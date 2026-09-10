@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nexus EcoTrack | Telemetry & Operations Data Hub</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+</head>
+<body>
+  <div class="app-shell" id="app-shell">
+    
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <div class="brand-logo">
+          <div class="brand-icon">⚡</div>
+          <div>
+            <div class="brand-title">Nexus Hub</div>
+            <div style="font-size: 11px; color: var(--text-secondary);">EcoTrack System</div>
+          </div>
+          <span class="brand-badge">SWR v2.4</span>
+        </div>
+
+        <nav class="nav-menu" id="nav-menu">
+          <a class="nav-item active" data-route="overview" id="nav-overview">
+            <span class="nav-icon">📊</span>
+            <span>Operations Hub</span>
+          </a>
+          <a class="nav-item" data-route="telemetry" id="nav-telemetry">
+            <span class="nav-icon">📡</span>
+            <span>Telemetry Matrix</span>
+          </a>
+          <a class="nav-item" data-route="maintenance" id="nav-maintenance">
+            <span class="nav-icon">🛠️</span>
+            <span>Work Orders</span>
+          </a>
+          <a class="nav-item" data-route="analytics" id="nav-analytics">
+            <span class="nav-icon">📈</span>
+            <span>Energy Analytics</span>
+          </a>
+          <a class="nav-item" data-route="staff" id="nav-staff">
+            <span class="nav-icon">👥</span>
+            <span>Field Personnel</span>
+          </a>
+          <a class="nav-item" data-route="config" id="nav-config">
+            <span class="nav-icon">⚙️</span>
+            <span>Rules & SWR Cache</span>
+          </a>
+        </nav>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="user-profile-widget">
+          <div class="avatar-badge">RS</div>
+          <div class="user-info">
+            <div class="user-name">Rey O. Solamillo</div>
+            <div class="user-role">Lead HVAC Specialist</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main View Area -->
+    <main class="main-wrapper">
+      <!-- Topbar Header with Non-Intrusive Live SWR Status Indicator -->
+      <header class="topbar" id="topbar">
+        <div class="topbar-left">
+          <div class="swr-status-pill" id="sync-indicator">
+            <div class="swr-dot"></div>
+            <span id="sync-text">Live SWR Cached</span>
+          </div>
+        </div>
+
+        <div class="topbar-right">
+          <span class="live-clock-badge" id="live-clock">--:--:--</span>
+        </div>
+      </header>
+
+      <!-- Dynamic Page View Container (Zero Browser Reloads) -->
+      <section class="content-viewport" id="view-container">
+        <!-- Rendered dynamically by app.js router -->
+      </section>
+    </main>
+
+    <!-- Slide-in Inspector Detail Drawer -->
+    <div class="drawer-overlay" id="drawer-overlay"></div>
+    <div class="detail-drawer" id="detail-drawer">
+      <button class="close-drawer-btn" id="close-drawer-btn">✕</button>
+      <div id="drawer-content"></div>
+    </div>
+
+    <!-- Non-Intrusive Toast System Container -->
+    <div class="toast-container" id="toast-container"></div>
+  </div>
+
+  <!-- Main ES Module Entry Point -->
+  <script type="module" src="app.js"></script>
+</body>
+</html>

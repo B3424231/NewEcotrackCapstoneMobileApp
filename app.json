@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "EcoTrackApp",
+    "slug": "ecotrackapp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/ecoTrack.png",
+    "scheme": "ecotrackapp",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "icon": "./assets/images/ecoTrack.png"
+    },
+    "android": {
+      "package": "com.ecotrack.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0b291d",
+        "foregroundImage": "./assets/images/ecoTrack.png",
+        "monochromeImage": "./assets/images/ecoTrack.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/ecoTrack.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0b291d",
+          "image": "./assets/images/ecoTrack.png",
+          "imageWidth": 120
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "dc3394b9-32fa-4c3f-829e-2abf1c6ddbc1"
+      }
+    },
+    "owner": "rey12345"
+  }
+}
