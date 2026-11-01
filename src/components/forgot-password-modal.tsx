@@ -1,3 +1,4 @@
+import { Colors as UiColors, type AppColors, Spacing } from '@/constants/theme';
 import { useState } from 'react';
 import {
   Modal,
@@ -11,11 +12,13 @@ import {
 } from 'react-native';
 import { Image } from 'expo-image';
 import { ThemedText } from './themed-text';
-import { Spacing } from '@/constants/theme';
+
 import { useSettings } from '@/context/settings-context';
 import { AppIcon } from '@/components/app-icon';
 import {
   verifyUserForPasswordReset,
+  requestPasswordRecovery,
+  clearSession,
   resetUserPassword,
   saveRememberedCredentials,
   AppUser,
@@ -41,6 +44,7 @@ type ModalStep = 'verify' | 'reset' | 'remember';
 
 export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPasswordModalProps) {
   const { effectiveTheme, colors } = useSettings();
+  const styles = themedStyles[effectiveTheme];
   const isDark = effectiveTheme === 'dark';
 
   const [step, setStep] = useState<ModalStep>('verify');
@@ -63,6 +67,7 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
 
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
+  const [infoMessage, setInfoMessage] = useState('');
 
   const placeholderColor = isDark ? '#64748b' : '#9ca3af';
 
@@ -80,9 +85,11 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
     setMatchedPhone('');
     setLoading(false);
     setErrorMessage('');
+    setInfoMessage('');
   };
 
   const handleClose = () => {
+    if (verifiedUser) void clearSession();
     resetInternalState();
     onClose();
   };
@@ -90,12 +97,20 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
   // Step 1: Verify username and phone number
   const handleVerifyAccount = async () => {
     setErrorMessage('');
+    setInfoMessage('');
     if (!username.trim()) {
-      setErrorMessage('Please enter your username or full name.');
+      setErrorMessage('Please enter your account email.');
       return;
     }
     if (!phoneNumber.trim()) {
-      setErrorMessage('Please enter your phone number.');
+      setLoading(true);
+      const sent = await requestPasswordRecovery(username);
+      setLoading(false);
+      if (sent.success) {
+        setInfoMessage('We sent a 6-digit code to your email. Check your inbox or spam folder.');
+      } else {
+        setErrorMessage(sent.error || 'Unable to send recovery code.');
+      }
       return;
     }
 
@@ -123,8 +138,8 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
       setErrorMessage('New password is required.');
       return;
     }
-    if (newPassword.length < 4) {
-      setErrorMessage('Password must be at least 4 characters long.');
+    if (newPassword.length < 8) {
+      setErrorMessage('Password must be at least 8 characters long.');
       return;
     }
     if (newPassword !== confirmPassword) {
@@ -225,6 +240,16 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
               </View>
             </View>
 
+            {/* Info / Success Container */}
+            {infoMessage ? (
+              <View style={[styles.infoContainer, isDark && styles.infoContainerDark]}>
+                <AppIcon name="check-circle" size={14} color={isDark ? '#34d399' : '#059669'} />
+                <ThemedText style={[styles.infoText, isDark && styles.infoTextDark]}>
+                  {infoMessage}
+                </ThemedText>
+              </View>
+            ) : null}
+
             {/* Error Container */}
             {errorMessage ? (
               <View style={[styles.errorContainer, isDark && styles.errorContainerDark]}>
@@ -245,40 +270,61 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
                     Forgot Password
                   </ThemedText>
                   <ThemedText style={[styles.modalSubtitle, isDark && styles.modalSubtitleDark]}>
-                    Enter your username / full name and mobile number to verify your account.
+                    Request a code by email, then enter it to verify your account.
                   </ThemedText>
                 </View>
 
                 <View style={styles.formGroup}>
                   <View style={styles.inputGroup}>
                     <ThemedText style={[styles.inputLabel, isDark && styles.inputLabelDark]}>
-                      Username or Full Name
+                      Email Address
                     </ThemedText>
                     <TextInput
                       style={[styles.inputField, isDark && styles.inputFieldDark]}
                       value={username}
                       onChangeText={setUsername}
-                      placeholder="e.g. Rey O. Solamillo"
+                      placeholder="Enter your account email"
                       placeholderTextColor={placeholderColor}
-                      autoCapitalize="words"
+                      autoCapitalize="none"
                       autoCorrect={false}
                     />
                   </View>
 
                   <View style={styles.inputGroup}>
                     <ThemedText style={[styles.inputLabel, isDark && styles.inputLabelDark]}>
-                      Phone Number
+                      Recovery Code
                     </ThemedText>
                     <TextInput
                       style={[styles.inputField, isDark && styles.inputFieldDark]}
                       value={phoneNumber}
                       onChangeText={setPhoneNumber}
-                      placeholder="e.g. 09853308630"
+                      placeholder="Enter the 6-digit emailed recovery code"
                       placeholderTextColor={placeholderColor}
-                      keyboardType="phone-pad"
+                      keyboardType="number-pad"
                       autoCapitalize="none"
                       autoCorrect={false}
                     />
+                    {Boolean(infoMessage) && (
+                      <Pressable
+                        onPress={async () => {
+                          setLoading(true);
+                          setErrorMessage('');
+                          const sent = await requestPasswordRecovery(username);
+                          setLoading(false);
+                          if (sent.success) {
+                            setInfoMessage('A new recovery code has been sent to your email.');
+                          } else {
+                            setErrorMessage(sent.error || 'Unable to resend recovery code.');
+                          }
+                        }}
+                        disabled={loading}
+                        style={{ alignSelf: 'flex-end', marginTop: 4 }}
+                      >
+                        <ThemedText style={{ fontSize: 11.5, color: colors.emerald, fontWeight: '700' }}>
+                          Resend recovery code
+                        </ThemedText>
+                      </Pressable>
+                    )}
                   </View>
                 </View>
 
@@ -292,9 +338,9 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
                   ]}
                 >
                   {loading ? (
-                    <ActivityIndicator color="#ffffff" size="small" />
+                    <ActivityIndicator color={UiColors[effectiveTheme].onPrimary} size="small" />
                   ) : (
-                    <ThemedText style={styles.primaryButtonText}>VERIFY ACCOUNT</ThemedText>
+                    <ThemedText style={styles.primaryButtonText}>{phoneNumber.trim() ? 'VERIFY ACCOUNT' : 'SEND RECOVERY CODE'}</ThemedText>
                   )}
                 </Pressable>
 
@@ -419,7 +465,7 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
                   ]}
                 >
                   {loading ? (
-                    <ActivityIndicator color="#ffffff" size="small" />
+                    <ActivityIndicator color={UiColors[effectiveTheme].onPrimary} size="small" />
                   ) : (
                     <ThemedText style={styles.primaryButtonText}>UPDATE PASSWORD</ThemedText>
                   )}
@@ -454,7 +500,7 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
 
                 {/* Convenience info callout */}
                 <View style={[styles.rememberCard, isDark && styles.rememberCardDark]}>
-                  <AppIcon name="bolt" size={20} color="#f59e0b" />
+                  <AppIcon name="bolt" size={20} color={UiColors[effectiveTheme].warning} />
                   <View style={{ flex: 1 }}>
                     <ThemedText
                       style={[styles.rememberCardTitle, isDark && styles.rememberCardTitleDark]}
@@ -509,7 +555,7 @@ export function ForgotPasswordModal({ visible, onClose, onSuccess }: ForgotPassw
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(6, 46, 30, 0.85)',
@@ -520,13 +566,13 @@ const styles = StyleSheet.create({
   modalCard: {
     width: '100%',
     maxWidth: 420,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 28,
     borderWidth: 1.5,
-    borderColor: '#10b981',
+    borderColor: colors.panelBorder,
     paddingHorizontal: 24,
     paddingVertical: 26,
-    shadowColor: '#000000',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 16 },
     shadowOpacity: 0.25,
     shadowRadius: 30,
@@ -537,9 +583,9 @@ const styles = StyleSheet.create({
     }),
   },
   modalCardDark: {
-    backgroundColor: '#151e32',
-    borderColor: 'rgba(16, 185, 129, 0.45)',
-    shadowColor: '#000000',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
+    shadowColor: "#0f172a",
   },
   scrollInner: {
     alignItems: 'stretch',
@@ -555,28 +601,28 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingVertical: 6,
     borderRadius: 12,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     alignItems: 'center',
     justifyContent: 'center',
   },
   stepPillActive: {
-    backgroundColor: '#ecfdf5',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: '#10b981',
+    borderColor: colors.emerald,
   },
   stepPillActiveDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.2)',
-    borderColor: '#34d399',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.emerald,
   },
   stepPillText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   stepPillTextActive: {
     fontSize: 11,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.emerald,
   },
   headerSection: {
     alignItems: 'center',
@@ -586,53 +632,53 @@ const styles = StyleSheet.create({
     width: 54,
     height: 54,
     borderRadius: 18,
-    backgroundColor: '#f0fdf4',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: Spacing.two,
   },
   iconBadgeDark: {
     backgroundColor: '#0f172a',
-    borderColor: 'rgba(16, 185, 129, 0.3)',
+    borderColor: colors.border,
   },
   iconBadgeSuccess: {
     width: 54,
     height: 54,
     borderRadius: 18,
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1.5,
-    borderColor: '#10b981',
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: Spacing.two,
   },
   iconBadgeSuccessDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.25)',
-    borderColor: '#34d399',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   modalTitle: {
     fontSize: 20,
     fontWeight: '900',
-    color: '#0b291d',
+    color: colors.text,
     textAlign: 'center',
     marginBottom: 4,
     letterSpacing: -0.3,
   },
   modalTitleDark: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
   modalSubtitle: {
     fontSize: 12.5,
-    color: '#6b7280',
+    color: colors.textSecondary,
     textAlign: 'center',
     lineHeight: 18,
     fontWeight: '500',
     paddingHorizontal: 8,
   },
   modalSubtitleDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   stepContent: {
     gap: Spacing.three,
@@ -652,18 +698,18 @@ const styles = StyleSheet.create({
     paddingLeft: 2,
   },
   inputLabelDark: {
-    color: '#cbd5e1',
+    color: colors.textMuted,
   },
   inputField: {
     borderRadius: 12,
     borderWidth: 1.5,
-    borderColor: '#e5e7eb',
-    backgroundColor: '#f9fafb',
+    borderColor: colors.inputBorder,
+    backgroundColor: colors.background,
     paddingHorizontal: Spacing.three,
     paddingVertical: 11,
     fontSize: 13.5,
     fontWeight: '600',
-    color: '#1f2937',
+    color: colors.text,
     ...Platform.select({
       web: {
         outlineStyle: 'none',
@@ -671,9 +717,9 @@ const styles = StyleSheet.create({
     }),
   },
   inputFieldDark: {
-    backgroundColor: '#0a0f1d',
-    borderColor: '#334155',
-    color: '#f1f5f9',
+    backgroundColor: colors.background,
+    borderColor: colors.inputBorder,
+    color: colors.text,
   },
   passwordWrapper: {
     position: 'relative',
@@ -698,22 +744,22 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    backgroundColor: '#ecfdf5',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: '#a7f3d0',
+    borderColor: colors.border,
     borderRadius: 14,
     padding: 12,
     marginBottom: 4,
   },
   verifiedBadgeDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.12)',
-    borderColor: 'rgba(16, 185, 129, 0.3)',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   verifiedBadgeIcon: {
     fontSize: 16,
     fontWeight: '900',
-    color: '#059669',
-    backgroundColor: '#d1fae5',
+    color: colors.emerald,
+    backgroundColor: colors.accentSurface,
     width: 26,
     height: 26,
     borderRadius: 13,
@@ -723,53 +769,53 @@ const styles = StyleSheet.create({
   verifiedName: {
     fontSize: 13,
     fontWeight: '800',
-    color: '#065f46',
+    color: colors.text,
   },
   verifiedNameDark: {
-    color: '#6ee7b7',
+    color: colors.emerald,
   },
   verifiedPhone: {
     fontSize: 11.5,
     fontWeight: '600',
-    color: '#047857',
+    color: colors.text,
   },
   verifiedPhoneDark: {
-    color: '#a7f3d0',
+    color: colors.textMuted,
   },
   rememberCard: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
-    backgroundColor: '#f0fdf4',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: '#bbf7d0',
+    borderColor: colors.panelBorder,
     borderRadius: 16,
     padding: 14,
     marginBottom: 4,
   },
   rememberCardDark: {
     backgroundColor: '#0f172a',
-    borderColor: 'rgba(16, 185, 129, 0.3)',
+    borderColor: colors.panelBorder,
   },
   rememberCardTitle: {
     fontSize: 13,
     fontWeight: '800',
-    color: '#064e3b',
+    color: colors.text,
   },
   rememberCardTitleDark: {
-    color: '#34d399',
+    color: colors.text,
   },
   rememberCardSub: {
     fontSize: 11.5,
-    color: '#047857',
+    color: colors.text,
     lineHeight: 16,
     marginTop: 2,
   },
   rememberCardSubDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   primaryButton: {
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     borderRadius: 13,
     paddingVertical: 13,
     alignItems: 'center',
@@ -782,22 +828,22 @@ const styles = StyleSheet.create({
     }),
   },
   rememberYesButton: {
-    backgroundColor: '#059669',
+    backgroundColor: colors.primaryFill,
   },
   primaryButtonText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 13.5,
     fontWeight: '900',
     letterSpacing: 0.5,
   },
   secondaryButton: {
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     borderRadius: 13,
     paddingVertical: 12,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.border,
     ...Platform.select({
       web: {
         cursor: 'pointer',
@@ -805,17 +851,17 @@ const styles = StyleSheet.create({
     }),
   },
   secondaryButtonDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   secondaryButtonText: {
-    color: '#475569',
+    color: colors.textSecondary,
     fontSize: 12.5,
     fontWeight: '800',
     letterSpacing: 0.4,
   },
   secondaryButtonTextDark: {
-    color: '#cbd5e1',
+    color: colors.textMuted,
   },
   buttonPressed: {
     transform: [{ scale: 0.97 }],
@@ -828,30 +874,56 @@ const styles = StyleSheet.create({
   cancelButtonText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#6b7280',
+    color: colors.textSecondary,
   },
   cancelButtonTextDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   errorContainer: {
-    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.2)',
+    borderColor: colors.border,
     borderRadius: 10,
     padding: Spacing.two,
     marginBottom: Spacing.two,
   },
   errorContainerDark: {
-    backgroundColor: 'rgba(239, 68, 68, 0.18)',
-    borderColor: 'rgba(239, 68, 68, 0.45)',
+    backgroundColor: colors.errorSurface,
+    borderColor: colors.border,
   },
   errorText: {
-    color: '#ef4444',
+    color: colors.error,
     fontSize: 12,
     fontWeight: '700',
     textAlign: 'center',
   },
   errorTextDark: {
-    color: '#f87171',
+    color: colors.error,
+  },
+  infoContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: colors.accentSurface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 10,
+    padding: Spacing.two,
+    marginBottom: Spacing.two,
+  },
+  infoContainerDark: {
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
+  },
+  infoText: {
+    color: colors.emerald,
+    fontSize: 12,
+    fontWeight: '700',
+    flex: 1,
+    lineHeight: 16,
+  },
+  infoTextDark: {
+    color: colors.emerald,
   },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };

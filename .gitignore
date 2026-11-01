@@ -55,6 +55,44 @@ GoogleService-Info.plist
 scratch/
 .system_generated/
 
+# Generated builds, reports, and local verification output
+artifacts/
+reports/
+coverage/
+*.apk
+*.aab
+*.ipa
+__pycache__/
+*.py[cod]
+/*_REPORT.md
+/*_DIFF.txt
+/BACKEND_AUDIT.md
+/SUPABASE_FETCH_REVIEW.md
+/ANDROID_APK_BUILD.md
+
+# Personal editor and agent settings
+.agents/
+.codex/
+.claude/
+.vscode/
+.idea/
+/CLAUDE.md
+/debugging skills.md
+
+# Supabase CLI state
+/supabase/.temp/
+/supabase/.branches/
+
+# One-off local analysis, build-download, and fixture-generation tools
+/scripts/check_supabase.js
+/scripts/compare-*.py
+/scripts/stage-*.py
+/scripts/verify-*.py
+/scripts/download-mobile-home-apk.cjs
+/scripts/export-schema-metadata.cjs
+/scripts/render-approved-device-fixes.cjs
+/scripts/render-mobile-home-fixtures.cjs
+
 # typescript
 *.tsbuildinfo
 

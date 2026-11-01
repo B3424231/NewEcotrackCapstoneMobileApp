@@ -1,7 +1,9 @@
+import { clearSessionPageSnapshots, setSessionPageAccount } from '@/hooks/use-session-page-snapshot';
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { AppState, AppStateStatus } from 'react-native';
 import {
   AppUser,
+  supabase,
   getSavedSession,
   clearSession,
   updateStaffOnlineStatus,
@@ -10,9 +12,11 @@ import {
   isStaffArchived,
 } from '@/services/supabase';
 import { checkAndDispatchMaintenanceReminders } from '@/services/mobile-notifications';
+import { readWithTimeout } from '@/services/query-utils';
 
 export interface AuthContextType {
   isAuthenticated: boolean;
+  isRestoringSession: boolean;
   userId: string;
   userEmail: string;
   userName: string;
@@ -45,6 +49,7 @@ export interface AuthContextType {
 
 export const AuthContext = createContext<AuthContextType>({
   isAuthenticated: false,
+  isRestoringSession: true,
   userId: '',
   userEmail: '',
   userName: '',
@@ -71,6 +76,7 @@ export const useAuth = () => useContext(AuthContext);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isRestoringSession, setIsRestoringSession] = useState(true);
   const [userId, setUserId] = useState('');
   const [userEmail, setUserEmail] = useState('');
   const [userName, setUserName] = useState('');
@@ -89,8 +95,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [remotelyLoggedOut, setRemotelyLoggedOut] = useState(false);
 
   useEffect(() => {
+    let active = true;
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(event => {
+      if (event === 'SIGNED_OUT') {
+        clearSessionPageSnapshots();
+        active = false;
+        setIsRestoringSession(false);
+        setIsAuthenticated(false);
+        setUserId('');
+        setUserCustomPhotoUri(null);
+      }
+    });
+
     // Restore session on app launch
-    getSavedSession().then((savedUser) => {
+    readWithTimeout(() => getSavedSession()).then((savedUser) => {
+      if (!active) return;
       if (savedUser) {
         setUserId(savedUser.id);
         setUserEmail(savedUser.email);
@@ -122,14 +141,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             .catch(() => {});
         }
       }
+    }).catch(() => {
+      if (active) setIsAuthenticated(false);
+    }).finally(() => {
+      if (active) setIsRestoringSession(false);
     });
+    return () => { active = false; subscription.unsubscribe(); };
   }, []);
 
   // Real-time synchronization on current staff member (archival & admin force logout)
   useEffect(() => {
-    if (!userId || userType === 'admin') return;
+    if (!userId || userType === 'admin' || !isAuthenticated || isArchived) return;
+    let disposed = false;
+    let readingProfile = false;
 
-    const unsubscribe = subscribeToStaffMember(userId, (updatedStaff) => {
+    const applyStaffStatus = (updatedStaff: any) => {
+      if (disposed || updatedStaff.id !== userId) return;
       const isNowArchived = isStaffArchived(updatedStaff);
 
       if (isNowArchived) {
@@ -142,7 +169,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       // Check if admin remotely forced logout from desktop
       const isRemoteLoggedOut =
-        (updatedStaff.status === 'Offline' || updatedStaff.status === 'inactive' || (updatedStaff as any).force_logout === true) &&
+        (updatedStaff as any).force_logout === true &&
         !isNowArchived;
 
       if (isRemoteLoggedOut && isAuthenticated) {
@@ -150,19 +177,44 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         clearSession(userId);
         setIsAuthenticated(false);
       }
-    });
-
-    return () => {
-      unsubscribe();
     };
-  }, [userId, userType, isAuthenticated]);
+    const unsubscribe = subscribeToStaffMember(userId, applyStaffStatus);
+    const refreshAccountAccess = async () => {
+      if (disposed || readingProfile || (AppState.currentState && AppState.currentState !== 'active')) return;
+      readingProfile = true;
+      try {
+        const profile = await getSavedSession({ throwOnUnavailable: true });
+        if (disposed) return;
+        if (!profile || profile.id !== userId) { setIsAuthenticated(false); return; }
+        if (profile.isArchived) applyStaffStatus({ id: profile.id, is_archived: true,
+          archive_reason: profile.archiveReason, archive_notes: profile.archiveNotes, archived_at: profile.archivedAt });
+      } catch { /* Keep realtime available; retry the verified status on the next tick. */ }
+      finally { readingProfile = false; }
+    };
+    void refreshAccountAccess();
+    const timer = setInterval(() => { void refreshAccountAccess(); }, 10000);
+    const appStateSubscription = AppState.addEventListener('change', state => {
+      if (state === 'active') void refreshAccountAccess();
+    });
+    return () => {
+      disposed = true; clearInterval(timer); appStateSubscription.remove(); unsubscribe();
+    };
+  }, [userId, userType, isAuthenticated, isArchived]);
 
   // Synchronize Online status when app is brought to foreground
   useEffect(() => {
     const handleAppStateChange = (nextAppState: AppStateStatus) => {
       if (!userId || !isAuthenticated || isArchived) return;
       if (nextAppState === 'active') {
-        updateStaffOnlineStatus(userId, true);
+        getSavedSession({ throwOnUnavailable: true }).then(profile => {
+          if (!profile || profile.id !== userId) { setIsAuthenticated(false); return; }
+          if (profile.isArchived) {
+            setIsArchived(true); setArchiveReason(profile.archiveReason || 'Account archived');
+            setArchiveNotes(profile.archiveNotes || null); setArchivedAt(profile.archivedAt || null);
+            return;
+          }
+          updateStaffOnlineStatus(userId, true).catch(() => {});
+        }).catch(() => { /* Retry on the next foreground access check. */ });
       }
     };
 
@@ -172,17 +224,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [userId, isAuthenticated, isArchived]);
 
-  const handleLogin = (user?: AppUser) => {
+  const handleLogin = async (_candidate?: AppUser) => {
+    const user = await getSavedSession();
+    if (!user?.id) { setIsAuthenticated(false); return; }
     if (user) {
       setUserId(user.id);
       setUserEmail(user.email);
       setUserName(user.name);
       setUserRole(user.role || 'HVAC / Aircon Technician');
       setUserPhone(user.phone);
-      if (user.assignment) setUserAssignment(user.assignment);
+      setUserAssignment(user.assignment || 'Unassigned');
       setUserType(user.userType);
-      if (user.avatar) setUserAvatar(user.avatar);
-      if (user.photoUrl) setUserCustomPhotoUri(user.photoUrl);
+      setUserAvatar(user.avatar || 'default');
+      setUserCustomPhotoUri(user.photoUrl || null);
 
       if (user.isArchived) {
         setIsArchived(true);
@@ -203,15 +257,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         updateStaffOnlineStatus(user.id || user.email, true);
 
         // Run proactive maintenance reminder check
-        fetchLiveMaintenanceReports(user.name).then((reports) => {
-          checkAndDispatchMaintenanceReminders(user.name, reports);
-        });
+        fetchLiveMaintenanceReports(user.name)
+          .then((reports) => checkAndDispatchMaintenanceReminders(user.name, reports))
+          .catch(() => {});
       }
     }
     setIsAuthenticated(true);
   };
 
   const handleLogout = async () => {
+    clearSessionPageSnapshots();
     const currentId = userId;
     await clearSession(currentId);
     setUserId('');
@@ -230,6 +285,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const acknowledgeArchived = async () => {
+    clearSessionPageSnapshots();
     const currentId = userId;
     await clearSession(currentId);
     setUserId('');
@@ -251,10 +307,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setRemotelyLoggedOut(false);
   };
 
+  setSessionPageAccount(isAuthenticated && !isArchived && !remotelyLoggedOut && userId ? `${userType}:${userId}` : null);
+
   return (
     <AuthContext.Provider
       value={{
         isAuthenticated,
+        isRestoringSession,
         userId,
         userEmail,
         userName,

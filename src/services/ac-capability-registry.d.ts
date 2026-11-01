@@ -1,0 +1,2 @@
+declare const registry: { protocol(value: unknown): string; capabilities(value: unknown, mode?: string): Record<string, any>; validateState(value: unknown, state: unknown): { valid: boolean; errors: string[] }; validateTemperature(value: unknown, requested: number, mode?: string, retainedSetting?: boolean): { valid: boolean; message?: string }; data: Record<string, any> };
+export default registry;

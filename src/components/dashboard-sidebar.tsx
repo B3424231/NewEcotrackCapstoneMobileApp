@@ -1,9 +1,10 @@
+import { Colors as UiColors, type AppColors, Spacing } from '@/constants/theme';
 import { useState, useEffect } from 'react';
 import { StyleSheet, View, ScrollView, Pressable, Platform, Animated, Dimensions, Modal } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Image } from 'expo-image';
 import { ThemedText } from './themed-text';
-import { Spacing } from '@/constants/theme';
+
 import { router } from 'expo-router';
 import { useAuth } from '@/context/auth-context';
 import { useSettings } from '@/context/settings-context';
@@ -15,7 +16,7 @@ const AVATAR_FEMALE = require('@/assets/images/avatar_female.png');
 const SCREEN_WIDTH = Dimensions.get('window').width;
 const SIDEBAR_WIDTH = Math.min(SCREEN_WIDTH * 0.85, 340);
 
-import { ICON_LOCATION, ICON_SETTINGS } from '@/constants/custom-icons';
+import { ICON_LOCATION, ICON_SETTINGS, getColoredSvgUri } from '@/constants/custom-icons';
 import { LocationIcon } from './location-icon';
 
 const ICON_NOTIFICATION = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cGF0aCBkPSJNOTkgMjFINWEyIDIgMCAwIDEtMi0yVjVhMiAyIDAgMCAxIDItMmg0Ii8+PHBvbHlsaW5lIHBvaW50cz0iMTYgMTcgMjEgMTIgMTYgNyIvPjxsaW5lIHgxPSIyMSIgeTE9IjEyIiB4Mj0iOSIgeTI9IjEyIi8+PC9zdmc+';
@@ -47,9 +48,11 @@ export function DashboardSidebar({
   onPageChange,
   logout,
 }: DashboardSidebarProps) {
-  const { userAvatar, userCustomPhotoUri } = useAuth();
+  const { userAvatar, userCustomPhotoUri, userRole, userType } = useAuth();
   const { effectiveTheme } = useSettings();
+  const styles = themedStyles[effectiveTheme];
   const isDark = effectiveTheme === 'dark';
+  const isAdmin = userType === 'admin' || userRole?.toLowerCase().includes('admin');
 
   const [sidebarVisible, setSidebarVisible] = useState(false);
   const [localActive, setLocalActive] = useState<PageType>(currentPage);
@@ -65,10 +68,15 @@ export function DashboardSidebar({
   };
 
   useEffect(() => {
+    let active = true;
     if (visible) {
-      setSidebarVisible(true);
-      setLocalActive(currentPage);
+      void Promise.resolve().then(() => {
+        if (!active) return;
+        setSidebarVisible(true);
+        setLocalActive(currentPage);
+      });
     }
+    return () => { active = false; };
   }, [visible, currentPage]);
 
   if (!visible) return null;
@@ -79,10 +87,10 @@ export function DashboardSidebar({
   });
 
   const mainMenuItems: MenuItem[] = [
-    { id: 'sensor-location', label: 'Sensor Location', icon: ICON_LOCATION },
+    { id: 'sensor-location', label: 'AC Devices', icon: ICON_LOCATION },
     { id: 'notifications', label: 'Notifications', icon: ICON_NOTIFICATION },
-    { id: 'maintenance' as any, label: 'Maintenance', icon: ICON_SETTINGS },
-    { id: 'profile', label: 'Admin Profile', icon: ICON_PROFILE },
+    { id: 'maintenance', label: 'Maintenance', icon: ICON_SETTINGS },
+    { id: 'profile', label: isAdmin ? 'Admin Profile' : 'My Profile', icon: ICON_PROFILE },
     { id: 'settings', label: 'Settings', icon: ICON_SETTINGS },
   ];
 
@@ -169,11 +177,13 @@ export function DashboardSidebar({
                         <LocationIcon size={20} color={isActive ? '#10b981' : '#6b7280'} />
                       ) : (
                         <Image
-                          source={{ uri: item.icon }}
+                          source={{ uri: getColoredSvgUri(item.icon, isActive ? '#10b981' : (isDark ? '#94a3b8' : '#6b7280')) }}
                           style={[
                             styles.menuIcon, 
                             isActive ? styles.menuIconActive : styles.menuIconInactive
                           ]}
+                          tintColor={isActive ? '#10b981' : (isDark ? '#94a3b8' : '#6b7280')}
+                          contentFit="contain"
                         />
                       )}
                       {item.id === 'notifications' && (
@@ -229,10 +239,10 @@ export function DashboardSidebar({
           <View style={[styles.confirmBox, isDark && styles.confirmBoxDark]}>
             <View style={[styles.logoutIconBadge, isDark && styles.logoutIconBadgeDark]}>
               <Image
-                source={{ uri: ICON_LOGOUT }}
+                source={{ uri: getColoredSvgUri(ICON_LOGOUT, '#ef4444') }}
                 style={styles.logoutBadgeIcon}
+                tintColor={UiColors[effectiveTheme].error}
                 contentFit="contain"
-                tintColor="#ef4444"
               />
             </View>
             <ThemedText style={[styles.confirmTitle, isDark && styles.confirmTitleDark]}>
@@ -277,7 +287,7 @@ export function DashboardSidebar({
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
   sidebarOverlayContainer: {
     position: 'absolute',
     top: 0,
@@ -299,10 +309,10 @@ const styles = StyleSheet.create({
   sidebarContainer: {
     width: SIDEBAR_WIDTH,
     height: '100%',
-    backgroundColor: '#0b291d', // Deep forest theme background
+    backgroundColor: colors.primaryFill, // Deep forest theme background
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: -6, height: 0 },
         shadowOpacity: 0.25,
         shadowRadius: 16,
@@ -330,9 +340,11 @@ const styles = StyleSheet.create({
   logoImage: {
     width: 32,
     height: 32,
+    borderRadius: 8,
+    overflow: 'hidden',
   },
   logoTitle: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 22,
     fontWeight: '800',
     letterSpacing: -0.5,
@@ -347,7 +359,7 @@ const styles = StyleSheet.create({
   hamburgerLine: {
     width: 22,
     height: 2,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 1,
   },
   menuScroll: {
@@ -378,8 +390,8 @@ const styles = StyleSheet.create({
     }),
   },
   menuItemActive: {
-    borderColor: 'rgba(16, 185, 129, 0.4)',
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    borderColor: colors.border,
+    backgroundColor: colors.accentSurface,
   },
   menuItemPressed: {
     opacity: 0.7,
@@ -392,7 +404,7 @@ const styles = StyleSheet.create({
     tintColor: '#a1a1aa',
   },
   menuIconActive: {
-    tintColor: '#ffffff',
+    tintColor: colors.onPrimary,
   },
   menuText: {
     fontSize: 15,
@@ -400,12 +412,12 @@ const styles = StyleSheet.create({
     color: '#a1a1aa',
   },
   menuTextActive: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
   bottomSection: {
     marginTop: 48,
     borderTopWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: colors.panelBorder,
     paddingTop: 16,
     gap: Spacing.one,
   },
@@ -421,15 +433,15 @@ const styles = StyleSheet.create({
   confirmBox: {
     width: '90%',
     maxWidth: 320,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 24,
     borderWidth: 1.5,
-    borderColor: '#10b981',
+    borderColor: colors.border,
     padding: 22,
     alignItems: 'center',
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 6 },
         shadowOpacity: 0.25,
         shadowRadius: 16,
@@ -440,25 +452,25 @@ const styles = StyleSheet.create({
     }),
   },
   confirmBoxDark: {
-    backgroundColor: '#151e32',
-    borderColor: 'rgba(239, 68, 68, 0.45)',
-    shadowColor: '#000000',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
+    shadowColor: "#0f172a",
     shadowOpacity: 0.7,
   },
   logoutIconBadge: {
     width: 48,
     height: 48,
     borderRadius: 16,
-    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.25)',
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 12,
   },
   logoutIconBadgeDark: {
-    backgroundColor: 'rgba(239, 68, 68, 0.18)',
-    borderColor: 'rgba(239, 68, 68, 0.4)',
+    backgroundColor: colors.errorSurface,
+    borderColor: colors.border,
   },
   logoutBadgeIcon: {
     width: 24,
@@ -467,23 +479,23 @@ const styles = StyleSheet.create({
   confirmTitle: {
     fontSize: 18,
     fontWeight: '900',
-    color: '#0f172a',
+    color: colors.text,
     marginBottom: 6,
     textAlign: 'center',
   },
   confirmTitleDark: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
   confirmDesc: {
     fontSize: 13.5,
-    color: '#64748b',
+    color: colors.textSecondary,
     textAlign: 'center',
     marginBottom: 18,
     lineHeight: 19,
     paddingHorizontal: 6,
   },
   confirmDescDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   confirmActions: {
     alignSelf: 'stretch',
@@ -491,17 +503,17 @@ const styles = StyleSheet.create({
   },
   cancelBtn: {
     alignSelf: 'stretch',
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.border,
     borderRadius: 12,
     paddingVertical: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
   cancelBtnDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   cancelBtnText: {
     color: '#475563',
@@ -509,7 +521,7 @@ const styles = StyleSheet.create({
     fontSize: 13.5,
   },
   cancelBtnTextDark: {
-    color: '#e2e8f0',
+    color: colors.text,
   },
   logoutBtn: {
     alignSelf: 'stretch',
@@ -518,28 +530,28 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#ef4444',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.25,
     shadowRadius: 8,
     elevation: 4,
   },
   logoutBtnText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontWeight: '900',
     fontSize: 13.5,
     letterSpacing: 0.4,
   },
   logoutMenuItem: {
-    borderColor: 'rgba(239, 68, 68, 0.25)',
-    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+    borderColor: colors.border,
+    backgroundColor: colors.errorSurface,
   },
   sidebarLogoutAvatar: {
     width: 32,
     height: 32,
     borderRadius: 16,
     borderWidth: 1.5,
-    borderColor: '#ef4444',
+    borderColor: colors.border,
   },
   iconContainer: {
     position: 'relative',
@@ -555,13 +567,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: '#0b291d',
+    borderColor: colors.border,
     zIndex: 10,
   },
   sidebarBadgeText: {
     fontSize: 8,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     lineHeight: 11,
   },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };

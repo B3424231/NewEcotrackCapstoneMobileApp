@@ -1,6 +1,28 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { supabase, LiveMaintenanceReport } from './supabase';
+import { supabase, LiveMaintenanceReport, resolveNotificationEquipment } from './supabase';
 import { NotificationEmitter } from '@/utils/notification-emitter';
+import { functionalDeviceText } from './sensor-readings';
+
+export async function registerMobilePushToken(preferences: { critical: boolean; maintenance: boolean }): Promise<boolean> {
+  try {
+    const { Platform } = require('react-native');
+    const Constants = require('expo-constants').default;
+    if (Platform.OS === 'web' || Constants.executionEnvironment === 'store-client' || Constants.appOwnership === 'expo' || !require('expo-device').isDevice) return false;
+    const Notifications = require('expo-notifications');
+    const permission = await Notifications.getPermissionsAsync();
+    if (permission.status !== 'granted' && !(permission.ios?.status !== undefined && permission.ios.status === Notifications.IosAuthorizationStatus?.PROVISIONAL)) return false;
+    const projectId = Constants.expoConfig?.extra?.eas?.projectId || Constants.easConfig?.projectId;
+    if (!projectId) return false;
+    const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId });
+    const { error } = await supabase.rpc('ecotrack_register_push_token', {
+      p_token: token, p_platform: Platform.OS, p_critical: preferences.critical, p_maintenance: preferences.maintenance,
+    });
+    if (error) return false;
+    await AsyncStorage.setItem('ecotrack_expo_push_token', token);
+    return true;
+  } catch { return false; }
+}
+
 
 export type MobileNotificationType =
   | 'task_assigned'
@@ -8,16 +30,18 @@ export type MobileNotificationType =
   | 'overdue_alert'
   | 'urgent_repair'
   | 'preventive_routine'
+  | 'controller_alert'
   | 'sensor_alert'
   | 'status_update'
   | 'system';
 
 export type MobileNotificationPriority = 'critical' | 'urgent' | 'high' | 'medium' | 'low';
 
-export type MobileNotificationCategory = 'task' | 'maintenance' | 'sensor' | 'system';
+export type MobileNotificationCategory = 'task' | 'maintenance' | 'device' | 'sensor' | 'system';
 
 export interface MobileNotificationItem {
   id: string;
+  eventKey?: string;
   staffId?: string;
   staffName: string;
   title: string;
@@ -29,6 +53,10 @@ export interface MobileNotificationItem {
   airconId?: string;
   airconName?: string;
   airconType?: string;
+  controllerId?: string;
+  controllerName?: string;
+  protocolName?: string;
+  roomId?: string;
   location?: string;
   dueDate?: string;
   verificationRemarks?: string;
@@ -39,7 +67,69 @@ export interface MobileNotificationItem {
   updatedAt?: string;
 }
 
+type NotificationStateAction = 'read' | 'unread' | 'archive' | 'snooze' | 'unsnooze';
+export interface MobileNotificationStateChange {
+  action: NotificationStateAction;
+  /** Omitted only when the server marks all visible notifications read. */
+  ids?: string[];
+  snoozeUntil?: string;
+}
+
+const stateListeners = new Set<(change?: MobileNotificationStateChange) => void>();
+let stateRevision = 0;
+let stateUpdatePending = false;
+
+export function getMobileNotificationStateRevision(): number { return stateRevision; }
+export function isMobileNotificationStateUpdating(): boolean { return stateUpdatePending; }
+
+function notifyStateListeners(change?: MobileNotificationStateChange) {
+  stateListeners.forEach(listener => {
+    try { listener(change); } catch (error) { console.warn('Notification listener failed:', error); }
+  });
+}
+
+export function applyMobileNotificationState(
+  items: MobileNotificationItem[], change: MobileNotificationStateChange
+): MobileNotificationItem[] {
+  const ids = change.ids ? new Set(change.ids) : null;
+  return items.flatMap(item => {
+    if (ids && !ids.has(item.id)) return [item];
+    if (change.action === 'archive') return [];
+    if (change.action === 'read' || change.action === 'unread') return [{ ...item, isRead: change.action === 'read' }];
+    return [{ ...item, isSnoozed: change.action === 'snooze', snoozeUntil: change.snoozeUntil }];
+  });
+}
+
+async function commitNotificationState(
+  operation: () => Promise<boolean>, change: MobileNotificationStateChange
+): Promise<boolean> {
+  // Prevent overlapping read/unread operations from committing in an ambiguous order.
+  if (stateUpdatePending) return false;
+  stateUpdatePending = true;
+  stateRevision++;
+  notifyStateListeners();
+  try {
+    const ok = await operation();
+    if (ok) {
+      stateRevision++;
+      notifyStateListeners(change);
+    }
+    return ok;
+  } catch (error) {
+    console.warn('Unable to update notification state:', error);
+    return false;
+  } finally {
+    stateUpdatePending = false;
+    stateRevision++;
+    // Refresh from the per-recipient RPC after the commit, including uncertain failures.
+    notifyStateListeners();
+  }
+}
+
 export interface CreateMobileNotificationPayload {
+  /** Stable event identifier reused on retry. */
+  eventKey?: string;
+  broadcast?: boolean;
   staffId?: string;
   staffName?: string;
   title: string;
@@ -56,24 +146,49 @@ export interface CreateMobileNotificationPayload {
   verificationRemarks?: string;
 }
 
+function sanitizeNotificationText(text?: string): string {
+  if (!text) return '';
+  return functionalDeviceText(text)
+    .replace(/maintenance\s+rework\s+dispatched/gi, 'Corrective Repair Dispatched')
+    .replace(/maintenance\s+rework/gi, 'Corrective Repair')
+    .replace(/rework\s+dispatched/gi, 'Corrective repair dispatched')
+    .replace(/rework/gi, 'Corrective Repair')
+    .replace(/^RWK-/i, 'REP-')
+    .replace(/#RWK-/gi, '#REP-');
+}
+
 // Convert raw DB row to MobileNotificationItem
 function mapDbToNotificationItem(row: any): MobileNotificationItem {
+  let cleanType = (row.type as MobileNotificationType) || 'task_reminder';
+  if ((row.type as string) === 'rework_assigned' || (row.type as string)?.includes('rework')) {
+    cleanType = 'urgent_repair';
+  }
+
+  const rawTitle = row.title || 'System Notification';
+  const rawMsg = row.message || '';
+  const rawReportId = row.related_report_id || undefined;
+
   return {
     id: row.id,
+    eventKey: row.event_key || undefined,
     staffId: row.staff_id || undefined,
     staffName: row.staff_name || 'Maintenance Staff',
-    title: row.title || 'System Notification',
-    message: row.message || '',
-    type: (row.type as MobileNotificationType) || 'task_reminder',
+    title: sanitizeNotificationText(rawTitle),
+    message: sanitizeNotificationText(rawMsg),
+    type: cleanType,
     priority: (row.priority as MobileNotificationPriority) || 'medium',
     category: (row.category as MobileNotificationCategory) || 'maintenance',
-    relatedReportId: row.related_report_id || undefined,
+    relatedReportId: rawReportId ? rawReportId.replace(/^RWK-/i, 'REP-') : undefined,
     airconId: row.aircon_id || undefined,
     airconName: row.aircon_name || undefined,
     airconType: row.aircon_type || undefined,
+    controllerId: row.controller_id || row.node_id || undefined,
+    controllerName: row.controller_name || undefined,
+    protocolName: row.protocol_name || undefined,
+    roomId: row.room_id || undefined,
     location: row.location || undefined,
     dueDate: row.due_date || undefined,
-    verificationRemarks: row.verification_remarks || undefined,
+    verificationRemarks: row.verification_remarks ? sanitizeNotificationText(row.verification_remarks) : undefined,
     isRead: Boolean(row.is_read),
     isSnoozed: Boolean(row.is_snoozed),
     snoozeUntil: row.snooze_until || undefined,
@@ -88,7 +203,10 @@ export function deduplicateMobileNotifications(items: MobileNotificationItem[]):
   const seenSignatures = new Set<string>();
   const deduplicated: MobileNotificationItem[] = [];
 
-  for (const item of items) {
+  const newestFirst = [...items].sort((a, b) =>
+    (Date.parse(b.updatedAt || b.createdAt) || 0) - (Date.parse(a.updatedAt || a.createdAt) || 0)
+  );
+  for (const item of newestFirst) {
     if (!item.id || seenIds.has(item.id)) continue;
     seenIds.add(item.id);
 
@@ -97,7 +215,9 @@ export function deduplicateMobileNotifications(items: MobileNotificationItem[]):
     const reportKey = item.relatedReportId || item.airconId || 'noreport';
     const typeKey = item.type || 'notype';
     const titleKey = (item.title || '').trim().toLowerCase();
-    const sig = `${reportKey}__${typeKey}__${titleKey}`;
+    const sig = item.eventKey
+      ? JSON.stringify(['event', item.eventKey])
+      : JSON.stringify([item.staffId || item.staffName, reportKey, typeKey, titleKey, item.message]);
 
     if (seenSignatures.has(sig)) {
       // Duplicate notification for same report and status event: keep only the newest one
@@ -110,267 +230,195 @@ export function deduplicateMobileNotifications(items: MobileNotificationItem[]):
   return deduplicated;
 }
 
-// Fetch live mobile notifications from Supabase
-export async function fetchLiveMobileNotifications(staffName?: string): Promise<MobileNotificationItem[]> {
-  try {
-    let query = supabase
-      .from('mobile_notifications')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(60);
-
-    // If staffName is provided and not generic, filter for this staff or broadcast
-    if (staffName && staffName.trim() && staffName !== 'All Staff') {
-      query = query.or(`staff_name.eq.${staffName},staff_name.eq.All Staff,staff_name.is.null`);
-    }
-
-    const { data, error } = await query;
-
-    if (!error && Array.isArray(data)) {
-      const mapped = data.map(mapDbToNotificationItem);
-      return deduplicateMobileNotifications(mapped);
-    }
-
-    if (error) {
-      console.warn('Error fetching live mobile notifications from Supabase:', error.message);
-    }
-
-    return [];
-  } catch (err) {
-    console.warn('Error fetching live mobile notifications:', err);
-    return [];
-  }
+export interface MobileNotificationCursor { createdAt: string; id: string }
+export interface MobileNotificationPage {
+  items: MobileNotificationItem[];
+  nextCursor?: MobileNotificationCursor;
 }
 
-// Clean up existing duplicate records in Supabase mobile_notifications table
-export async function cleanDuplicateDbNotifications(): Promise<number> {
-  try {
-    const { data, error } = await supabase
-      .from('mobile_notifications')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (error || !Array.isArray(data)) return 0;
-
-    const seenSignatures = new Set<string>();
-    const duplicateIds: string[] = [];
-
-    for (const row of data) {
-      const reportKey = row.related_report_id || row.aircon_id || 'noreport';
-      const typeKey = row.type || 'notype';
-      const titleKey = (row.title || '').trim().toLowerCase();
-      const sig = `${reportKey}__${typeKey}__${titleKey}`;
-
-      if (seenSignatures.has(sig)) {
-        duplicateIds.push(row.id);
-      } else {
-        seenSignatures.add(sig);
-      }
-    }
-
-    if (duplicateIds.length > 0) {
-      await supabase.from('mobile_notifications').delete().in('id', duplicateIds);
-      console.log(`Cleaned up ${duplicateIds.length} duplicate mobile notifications from DB`);
-      return duplicateIds.length;
-    }
-    return 0;
-  } catch (e) {
-    console.warn('Error cleaning duplicate mobile notifications from DB:', e);
-    return 0;
-  }
+// The database resolves identity and recipient state from the authenticated JWT.
+export async function fetchMobileNotificationPage(
+  cursor?: MobileNotificationCursor,
+  limit: number = 60
+): Promise<MobileNotificationPage> {
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 60)));
+  const { data, error } = await supabase.rpc('ecotrack_list_notifications', {
+    p_limit: pageSize,
+    p_before_created_at: cursor?.createdAt || null,
+    p_before_id: cursor?.id || null,
+  });
+  if (error) throw new Error(error.message || 'Unable to load notifications.');
+  if (!data || !Array.isArray(data.items)) throw new Error('Invalid notification response.');
+  return {
+    items: data.items.map(mapDbToNotificationItem),
+    nextCursor: data.next_cursor ? { createdAt: data.next_cursor.created_at, id: data.next_cursor.id } : undefined,
+  };
 }
 
-// Real-time subscription to mobile_notifications table
-export function subscribeToMobileNotifications(onUpdate: () => void) {
-  const channelId = `mobile_notifs_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+// Retain the argument for existing screens. A display name grants no access.
+export async function fetchLiveMobileNotifications(_staffName?: string): Promise<MobileNotificationItem[]> {
+  const items: MobileNotificationItem[] = [];
+  const cursors = new Set<string>();
+  let cursor: MobileNotificationCursor | undefined;
+  do {
+    const page = await fetchMobileNotificationPage(cursor);
+    items.push(...page.items);
+    cursor = page.nextCursor;
+    if (cursor) {
+      const key = JSON.stringify(cursor);
+      if (cursors.has(key)) throw new Error('Notification pagination did not advance.');
+      cursors.add(key);
+    }
+  } while (cursor);
+  return resolveNotificationEquipment(items);
+}
+
+// Events are shared and immutable; historical deduplication requires an audited migration.
+export async function cleanDuplicateDbNotifications(_staffName?: string): Promise<number> {
+  return 0;
+}
+
+export function subscribeToIncomingNotifications(
+  _userName: string | undefined,
+  onNewNotification: (item: MobileNotificationItem) => void
+) {
+  const channelId = `incoming_notifs_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+  let disposed = false;
   const channel = supabase
     .channel(channelId)
     .on(
       'postgres_changes',
-      {
-        event: '*',
-        schema: 'public',
-        table: 'mobile_notifications',
-      },
-      () => {
-        onUpdate();
+      { event: 'INSERT', schema: 'public', table: 'mobile_notifications' },
+      (payload) => {
+        const row = payload.new;
+        if (!row) return;
+
+        // Supabase Realtime applies the event table's recipient RLS policy.
+        // Display names must not hide or authorize immutable staff-ID assignments.
+        const item = mapDbToNotificationItem(row);
+        if (!item.airconId && !item.airconName && !item.relatedReportId) onNewNotification(item);
+        else void resolveNotificationEquipment([item]).then(items => {
+          if (!disposed) onNewNotification(items[0]);
+        }).catch(() => { if (!disposed) onNewNotification(item); });
       }
     )
     .subscribe();
 
   return () => {
+    disposed = true;
     supabase.removeChannel(channel);
   };
 }
 
-// Mark single mobile notification as read / unread
-export async function markMobileNotificationAsRead(id: string, isRead: boolean = true): Promise<boolean> {
-  try {
-    const { error } = await supabase
-      .from('mobile_notifications')
-      .update({ is_read: isRead, updated_at: new Date().toISOString() })
-      .eq('id', id);
-
-    if (error) {
-      console.warn('Failed to update notification read status in DB:', error.message);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error('Error marking notification read:', e);
-    return false;
-  }
+export function subscribeToMobileNotifications(onUpdate: (change?: MobileNotificationStateChange) => void) {
+  const channelId = `mobile_notifs_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  stateListeners.add(onUpdate);
+  const channel = supabase
+    .channel(channelId)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'mobile_notifications' }, () => onUpdate())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'mobile_notification_state' }, () => onUpdate())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'nodes' }, () => onUpdate())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'aircons' }, () => onUpdate())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, () => onUpdate())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, () => onUpdate())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, () => onUpdate())
+    .subscribe();
+  return () => { stateListeners.delete(onUpdate); supabase.removeChannel(channel); };
 }
 
-// Mark all notifications for staff as read
-export async function markAllMobileNotificationsAsRead(staffName?: string): Promise<boolean> {
-  try {
-    let query = supabase
-      .from('mobile_notifications')
-      .update({ is_read: true, updated_at: new Date().toISOString() })
-      .eq('is_read', false);
-
-    if (staffName && staffName !== 'All Staff') {
-      query = query.or(`staff_name.eq.${staffName},staff_name.eq.All Staff,staff_name.is.null`);
-    }
-
-    const { error } = await query;
-    if (error) {
-      console.warn('Failed to mark all notifications read in DB:', error.message);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error('Error in markAllMobileNotificationsAsRead:', e);
-    return false;
-  }
-}
-
-// Delete notification
-export async function deleteMobileNotification(id: string): Promise<boolean> {
-  try {
-    const { error } = await supabase.from('mobile_notifications').delete().eq('id', id);
-    if (error) {
-      console.warn('Failed to delete notification in DB:', error.message);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error('Error deleting mobile notification:', e);
-    return false;
-  }
-}
-
-// Delete multiple notifications in batch
-export async function deleteMultipleMobileNotifications(ids: string[]): Promise<boolean> {
-  try {
-    if (!ids || ids.length === 0) return true;
-    const { error } = await supabase.from('mobile_notifications').delete().in('id', ids);
-    if (error) {
-      console.warn('Failed to delete multiple notifications in DB:', error.message);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error('Error deleting multiple mobile notifications:', e);
-    return false;
-  }
-}
-
-// Snooze notification reminder
-export async function snoozeMobileNotification(id: string, minutes: number = 60): Promise<boolean> {
-  try {
-    const snoozeTime = new Date(Date.now() + minutes * 60 * 1000).toISOString();
-    const { error } = await supabase
-      .from('mobile_notifications')
-      .update({
-        is_snoozed: true,
-        snooze_until: snoozeTime,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id);
-
-    if (error) return false;
-    return true;
-  } catch (e) {
-    console.error('Error snoozing notification:', e);
-    return false;
-  }
-}
-
-// Unsnooze / resume notification reminder
-export async function unsnoozeMobileNotification(id: string): Promise<boolean> {
-  try {
-    const { error } = await supabase
-      .from('mobile_notifications')
-      .update({
-        is_snoozed: false,
-        snooze_until: null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id);
-
-    if (error) return false;
-    return true;
-  } catch (e) {
-    console.error('Error unsnoozing notification:', e);
-    return false;
-  }
-}
-
-// Create a new mobile notification in Supabase
-export async function createMobileNotification(payload: CreateMobileNotificationPayload): Promise<boolean> {
-  try {
-    const now = new Date();
-    const notifId = `mob_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
-    const { error } = await supabase.from('mobile_notifications').insert({
-      id: notifId,
-      staff_id: payload.staffId || null,
-      staff_name: payload.staffName || 'Maintenance Staff',
-      title: payload.title,
-      message: payload.message,
-      type: payload.type || 'task_reminder',
-      priority: payload.priority || 'medium',
-      category: payload.category || 'task',
-      related_report_id: payload.relatedReportId || null,
-      aircon_id: payload.airconId || null,
-      aircon_name: payload.airconName || null,
-      location: payload.location || null,
-      due_date: payload.dueDate || null,
-      is_read: false,
-      created_at: now.toISOString(),
-      updated_at: now.toISOString(),
+async function setNotificationState(
+  ids: string[], action: NotificationStateAction, minutes?: number
+): Promise<boolean> {
+  if (!ids.length || ids.some(id => !id?.trim()) || ids.length > 1000) return false;
+  const uniqueIds = [...new Set(ids)];
+  return commitNotificationState(async () => {
+    const { data, error } = await supabase.rpc('ecotrack_set_notification_state', {
+      p_ids: uniqueIds,
+      p_action: action,
+      p_snooze_minutes: minutes ?? null,
     });
+    // The RPC validates the complete selection and commits it atomically.
+    return !error && data === uniqueIds.length;
+  }, {
+    action, ids: uniqueIds,
+    snoozeUntil: action === 'snooze' ? new Date(Date.now() + minutes! * 60000).toISOString() : undefined,
+  });
+}
 
-    if (error) {
-      console.warn('Failed to insert mobile notification:', error.message);
-      return false;
-    }
+export async function markMobileNotificationAsRead(id: string, isRead: boolean = true): Promise<boolean> {
+  return setNotificationState([id], isRead ? 'read' : 'unread');
+}
 
-    // Trigger immediate in-app tactile banner
-    const isAlert = payload.priority === 'critical' || payload.priority === 'urgent' || payload.priority === 'high';
-    NotificationEmitter.trigger(payload.title, payload.message, isAlert);
+export async function markAllMobileNotificationsAsRead(_staffName?: string): Promise<boolean> {
+  return commitNotificationState(async () => {
+    const { data, error } = await supabase.rpc('ecotrack_mark_all_notifications_read');
+    return !error && Number.isInteger(data) && data >= 0;
+  }, { action: 'read' });
+}
 
-    return true;
-  } catch (e) {
-    console.error('Error creating mobile notification:', e);
+// Delete means archive only for the current recipient, including broadcasts.
+export async function deleteMobileNotification(id: string): Promise<boolean> {
+  return setNotificationState([id], 'archive');
+}
+
+export async function deleteMultipleMobileNotifications(ids: string[]): Promise<boolean> {
+  if (!ids?.length) return true;
+  return setNotificationState(ids, 'archive');
+}
+
+export async function snoozeMobileNotification(id: string, minutes: number = 60): Promise<boolean> {
+  if (!Number.isInteger(minutes) || minutes <= 0 || minutes > 10080) return false;
+  return setNotificationState([id], 'snooze', minutes);
+}
+
+export async function unsnoozeMobileNotification(id: string): Promise<boolean> {
+  return setNotificationState([id], 'unsnooze');
+}
+
+// Ad-hoc events are administrator-only. Maintenance events come from the transaction trigger.
+export async function createMobileNotification(payload: CreateMobileNotificationPayload): Promise<boolean> {
+  if (!payload.title?.trim() || !payload.message?.trim() || !payload.eventKey?.trim()) return false;
+  if (payload.broadcast ? Boolean(payload.staffId) : !payload.staffId?.trim()) return false;
+  try {
+    const { data, error } = await supabase.rpc('ecotrack_create_notification', {
+      p_payload: {
+        event_key: payload.eventKey,
+        staff_id: payload.staffId || null,
+        is_broadcast: payload.broadcast === true,
+        title: payload.title,
+        message: payload.message,
+        type: payload.type || 'task_reminder',
+        priority: payload.priority || 'medium',
+        category: payload.category || 'task',
+        related_report_id: payload.relatedReportId || null,
+        aircon_id: payload.airconId || null,
+        aircon_name: payload.airconName || null,
+        aircon_type: payload.airconType || null,
+        location: payload.location || null,
+        due_date: payload.dueDate || null,
+        verification_remarks: payload.verificationRemarks || null,
+      },
+    });
+    return !error && typeof data === 'string' && data.length > 0;
+  } catch (error) {
+    console.warn('Unable to create notification:', error);
     return false;
   }
 }
-
-// Proactive Maintenance Reminder Engine
-// Runs periodically on app launch / refresh to guarantee technicians never miss upcoming, due, or overdue maintenance tasks
+// Foreground-only reminders. This does not schedule push or background delivery.
 export async function checkAndDispatchMaintenanceReminders(
-  staffName: string,
+  _staffName: string,
   reports: LiveMaintenanceReport[]
 ): Promise<void> {
   try {
-    if (!reports || reports.length === 0) return;
+    if (!reports?.length) return;
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data.user) return;
 
     const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
-    const storageKey = `ECO_LAST_REMINDED_${todayStr}_${staffName}`;
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const storageKey = `ECO_LAST_REMINDED_${todayStr}_${data.user.id}`;
 
     // Prevent duplicate spamming on multiple rapid re-renders (check once per hour per day)
     const lastChecked = await AsyncStorage.getItem(storageKey);
@@ -381,10 +429,8 @@ export async function checkAndDispatchMaintenanceReminders(
       return;
     }
 
-    // Find urgent, due today, or overdue tasks for this technician
-    const userReports = reports.filter(
-      (r) => !staffName || r.assignedWorker === staffName || r.assignedWorker === 'Maintenance Staff'
-    );
+    // Reports were fetched under server-enforced assignment access. Names are display data.
+    const userReports = reports;
 
     const urgentRepairs = userReports.filter((r) => r.status === 'Needs Repair');
     const overdueTasks = userReports.filter(
@@ -398,7 +444,7 @@ export async function checkAndDispatchMaintenanceReminders(
     if (urgentRepairs.length > 0) {
       const topRepair = urgentRepairs[0];
       NotificationEmitter.trigger(
-        `URGENT: Repair Needed (${topRepair.airconId})`,
+        `URGENT: Repair Needed (${topRepair.airconName || topRepair.controllerName || 'Name unavailable'})`,
         `${topRepair.title} at ${topRepair.location} requires immediate repair attention.`,
         true
       );

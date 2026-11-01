@@ -1,3 +1,4 @@
+import { Colors as UiColors, type AppColors, Spacing } from '@/constants/theme';
 import { useState, useEffect } from 'react';
 import {
   View,
@@ -11,7 +12,7 @@ import {
 } from 'react-native';
 import { Image } from 'expo-image';
 import { ThemedText } from './themed-text';
-import { Spacing } from '@/constants/theme';
+
 import { useSettings } from '@/context/settings-context';
 
 // 2D line-art eye vector icons using base64-encoded SVG data URIs
@@ -36,6 +37,7 @@ type InputFieldType = 'phone' | 'password';
 
 export function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
   const { effectiveTheme } = useSettings();
+  const styles = themedStyles[effectiveTheme];
   const isDark = effectiveTheme === 'dark';
 
   const [phone, setPhone] = useState('');
@@ -140,13 +142,11 @@ export function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
             
             {/* Logo Section */}
             <View style={styles.logoContainer}>
-              <View style={[styles.logoBadge, isDark && styles.logoBadgeDark]}>
-                <Image
-                  source={require('@/assets/images/ecoTrack.png')}
-                  style={styles.logoImage}
-                  contentFit="contain"
-                />
-              </View>
+              <Image
+                source={require('@/assets/images/ecoTrack.png')}
+                style={styles.logoImage}
+                contentFit="contain"
+              />
               <ThemedText style={[styles.titleText, isDark && styles.titleTextDark]}>
                 EcoTrack
               </ThemedText>
@@ -281,7 +281,7 @@ export function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                 ]}
               >
                 {loading ? (
-                  <ActivityIndicator color="#ffffff" />
+                  <ActivityIndicator color={UiColors[effectiveTheme].onPrimary} />
                 ) : (
                   <ThemedText style={styles.submitButtonText}>
                     LOGIN
@@ -321,7 +321,7 @@ export function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
   keyboardContainer: {
     flex: 1,
     backgroundColor: '#062e1e',
@@ -340,14 +340,14 @@ const styles = StyleSheet.create({
   },
   whiteCard: {
     width: '100%',
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 36,
     paddingHorizontal: 28,
     paddingVertical: 36,
     alignItems: 'stretch',
     borderWidth: 1.5,
-    borderColor: '#10b981',
-    shadowColor: 'rgba(6, 14, 30, 0.18)',
+    borderColor: colors.panelBorder,
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 16 },
     shadowOpacity: 1,
     shadowRadius: 36,
@@ -358,9 +358,9 @@ const styles = StyleSheet.create({
     }),
   },
   darkCard: {
-    backgroundColor: '#151e32',
-    borderColor: 'rgba(16, 185, 129, 0.45)',
-    shadowColor: '#000000',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
+    shadowColor: "#0f172a",
     shadowOpacity: 0.6,
     shadowRadius: 30,
   },
@@ -368,74 +368,55 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: Spacing.four,
   },
-  logoBadge: {
-    width: 72,
-    height: 72,
-    backgroundColor: '#ffffff',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 22,
-    borderWidth: 1,
-    borderColor: '#f0fdf4',
-    shadowColor: '#10b981',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.12,
-    shadowRadius: 10,
-    elevation: 2,
-    marginBottom: Spacing.three,
-  },
-  logoBadgeDark: {
-    backgroundColor: '#0f172a',
-    borderColor: 'rgba(16, 185, 129, 0.3)',
-    shadowColor: '#10b981',
-    shadowOpacity: 0.3,
-  },
   logoImage: {
-    width: 52,
-    height: 52,
+    width: 80,
+    height: 80,
+    borderRadius: 20,
+    overflow: 'hidden',
+    marginBottom: Spacing.three,
   },
   titleText: {
     fontSize: 28,
     fontWeight: '900',
     letterSpacing: -0.5,
-    color: '#0b291d',
+    color: colors.text,
     textAlign: 'center',
     marginBottom: 4,
   },
   titleTextDark: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
   subtitleText: {
     textAlign: 'center',
     fontSize: 13,
     lineHeight: 18,
-    color: '#6b7280',
+    color: colors.textSecondary,
     fontWeight: '500',
     paddingHorizontal: Spacing.two,
   },
   subtitleTextDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   errorContainer: {
-    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.2)',
+    borderColor: colors.border,
     borderRadius: 12,
     padding: Spacing.two,
     marginBottom: Spacing.three,
   },
   errorContainerDark: {
-    backgroundColor: 'rgba(239, 68, 68, 0.18)',
-    borderColor: 'rgba(239, 68, 68, 0.45)',
+    backgroundColor: colors.errorSurface,
+    borderColor: colors.border,
   },
   errorText: {
-    color: '#ef4444',
+    color: colors.error,
     fontSize: 13,
     fontWeight: '600',
     textAlign: 'center',
   },
   errorTextDark: {
-    color: '#f87171',
+    color: colors.error,
   },
   formContainer: {
     gap: Spacing.three,
@@ -452,18 +433,18 @@ const styles = StyleSheet.create({
     paddingLeft: 4,
   },
   inputLabelDark: {
-    color: '#cbd5e1',
+    color: colors.textMuted,
   },
   inputField: {
     borderRadius: 14,
     borderWidth: 1.5,
-    borderColor: '#e5e7eb',
-    backgroundColor: '#f9fafb',
+    borderColor: colors.inputBorder,
+    backgroundColor: colors.background,
     paddingHorizontal: Spacing.three,
     paddingVertical: 12,
     fontSize: 14,
     fontWeight: '600',
-    color: '#1f2937',
+    color: colors.text,
     ...Platform.select({
       web: {
         outlineStyle: 'none',
@@ -472,16 +453,16 @@ const styles = StyleSheet.create({
     }),
   },
   inputFieldDark: {
-    backgroundColor: '#0a0f1d',
-    borderColor: '#334155',
-    color: '#f1f5f9',
+    backgroundColor: colors.background,
+    borderColor: colors.inputBorder,
+    color: colors.text,
   },
   inputFieldFocused: {
-    borderColor: '#10b981',
-    backgroundColor: '#ffffff',
+    borderColor: colors.emerald,
+    backgroundColor: colors.backgroundElement,
   },
   inputFieldFocusedDark: {
-    borderColor: '#10b981',
+    borderColor: colors.emerald,
     backgroundColor: '#0f172a',
   },
   passwordWrapper: {
@@ -504,13 +485,13 @@ const styles = StyleSheet.create({
     height: 20,
   },
   submitButton: {
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     borderRadius: 14,
     paddingVertical: 14,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: Spacing.two,
-    shadowColor: '#10b981',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.12,
     shadowRadius: 10,
@@ -528,7 +509,7 @@ const styles = StyleSheet.create({
     transform: [{ scale: 0.96 }],
   },
   submitButtonText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 15,
     fontWeight: '800',
     letterSpacing: 0.5,
@@ -556,25 +537,25 @@ const styles = StyleSheet.create({
     height: 18,
     borderRadius: 5,
     borderWidth: 1.5,
-    borderColor: '#d1d5db',
-    backgroundColor: '#f9fafb',
+    borderColor: colors.border,
+    backgroundColor: colors.background,
     alignItems: 'center',
     justifyContent: 'center',
   },
   checkboxDark: {
-    borderColor: '#475569',
-    backgroundColor: '#0a0f1d',
+    borderColor: colors.border,
+    backgroundColor: colors.background,
   },
   checkboxChecked: {
-    backgroundColor: '#10b981',
-    borderColor: '#10b981',
+    backgroundColor: colors.primaryFill,
+    borderColor: colors.border,
   },
   checkboxCheckedDark: {
-    backgroundColor: '#059669',
-    borderColor: '#10b981',
+    backgroundColor: colors.primaryFill,
+    borderColor: colors.border,
   },
   checkmarkIcon: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 11,
     fontWeight: '900',
     lineHeight: 13,
@@ -585,7 +566,7 @@ const styles = StyleSheet.create({
     color: '#4b5563',
   },
   rememberMeTextDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   forgotPasswordButton: {
     paddingVertical: 2,
@@ -598,9 +579,10 @@ const styles = StyleSheet.create({
   forgotPasswordText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#059669',
+    color: colors.emerald,
   },
   forgotPasswordTextDark: {
-    color: '#34d399',
+    color: colors.emerald,
   },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };

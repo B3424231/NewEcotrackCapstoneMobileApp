@@ -1,36 +1,87 @@
 {
   "expo": {
-    "name": "EcoTrackApp",
+    "name": "EcoTrack",
     "slug": "ecotrackapp",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/ecoTrack.png",
+    "icon": "./assets/images/ecotrack-app-icon.png",
     "scheme": "ecotrackapp",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/images/ecoTrack.png"
+      "icon": "./assets/images/ecotrack-app-icon.png",
+      "entitlements": {
+        "com.apple.developer.networking.wifi-info": true
+      },
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Allow EcoTrack to read your connected Wi-Fi name when configuring an AC controller."
+      }
     },
     "android": {
       "package": "com.ecotrack.app",
+      "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
-        "backgroundColor": "#0b291d",
-        "foregroundImage": "./assets/images/ecoTrack.png",
-        "monochromeImage": "./assets/images/ecoTrack.png"
+        "backgroundColor": "#ffffff",
+        "foregroundImage": "./assets/images/ecotrack-launcher-foreground.png",
+        "monochromeImage": "./assets/images/ecotrack-launcher-foreground.png"
       },
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.RECORD_AUDIO"
+      ],
       "predictiveBackGestureEnabled": false
     },
     "web": {
-      "output": "static",
-      "favicon": "./assets/images/ecoTrack.png"
+      "output": "single",
+      "favicon": "./assets/images/ecotrack-app-icon.png"
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#0b291d"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Allow EcoTrack to take profile and maintenance proof photos.",
+          "photosPermission": "Allow EcoTrack to select profile and maintenance proof photos."
+        }
+      ],
       [
         "expo-splash-screen",
         {
           "backgroundColor": "#0b291d",
           "image": "./assets/images/ecoTrack.png",
           "imageWidth": 120
+        }
+      ],
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "modes": [
+            "peripheral",
+            "central"
+          ],
+          "bluetoothAlwaysPermission": "Allow EcoTrack to connect to nearby ESP32-S3 AC Controller nodes over Bluetooth."
         }
       ]
     ],
@@ -40,9 +91,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "dc3394b9-32fa-4c3f-829e-2abf1c6ddbc1"
+        "projectId": "bc84c899-5b2f-428a-b534-9e5b7e7efd0f"
       }
     },
-    "owner": "rey12345"
+    "owner": "niggerrey"
   }
 }

@@ -8,17 +8,23 @@ import { scheduleOnRN } from 'react-native-worklets';
 const INITIAL_SCALE_FACTOR = Dimensions.get('screen').height / 90;
 const DURATION = 600;
 
-export function AnimatedSplashOverlay() {
+export function AnimatedSplashOverlay({ ready = true }: { ready?: boolean } = {}) {
   const [animate, setAnimate] = useState(false);
   const [visible, setVisible] = useState(true);
+  const [laidOut, setLaidOut] = useState(false);
 
-  // Auto-hide fallback to prevent stuck splash screen on Fast Refresh / Metro loading locks
+  // Start the exit animation and its fallback only after session verification and layout.
   useEffect(() => {
+    if (!ready || !laidOut) return;
+    let active = true;
+    SplashScreen.hideAsync().catch(() => {}).then(() => {
+      if (active) setAnimate(true);
+    });
     const timer = setTimeout(() => {
       setVisible(false);
     }, 1500);
-    return () => clearTimeout(timer);
-  }, []);
+    return () => { active = false; clearTimeout(timer); };
+  }, [ready, laidOut]);
 
   if (!visible) return null;
 
@@ -56,11 +62,7 @@ export function AnimatedSplashOverlay() {
     </Animated.View>
   ) : (
     <View
-      onLayout={() => {
-        SplashScreen.hideAsync().finally(() => {
-          setAnimate(true);
-        });
-      }}
+      onLayout={() => setLaidOut(true)}
       style={styles.splashOverlay}>
       {image}
     </View>
@@ -134,6 +136,8 @@ const styles = StyleSheet.create({
   image: {
     width: 80,
     height: 80,
+    borderRadius: 20,
+    overflow: 'hidden',
   },
   background: {
     borderRadius: 40,

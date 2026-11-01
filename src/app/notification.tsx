@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { Colors as UiColors, type AppColors, Colors, Spacing } from '@/constants/theme';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   StyleSheet,
   View,
@@ -19,19 +20,16 @@ import { router } from 'expo-router';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Colors, Spacing } from '@/constants/theme';
+
 import { useAuth } from '@/context/auth-context';
 import { useSettings } from '@/context/settings-context';
 import { FloatingBottomNavbar } from '@/components/floating-navbar';
 import { LinearGradient } from 'expo-linear-gradient';
-import { AppIcon } from '@/components/app-icon';
+import { AppIcon, AppIconName } from '@/components/app-icon';
 import { ICON_AIRCONSTATE, ICON_CHECKLIST } from '@/constants/custom-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   MobileNotificationItem,
-  fetchLiveMobileNotifications,
-  deduplicateMobileNotifications,
-  subscribeToMobileNotifications,
   markMobileNotificationAsRead,
   markAllMobileNotificationsAsRead,
   deleteMobileNotification,
@@ -39,59 +37,10 @@ import {
   snoozeMobileNotification,
   unsnoozeMobileNotification,
 } from '@/services/mobile-notifications';
-import Constants from 'expo-constants';
+import { useMobileNotifications } from '@/hooks/use-mobile-notifications';
 
 const SCREEN_HEIGHT = Dimensions.get('window').height;
 const SCREEN_WIDTH = Dimensions.get('window').width;
-
-// Safe-resolve expo-notifications dynamically
-let Notifications: any = null;
-const isExpoGo =
-  (Constants.executionEnvironment as string) === 'store-client' ||
-  Constants.appOwnership === 'expo';
-
-if (!isExpoGo) {
-  try {
-    Notifications = require('expo-notifications');
-    if (Notifications && typeof Notifications.setNotificationHandler === 'function') {
-      Notifications.setNotificationHandler({
-        handleNotification: async () => ({
-          shouldShowAlert: true,
-          shouldPlaySound: true,
-          shouldSetBadge: true,
-          shouldShowBanner: true,
-          shouldShowList: true,
-        }),
-      });
-    }
-  } catch (_e) {
-    // Not supported in this environment
-  }
-}
-
-async function setupNotificationChannels() {
-  if (!Notifications) return;
-  if (Platform.OS === 'android') {
-    try {
-      await Notifications.setNotificationChannelAsync('alerts', {
-        name: 'Alert Notifications',
-        importance: Notifications.AndroidImportance.HIGH,
-        sound: 'default',
-        vibrationPattern: [0, 250, 250, 250],
-        lightColor: '#ef4444',
-      });
-      await Notifications.setNotificationChannelAsync('messages', {
-        name: 'Maintenance Task Reminders',
-        importance: Notifications.AndroidImportance.HIGH,
-        sound: 'default',
-        vibrationPattern: [0, 200, 100, 200],
-        lightColor: '#10b981',
-      });
-    } catch (_e) {
-      /* noop */
-    }
-  }
-}
 
 // 2D Vector Icons
 const ICON_2D_CRITICAL_RED =
@@ -113,24 +62,18 @@ const ICON_CHEVRON_RIGHT =
 type FilterType = 'all' | 'tasks' | 'reminders' | 'urgent' | 'unread';
 
 // Compute "remind at" time label for snooze options
-function getSnoozeTimeLabel(minutes: number): string {
-  const now = new Date();
-  const target = new Date(now.getTime() + minutes * 60 * 1000);
+function getSnoozeTimeLabel(minutes: number, now: number): string {
+  const target = new Date(now + minutes * 60 * 1000);
   return target.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 export default function NotificationScreen() {
-  const { userName } = useAuth();
+  const { userId, userType, isAuthenticated } = useAuth();
   const { effectiveTheme, colors, triggerHaptic } = useSettings();
-  const theme = effectiveTheme;
-
-  // Setup notification channels
-  useEffect(() => {
-    setupNotificationChannels();
-  }, []);
+  const styles = themedStyles[effectiveTheme];
 
   // Modal states
-  const [selectedNotification, setSelectedNotification] = useState<MobileNotificationItem | null>(null);
+  const [selectedNotificationSnapshot, setSelectedNotification] = useState<MobileNotificationItem | null>(null);
   const [detailsVisible, setDetailsVisible] = useState(false);
   const [optionsNotification, setOptionsNotification] = useState<MobileNotificationItem | null>(null);
   const [optionsVisible, setOptionsVisible] = useState(false);
@@ -166,17 +109,28 @@ export default function NotificationScreen() {
   } | null>(null);
 
   // Animations
-  const detailsSlideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
-  const optionsSlideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
-  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const [detailsSlideAnim] = useState(() => new Animated.Value(SCREEN_HEIGHT));
+  const [optionsSlideAnim] = useState(() => new Animated.Value(SCREEN_HEIGHT));
+  const [pulseAnim] = useState(() => new Animated.Value(1));
 
   // Filter state
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
 
   // Live Notifications State
-  const [notifications, setNotifications] = useState<MobileNotificationItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
+  const { items: notifications, loading, refreshing, updating, error: loadError, refresh } =
+    useMobileNotifications(isAuthenticated && userId ? `${userType}:${userId}` : undefined);
+  const selectedNotification = notifications.find(item => item.id === selectedNotificationSnapshot?.id)
+    || selectedNotificationSnapshot;
+  if (selectedNotification !== selectedNotificationSnapshot) {
+    // Retain the latest details if this notification leaves the refreshed feed.
+    setSelectedNotification(selectedNotification);
+  }
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 60000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Current snooze calculation for target notification
   const currentSnoozeItem = useMemo(() => {
@@ -187,7 +141,7 @@ export default function NotificationScreen() {
   const isTargetSnoozed = Boolean(
     currentSnoozeItem?.isSnoozed &&
     currentSnoozeItem?.snoozeUntil &&
-    new Date(currentSnoozeItem.snoozeUntil).getTime() > Date.now()
+    new Date(currentSnoozeItem.snoozeUntil).getTime() > now
   );
 
   const activeSnoozeMinutes = useMemo(() => {
@@ -196,14 +150,14 @@ export default function NotificationScreen() {
       return snoozeDurations[snoozeTargetId];
     }
     if (currentSnoozeItem?.snoozeUntil) {
-      const remaining = Math.max(1, Math.round((new Date(currentSnoozeItem.snoozeUntil).getTime() - Date.now()) / 60000));
+      const remaining = Math.max(1, Math.round((new Date(currentSnoozeItem.snoozeUntil).getTime() - now) / 60000));
       const SNOOZE_OPTIONS = [15, 30, 60, 120, 240, 480, 1440];
       return SNOOZE_OPTIONS.reduce((prev, curr) =>
         Math.abs(curr - remaining) < Math.abs(prev - remaining) ? curr : prev
       );
     }
     return null;
-  }, [isTargetSnoozed, snoozeTargetId, snoozeDurations, currentSnoozeItem]);
+  }, [isTargetSnoozed, snoozeTargetId, snoozeDurations, currentSnoozeItem, now]);
 
   const currentSnoozeFormatted = useMemo(() => {
     if (!isTargetSnoozed || !currentSnoozeItem?.snoozeUntil) return null;
@@ -215,8 +169,8 @@ export default function NotificationScreen() {
 
   const remainingMins = useMemo(() => {
     if (!isTargetSnoozed || !currentSnoozeItem?.snoozeUntil) return null;
-    return Math.max(1, Math.round((new Date(currentSnoozeItem.snoozeUntil).getTime() - Date.now()) / 60000));
-  }, [isTargetSnoozed, currentSnoozeItem]);
+    return Math.max(1, Math.round((new Date(currentSnoozeItem.snoozeUntil).getTime() - now) / 60000));
+  }, [isTargetSnoozed, currentSnoozeItem, now]);
 
   // Pulse animation for beacon
   useEffect(() => {
@@ -234,36 +188,9 @@ export default function NotificationScreen() {
         }),
       ])
     ).start();
-  }, []);
+  }, [pulseAnim]);
 
-  const loadNotifications = async (showSpinner = false) => {
-    if (showSpinner) setLoading(true);
-    try {
-      const data = await fetchLiveMobileNotifications(userName);
-      const cleanData = deduplicateMobileNotifications(data || []);
-      setNotifications(cleanData);
-    } catch (e) {
-      console.error('Error loading mobile notifications:', e);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
-
-  useEffect(() => {
-    loadNotifications(true);
-    const unsubscribe = subscribeToMobileNotifications(() => {
-      loadNotifications(false);
-    });
-    return () => {
-      unsubscribe();
-    };
-  }, [userName]);
-
-  const onRefresh = () => {
-    setRefreshing(true);
-    loadNotifications(false);
-  };
+  const onRefresh = () => { void refresh(); };
 
   // Selection Mode Actions
   const toggleSelectionMode = () => {
@@ -283,16 +210,21 @@ export default function NotificationScreen() {
 
   // Actions
   const handleToggleRead = async (note: MobileNotificationItem) => {
+    if (updating) return;
     const nextRead = !note.isRead;
-    setNotifications((prev) =>
-      prev.map((n) => (n.id === note.id ? { ...n, isRead: nextRead } : n))
-    );
-    await markMobileNotificationAsRead(note.id, nextRead);
+    if (!await markMobileNotificationAsRead(note.id, nextRead)) {
+      Alert.alert('Unable to update notification', 'Please try again.');
+      return;
+    }
   };
 
   const handleMarkAllRead = async () => {
-    setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
-    await markAllMobileNotificationsAsRead(userName);
+    if (updating) return;
+    if (!await markAllMobileNotificationsAsRead()) {
+      Alert.alert('Unable to update notifications', 'Please try again.');
+      return;
+    }
+    setActiveFilter(prev => prev === 'unread' ? 'all' : prev);
   };
 
   const handleClearAll = () => {
@@ -307,10 +239,13 @@ export default function NotificationScreen() {
       onConfirm: async () => {
         setIsDeletingSelected(true);
         const allIds = notifications.map((n) => n.id);
-        setNotifications([]);
+        if (!await deleteMultipleMobileNotifications(allIds)) {
+          setIsDeletingSelected(false);
+          Alert.alert('Unable to delete notifications', 'Please try again.');
+          return;
+        }
         setSelectedIds([]);
         setIsSelectionMode(false);
-        await deleteMultipleMobileNotifications(allIds);
         setIsDeletingSelected(false);
       },
     });
@@ -318,9 +253,11 @@ export default function NotificationScreen() {
   };
 
   const handleDelete = async (id: string) => {
-    setNotifications((prev) => prev.filter((n) => n.id !== id));
+    if (!await deleteMobileNotification(id)) {
+      Alert.alert('Unable to delete notification', 'Please try again.');
+      return;
+    }
     setSelectedIds((prev) => prev.filter((item) => item !== id));
-    await deleteMobileNotification(id);
     closeOptions();
   };
 
@@ -332,54 +269,54 @@ export default function NotificationScreen() {
 
   const handleSnoozeWithDuration = async (minutes: number) => {
     if (!snoozeTargetId) return;
+    if (!await snoozeMobileNotification(snoozeTargetId, minutes)) {
+      Alert.alert('Unable to snooze notification', 'Please try again.');
+      return;
+    }
     triggerHaptic();
-    const snoozeTime = new Date(Date.now() + minutes * 60 * 1000).toISOString();
-    setNotifications((prev) =>
-      prev.map((n) => (n.id === snoozeTargetId ? { ...n, isSnoozed: true, snoozeUntil: snoozeTime } : n))
-    );
 
     const updatedMap = { ...snoozeDurations, [snoozeTargetId]: minutes };
     setSnoozeDurations(updatedMap);
     await AsyncStorage.setItem('@ecotrack_snooze_durations', JSON.stringify(updatedMap));
 
-    await snoozeMobileNotification(snoozeTargetId, minutes);
     setSnoozePickerVisible(false);
     setSnoozeTargetId(null);
   };
 
   const handleCancelSnooze = async (id: string) => {
+    if (!await unsnoozeMobileNotification(id)) {
+      Alert.alert('Unable to update notification', 'Please try again.');
+      return;
+    }
     triggerHaptic();
-    setNotifications((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, isSnoozed: false, snoozeUntil: undefined } : n))
-    );
 
     const updatedMap = { ...snoozeDurations };
     delete updatedMap[id];
     setSnoozeDurations(updatedMap);
     await AsyncStorage.setItem('@ecotrack_snooze_durations', JSON.stringify(updatedMap));
 
-    await unsnoozeMobileNotification(id);
     setSnoozePickerVisible(false);
     setSnoozeTargetId(null);
   };
 
   const handleOpenTask = (note: MobileNotificationItem) => {
     closeDetails();
-    if (note.relatedReportId) {
-      const isRepair = note.relatedReportId.startsWith('REP-') || note.type === 'urgent_repair';
+    const cleanRepId = note.relatedReportId ? note.relatedReportId.replace(/^RWK-/i, 'REP-') : undefined;
+    if (cleanRepId) {
+      const isRepair = cleanRepId.startsWith('REP-') || note.type === 'urgent_repair';
       if (isRepair) {
         router.push({
           pathname: '/Maintenance' as any,
           params: {
-            reportId: note.relatedReportId,
-            repairId: note.relatedReportId,
+            reportId: cleanRepId,
+            repairId: cleanRepId,
             screen: 'REPAIR',
           },
         });
       } else {
         router.push({
           pathname: '/Maintenance' as any,
-          params: { reportId: note.relatedReportId },
+          params: { reportId: cleanRepId },
         });
       }
     } else {
@@ -486,10 +423,13 @@ export default function NotificationScreen() {
       onConfirm: async () => {
         setIsDeletingSelected(true);
         const idsToDelete = [...selectedIds];
-        setNotifications((prev) => prev.filter((n) => !idsToDelete.includes(n.id)));
+        if (!await deleteMultipleMobileNotifications(idsToDelete)) {
+          setIsDeletingSelected(false);
+          Alert.alert('Unable to delete notifications', 'Please try again.');
+          return;
+        }
         setSelectedIds([]);
         setIsSelectionMode(false);
-        await deleteMultipleMobileNotifications(idsToDelete);
         setIsDeletingSelected(false);
       },
     });
@@ -498,7 +438,7 @@ export default function NotificationScreen() {
 
   const isDark = effectiveTheme === 'dark';
 
-  // Priority Styling Mapping
+  // Priority Styling Mapping for Facebook-Style Notification Cards
   const getPriorityStyle = (note: MobileNotificationItem) => {
     const isVerifiedRepair =
       note.title?.toLowerCase().includes('verified') ||
@@ -507,14 +447,14 @@ export default function NotificationScreen() {
 
     if (isVerifiedRepair) {
       return {
-        bg: isDark ? 'rgba(16, 185, 129, 0.2)' : '#d1fae5',
-        border: isDark ? 'rgba(16, 185, 129, 0.45)' : '#6ee7b7',
-        icon: ICON_2D_CHECK_GREEN,
+        avatarBg: isDark ? 'rgba(16, 185, 129, 0.2)' : '#d1fae5',
+        iconName: 'check-circle' as AppIconName,
+        iconColor: isDark ? '#34d399' : '#059669',
+        miniBadgeBg: '#10b981',
+        miniBadgeIcon: 'check' as AppIconName,
+        miniBadgeColor: '#ffffff',
         textColor: isDark ? '#34d399' : '#059669',
-        badgeBg: isDark ? 'rgba(16, 185, 129, 0.15)' : '#ecfdf5',
-        badgeBorder: isDark ? 'rgba(16, 185, 129, 0.35)' : '#a7f3d0',
-        badgeText: isDark ? '#6ee7b7' : '#047857',
-        tagLabel: '✓ REPAIRED & VERIFIED',
+        tagLabel: '✓ VERIFIED',
         accentBorder: '#10b981',
       };
     }
@@ -526,27 +466,27 @@ export default function NotificationScreen() {
 
     if (isCritical) {
       return {
-        bg: isDark ? 'rgba(239, 68, 68, 0.2)' : '#fee2e2',
-        border: isDark ? 'rgba(239, 68, 68, 0.45)' : '#fca5a5',
-        icon: ICON_2D_CRITICAL_RED,
+        avatarBg: isDark ? 'rgba(239, 68, 68, 0.2)' : '#fee2e2',
+        iconName: 'alert-octagon' as AppIconName,
+        iconColor: isDark ? '#f87171' : '#dc2626',
+        miniBadgeBg: '#ef4444',
+        miniBadgeIcon: 'alert' as AppIconName,
+        miniBadgeColor: '#ffffff',
         textColor: isDark ? '#f87171' : '#dc2626',
-        badgeBg: isDark ? 'rgba(239, 68, 68, 0.15)' : '#fef2f2',
-        badgeBorder: isDark ? 'rgba(239, 68, 68, 0.35)' : '#fecaca',
-        badgeText: isDark ? '#fca5a5' : '#b91c1c',
-        tagLabel: 'CRITICAL DEFECT',
+        tagLabel: 'CRITICAL',
         accentBorder: '#ef4444',
       };
     }
 
     if (isHighOrOverdue) {
       return {
-        bg: isDark ? 'rgba(245, 158, 11, 0.2)' : '#fef3c7',
-        border: isDark ? 'rgba(245, 158, 11, 0.45)' : '#fcd34d',
-        icon: ICON_2D_WARNING_AMBER,
+        avatarBg: isDark ? 'rgba(245, 158, 11, 0.2)' : '#fef3c7',
+        iconName: 'alert' as AppIconName,
+        iconColor: isDark ? '#fbbf24' : '#d97706',
+        miniBadgeBg: '#f59e0b',
+        miniBadgeIcon: 'clock' as AppIconName,
+        miniBadgeColor: '#ffffff',
         textColor: isDark ? '#fbbf24' : '#d97706',
-        badgeBg: isDark ? 'rgba(245, 158, 11, 0.15)' : '#fffbeb',
-        badgeBorder: isDark ? 'rgba(245, 158, 11, 0.35)' : '#fde68a',
-        badgeText: isDark ? '#fde68a' : '#b45309',
         tagLabel: note.type === 'overdue_alert' ? 'OVERDUE' : 'HIGH PRIORITY',
         accentBorder: '#f59e0b',
       };
@@ -554,13 +494,13 @@ export default function NotificationScreen() {
 
     if (isDueReminder) {
       return {
-        bg: isDark ? 'rgba(234, 179, 8, 0.2)' : '#fef3c7',
-        border: isDark ? 'rgba(234, 179, 8, 0.45)' : '#fde68a',
-        icon: ICON_2D_WARNING_AMBER,
+        avatarBg: isDark ? 'rgba(234, 179, 8, 0.2)' : '#fef3c7',
+        iconName: 'calendar' as AppIconName,
+        iconColor: isDark ? '#facc15' : '#b45309',
+        miniBadgeBg: '#eab308',
+        miniBadgeIcon: 'clock' as AppIconName,
+        miniBadgeColor: '#ffffff',
         textColor: isDark ? '#facc15' : '#b45309',
-        badgeBg: isDark ? 'rgba(234, 179, 8, 0.15)' : '#fffbeb',
-        badgeBorder: isDark ? 'rgba(234, 179, 8, 0.35)' : '#fde68a',
-        badgeText: isDark ? '#fef08a' : '#92400e',
         tagLabel: 'DUE TODAY',
         accentBorder: '#eab308',
       };
@@ -568,28 +508,28 @@ export default function NotificationScreen() {
 
     if (isNewTask) {
       return {
-        bg: isDark ? 'rgba(168, 85, 247, 0.2)' : '#f3e8ff',
-        border: isDark ? 'rgba(168, 85, 247, 0.45)' : '#d8b4fe',
-        icon: ICON_2D_TASK_PURPLE,
+        avatarBg: isDark ? 'rgba(168, 85, 247, 0.2)' : '#f3e8ff',
+        iconName: 'maintenance' as AppIconName,
+        iconColor: isDark ? '#c084fc' : '#7e22ce',
+        miniBadgeBg: '#9333ea',
+        miniBadgeIcon: 'checklist' as AppIconName,
+        miniBadgeColor: '#ffffff',
         textColor: isDark ? '#c084fc' : '#7e22ce',
-        badgeBg: isDark ? 'rgba(168, 85, 247, 0.15)' : '#faf5ff',
-        badgeBorder: isDark ? 'rgba(168, 85, 247, 0.35)' : '#e9d5ff',
-        badgeText: isDark ? '#e9d5ff' : '#6b21a8',
         tagLabel: 'NEW TASK',
         accentBorder: '#9333ea',
       };
     }
 
     return {
-      bg: isDark ? 'rgba(16, 185, 129, 0.2)' : '#d1fae5',
-      border: isDark ? 'rgba(16, 185, 129, 0.45)' : '#6ee7b7',
-      icon: ICON_2D_CHECK_GREEN,
-      textColor: isDark ? '#34d399' : '#059669',
-      badgeBg: isDark ? 'rgba(16, 185, 129, 0.15)' : '#ecfdf5',
-      badgeBorder: isDark ? 'rgba(16, 185, 129, 0.35)' : '#a7f3d0',
-      badgeText: isDark ? '#6ee7b7' : '#047857',
-      tagLabel: 'SCHEDULED',
-      accentBorder: '#10b981',
+      avatarBg: isDark ? 'rgba(255, 255, 255, 0.08)' : '#f1f5f9',
+      iconName: 'bell' as AppIconName,
+      iconColor: isDark ? '#cbd5e1' : '#64748b',
+      miniBadgeBg: '#64748b',
+      miniBadgeIcon: 'check' as AppIconName,
+      miniBadgeColor: '#ffffff',
+      textColor: isDark ? '#cbd5e1' : '#64748b',
+      tagLabel: 'NOTICE',
+      accentBorder: 'rgba(255, 255, 255, 0.1)',
     };
   };
 
@@ -597,21 +537,259 @@ export default function NotificationScreen() {
     try {
       const d = new Date(dateStr);
       if (isNaN(d.getTime())) return 'Recently';
-      const datePart = d.toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      });
-      const timePart = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      return `${datePart} • ${timePart}`;
+      const diffSec = Math.floor((now - d.getTime()) / 1000);
+      if (diffSec < 60) return 'Just now';
+      const diffMin = Math.floor(diffSec / 60);
+      if (diffMin < 60) return `${diffMin}m`;
+      const diffHours = Math.floor(diffMin / 60);
+      if (diffHours < 24) return `${diffHours}h`;
+      const diffDays = Math.floor(diffHours / 24);
+      if (diffDays === 1) return 'Yesterday';
+      if (diffDays < 7) return `${diffDays}d`;
+      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     } catch (_e) {
       return 'Recently';
     }
   };
 
+  const renderNotificationItem = (
+    note: MobileNotificationItem,
+    isUnread: boolean,
+    isLast: boolean = false
+  ) => {
+    const cleanTitle = (note.title || '')
+      .replace(/maintenance\s+rework\s+dispatched/gi, 'Corrective Repair Dispatched')
+      .replace(/maintenance\s+rework/gi, 'Corrective Repair')
+      .replace(/rework\s+dispatched/gi, 'Corrective repair dispatched')
+      .replace(/rework/gi, 'Corrective Repair');
+
+    const cleanMessage = (note.message || '')
+      .replace(/maintenance\s+rework\s+dispatched/gi, 'Corrective Repair Dispatched')
+      .replace(/maintenance\s+rework/gi, 'Corrective Repair')
+      .replace(/rework\s+dispatched/gi, 'Corrective repair dispatched')
+      .replace(/rework/gi, 'corrective repair');
+
+    const cleanReportId = note.relatedReportId ? note.relatedReportId.replace(/^RWK-/i, 'REP-') : undefined;
+
+    const styleInfo = getPriorityStyle({
+      ...note,
+      title: cleanTitle,
+      message: cleanMessage,
+    });
+    const isSelected = selectedIds.includes(note.id);
+
+    return (
+      <Pressable
+        key={note.id}
+        onPress={() => {
+          if (isSelectionMode) {
+            toggleSelectNotification(note.id);
+          } else if (cleanReportId) {
+            handleOpenTask({ ...note, relatedReportId: cleanReportId });
+          } else {
+            openDetails({ ...note, title: cleanTitle, message: cleanMessage, relatedReportId: cleanReportId });
+          }
+        }}
+        onLongPress={() => {
+          if (!isSelectionMode) {
+            setIsSelectionMode(true);
+            setSelectedIds([note.id]);
+          }
+        }}
+        style={({ pressed }) => [
+          styles.fbNotificationRow,
+          !isLast && (isDark ? styles.fbRowDividerDark : styles.fbRowDividerLight),
+          isUnread
+            ? (isDark ? styles.fbRowUnreadDark : styles.fbRowUnreadLight)
+            : (isDark ? styles.fbRowReadDark : styles.fbRowReadLight),
+          isSelectionMode && isSelected && (isDark ? styles.itemSelectedDark : styles.itemSelectedLight),
+          pressed && styles.itemPressed,
+        ]}
+      >
+        {/* Multi-Select Checkbox Column */}
+        {isSelectionMode && (
+          <View style={styles.selectCheckboxWrapper}>
+            <View
+              style={[
+                styles.selectCheckbox,
+                isDark ? styles.selectCheckboxDark : styles.selectCheckboxLight,
+                isSelected && styles.selectCheckboxChecked,
+              ]}
+            >
+              {isSelected && <ThemedText style={styles.selectCheckmark}>✓</ThemedText>}
+            </View>
+          </View>
+        )}
+
+        {/* Circular Avatar with mini overlay cutout badge */}
+        <View style={styles.fbAvatarWrapper}>
+          <View
+            style={[
+              styles.fbAvatarCircle,
+              {
+                backgroundColor: styleInfo.avatarBg,
+              },
+            ]}
+          >
+            <AppIcon name={styleInfo.iconName} size={22} color={styleInfo.iconColor} />
+          </View>
+          <View
+            style={[
+              styles.fbMiniBadge,
+              {
+                backgroundColor: styleInfo.miniBadgeBg,
+                borderColor: isUnread
+                  ? (isDark ? '#121826' : '#ecfdf5')
+                  : (isDark ? '#121826' : '#ffffff'),
+              },
+            ]}
+          >
+            <AppIcon name={styleInfo.miniBadgeIcon} size={11} color={styleInfo.miniBadgeColor} />
+          </View>
+        </View>
+
+        {/* Content Body: Title + message hierarchy */}
+        <View style={styles.fbBody}>
+          <ThemedText
+            style={[styles.fbTitleBold, isDark ? { color: UiColors[effectiveTheme].onPrimary } : { color: UiColors[effectiveTheme].text }]}
+            numberOfLines={2}
+          >
+            {cleanTitle}
+          </ThemedText>
+          {cleanMessage ? (
+            <ThemedText
+              style={[styles.fbMessageText, isDark ? { color: UiColors[effectiveTheme].textMuted } : { color: UiColors[effectiveTheme].textSecondary }]}
+              numberOfLines={2}
+            >
+              {cleanMessage}
+            </ThemedText>
+          ) : null}
+
+          {/* Metadata Row: relative time & location */}
+          <View style={styles.fbMetaRow}>
+            <ThemedText
+              style={[
+                styles.fbTimeText,
+                isUnread ? styles.fbTimeUnread : (isDark ? { color: UiColors[effectiveTheme].textMuted } : { color: UiColors[effectiveTheme].textSecondary }),
+              ]}
+            >
+              {formatTime(note.createdAt)}
+            </ThemedText>
+            {note.location ? (
+              <ThemedText style={[styles.fbMetaDotText, isDark && { color: UiColors[effectiveTheme].textMuted }]} numberOfLines={1}>
+                • {note.location}
+              </ThemedText>
+            ) : null}
+            {note.controllerName || note.airconId ? (
+              <ThemedText style={[styles.fbMetaDotText, isDark && { color: UiColors[effectiveTheme].textMuted }]} numberOfLines={1}>
+                • AC Device: {note.controllerName || 'Name unavailable'}
+              </ThemedText>
+            ) : null}
+            {note.airconName ? (
+              <ThemedText style={[styles.fbMetaDotText, isDark && { color: UiColors[effectiveTheme].textMuted }]} numberOfLines={1}>
+                • Aircon: {note.airconName}
+              </ThemedText>
+            ) : null}
+            {note.dueDate ? (
+              <ThemedText style={[styles.fbMetaDueText, isDark && { color: UiColors[effectiveTheme].warning }]}>
+                • Due {note.dueDate}
+              </ThemedText>
+            ) : null}
+          </View>
+
+          {/* Admin Verification Remarks if present */}
+          {note.verificationRemarks ? (
+            <View style={[styles.fbVerificationChip, isDark ? styles.fbVerificationDark : styles.fbVerificationLight]}>
+              <AppIcon name="shield" size={11} color={isDark ? '#c4b5fd' : '#7e22ce'} />
+              <ThemedText style={[styles.fbVerificationText, isDark && { color: '#c4b5fd' }]} numberOfLines={1}>
+                Admin: {note.verificationRemarks.replace(/rework/gi, 'corrective repair')}
+              </ThemedText>
+            </View>
+          ) : null}
+
+          {/* Keep report identifiers separate from the action labels. */}
+          {cleanReportId ? (
+            <View>
+              <ThemedText
+                style={[styles.fbReportId, isDark && { color: UiColors[effectiveTheme].textMuted }]}
+                numberOfLines={1}
+                accessibilityLabel={`Report ${cleanReportId}`}
+              >
+                #{cleanReportId}
+              </ThemedText>
+              <View style={styles.fbActionRow}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Open checklist for report ${cleanReportId}`}
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    handleOpenTask({ ...note, relatedReportId: cleanReportId });
+                  }}
+                  style={({ pressed }) => [
+                    styles.fbPrimaryActionBtn,
+                    pressed && { opacity: 0.85 },
+                  ]}
+                >
+                  <View style={styles.fbActionIcon}>
+                    <AppIcon name="checklist" size={16} color={UiColors[effectiveTheme].onPrimary} />
+                  </View>
+                  <ThemedText style={styles.fbPrimaryActionBtnText}>
+                    Checklist
+                  </ThemedText>
+                </Pressable>
+
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`View details for report ${cleanReportId}`}
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    openDetails({ ...note, title: cleanTitle, message: cleanMessage, relatedReportId: cleanReportId });
+                  }}
+                  style={({ pressed }) => [
+                    styles.fbSecondaryActionBtn,
+                    isDark ? styles.fbSecondaryActionBtnDark : styles.fbSecondaryActionBtnLight,
+                    pressed && { opacity: 0.8 },
+                  ]}
+                >
+                  <ThemedText style={[styles.fbSecondaryActionBtnText, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
+                    Details
+                  </ThemedText>
+                </Pressable>
+              </View>
+            </View>
+          ) : null}
+        </View>
+
+        {/* Right side: 3-dots menu button & unread indicator dot */}
+        <View style={styles.fbRightActions}>
+          <Pressable
+            hitSlop={8}
+            onPress={(e) => {
+              e.stopPropagation();
+              if (isSelectionMode) {
+                toggleSelectNotification(note.id);
+              } else {
+                openOptions(note);
+              }
+            }}
+            style={styles.fbMoreBtn}
+          >
+            <ThemedText style={[styles.fbMoreDots, isDark && { color: UiColors[effectiveTheme].textMuted }]}>•••</ThemedText>
+          </Pressable>
+
+          {isUnread && !isSelectionMode ? (
+            <View style={[styles.fbUnreadDot, { backgroundColor: UiColors[effectiveTheme].primaryFill }]} />
+          ) : (
+            <View style={{ width: 9, height: 9 }} />
+          )}
+        </View>
+      </Pressable>
+    );
+  };
+
   return (
     <LinearGradient
-      colors={theme === 'dark' ? ['#0f172a', '#0a0f1d'] : ['#d1fae5', '#ffffff']}
+      colors={[UiColors[effectiveTheme].background, UiColors[effectiveTheme].background]}
       style={[styles.container, { backgroundColor: colors.background }]}
       start={{ x: 0, y: 0 }}
       end={{ x: 0, y: 0.35 }}
@@ -660,7 +838,7 @@ export default function NotificationScreen() {
                       pressed && { opacity: 0.7 },
                     ]}
                   >
-                    <ThemedText style={[styles.selectAllHeaderText, isDark && { color: '#34d399' }]}>
+                    <ThemedText style={[styles.selectAllHeaderText, isDark && { color: UiColors[effectiveTheme].emerald }]}>
                       {isAllSelected ? 'Deselect All' : 'Select All'}
                     </ThemedText>
                   </Pressable>
@@ -673,7 +851,7 @@ export default function NotificationScreen() {
                       pressed && { opacity: 0.7 },
                     ]}
                   >
-                    <ThemedText style={[styles.cancelSelectText, isDark && { color: '#94a3b8' }]}>Cancel</ThemedText>
+                    <ThemedText style={[styles.cancelSelectText, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Cancel</ThemedText>
                   </Pressable>
                 </View>
               ) : (
@@ -687,9 +865,9 @@ export default function NotificationScreen() {
                   hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
                 >
                   <View style={styles.threeDotsColumn}>
-                    <View style={[styles.dotVertical, { backgroundColor: isDark ? '#cbd5e1' : '#1e293b' }]} />
-                    <View style={[styles.dotVertical, { backgroundColor: isDark ? '#cbd5e1' : '#1e293b' }]} />
-                    <View style={[styles.dotVertical, { backgroundColor: isDark ? '#cbd5e1' : '#1e293b' }]} />
+                    <View style={[styles.dotVertical, { backgroundColor: colors.text }]} />
+                    <View style={[styles.dotVertical, { backgroundColor: colors.text }]} />
+                    <View style={[styles.dotVertical, { backgroundColor: colors.text }]} />
                   </View>
                 </Pressable>
               )}
@@ -855,21 +1033,22 @@ export default function NotificationScreen() {
 
           {/* Loading Indicator */}
           {loading && notifications.length === 0 && (
-            <View style={styles.loadingContainer}>
-              <View style={[styles.loadingCard, isDark ? styles.cardDark : styles.cardLight]}>
-                <ActivityIndicator size="large" color="#059669" />
-                <ThemedText style={[styles.loadingTitle, isDark && { color: '#f1f5f9' }]}>
-                  Syncing Task Reminders
-                </ThemedText>
-                <ThemedText style={[styles.loadingSubtitle, isDark && { color: '#94a3b8' }]}>
-                  Checking upcoming maintenance and schedules...
-                </ThemedText>
-              </View>
+            <DataListSkeleton label="Loading task reminders..." compact />
+          )}
+
+          {loadError && (
+            <View style={[styles.loadingCard, isDark ? styles.cardDark : styles.cardLight]}>
+              <ThemedText style={[styles.loadingSubtitle, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
+                {loadError}
+              </ThemedText>
+              <Pressable onPress={onRefresh} disabled={refreshing || updating}>
+                <ThemedText style={{ color: UiColors[effectiveTheme].emerald, fontWeight: '700' }}>Retry</ThemedText>
+              </Pressable>
             </View>
           )}
 
           {/* Empty State */}
-          {!loading && filteredNotifications.length === 0 && (
+          {!loading && !loadError && filteredNotifications.length === 0 && (
             <View style={styles.emptyContainer}>
               <Animated.View
                 style={[
@@ -879,16 +1058,12 @@ export default function NotificationScreen() {
                 ]}
               />
               <View style={[styles.emptyBeaconInner, isDark ? styles.beaconInnerDark : styles.beaconInnerLight]}>
-                <Image
-                  source={{ uri: ICON_2D_CHECK_GREEN }}
-                  style={{ width: 36, height: 36 }}
-                  contentFit="contain"
-                />
+                <AppIcon name="check-circle" size={36} color={UiColors[effectiveTheme].emerald} />
               </View>
-              <ThemedText style={[styles.emptyTitle, isDark && { color: '#f1f5f9' }]}>
+              <ThemedText style={[styles.emptyTitle, isDark && { color: UiColors[effectiveTheme].text }]}>
                 All caught up!
               </ThemedText>
-              <ThemedText style={[styles.emptySubtitle, isDark && { color: '#94a3b8' }]}>
+              <ThemedText style={[styles.emptySubtitle, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                 No pending maintenance reminders or task alerts in this view.
               </ThemedText>
             </View>
@@ -898,222 +1073,15 @@ export default function NotificationScreen() {
           {!loading && unreadItems.length > 0 && (
             <View style={styles.groupSection}>
               <View style={styles.groupHeader}>
-                <ThemedText style={[styles.groupTitle, isDark && { color: '#94a3b8' }]}>
-                  New Alerts & Reminders ({unreadItems.length})
+                <ThemedText style={[styles.groupTitle, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
+                  New ({unreadItems.length})
                 </ThemedText>
               </View>
-              {unreadItems.map((note) => {
-                const styleInfo = getPriorityStyle(note);
-                const isSelected = selectedIds.includes(note.id);
-                return (
-                  <Pressable
-                    key={note.id}
-                    onPress={() => {
-                      if (isSelectionMode) {
-                        toggleSelectNotification(note.id);
-                      } else {
-                        openDetails(note);
-                      }
-                    }}
-                    onLongPress={() => {
-                      if (!isSelectionMode) {
-                        setIsSelectionMode(true);
-                        setSelectedIds([note.id]);
-                      }
-                    }}
-                    style={({ pressed }) => [
-                      styles.notificationItem,
-                      isDark ? styles.itemUnreadDark : styles.itemUnreadLight,
-                      { borderLeftColor: styleInfo.accentBorder, borderLeftWidth: 4 },
-                      isSelectionMode && isSelected && (isDark ? styles.itemSelectedDark : styles.itemSelectedLight),
-                      pressed && styles.itemPressed,
-                    ]}
-                  >
-                    {/* Multi-Select Checkbox Column */}
-                    {isSelectionMode && (
-                      <View style={styles.selectCheckboxWrapper}>
-                        <View
-                          style={[
-                            styles.selectCheckbox,
-                            isDark ? styles.selectCheckboxDark : styles.selectCheckboxLight,
-                            isSelected && styles.selectCheckboxChecked,
-                          ]}
-                        >
-                          {isSelected && <ThemedText style={styles.selectCheckmark}>✓</ThemedText>}
-                        </View>
-                      </View>
-                    )}
-
-                    {/* Left Icon */}
-                    <View style={styles.avatarWrapper}>
-                      <View
-                        style={[
-                          styles.avatarCircle,
-                          {
-                            backgroundColor: styleInfo.bg,
-                            borderColor: styleInfo.border,
-                            borderWidth: 1.5,
-                          },
-                        ]}
-                      >
-                        <Image
-                          source={{ uri: styleInfo.icon }}
-                          style={{ width: 22, height: 22 }}
-                          contentFit="contain"
-                        />
-                      </View>
-                    </View>
-
-                    {/* Content Body */}
-                    <View style={styles.itemBody}>
-                      <View style={styles.itemHeaderLine}>
-                        <View
-                          style={[
-                            styles.levelChip,
-                            {
-                              backgroundColor: styleInfo.badgeBg,
-                              borderColor: styleInfo.badgeBorder,
-                            },
-                          ]}
-                        >
-                          <ThemedText
-                            style={[
-                              styles.levelChipText,
-                              { color: styleInfo.badgeText },
-                            ]}
-                          >
-                            {styleInfo.tagLabel}
-                          </ThemedText>
-                        </View>
-                        <ThemedText style={[styles.timeText, isDark && { color: '#94a3b8' }]}>
-                          {formatTime(note.createdAt)}
-                        </ThemedText>
-                      </View>
-
-                      <ThemedText style={[styles.boldSubject, { color: styleInfo.textColor }]}>
-                        {note.title}
-                      </ThemedText>
-
-                      <ThemedText style={[styles.normalBody, isDark && { color: '#cbd5e1' }]} numberOfLines={3}>
-                        {note.message}
-                      </ThemedText>
-
-                      {/* Equipment, Location & Due Date Meta Row */}
-                      {(note.airconName || note.location || note.dueDate || note.staffName) && (
-                        <View style={styles.cardMetaRow}>
-                          {note.airconName && (
-                            <View style={[styles.metaItem, isDark ? styles.metaEquipmentDark : styles.metaEquipmentLight]}>
-                              <Image
-                                source={{ uri: ICON_AIRCONSTATE }}
-                                style={{ width: 11, height: 11, tintColor: isDark ? '#34d399' : '#059669' }}
-                                contentFit="contain"
-                              />
-                              <ThemedText style={[styles.metaText, isDark && { color: '#34d399' }]} numberOfLines={1}>
-                                {note.airconName}{note.airconType ? ` • ${note.airconType}` : ''}
-                              </ThemedText>
-                            </View>
-                          )}
-                          {note.location && (
-                            <View style={[styles.metaItem, isDark ? styles.metaItemDark : styles.metaItemLight]}>
-                              <Image
-                                source={{ uri: ICON_PIN }}
-                                style={{ width: 12, height: 12, tintColor: isDark ? '#34d399' : '#059669' }}
-                                contentFit="contain"
-                              />
-                              <ThemedText style={[styles.metaText, isDark && { color: '#cbd5e1' }]} numberOfLines={1}>
-                                {note.location}
-                              </ThemedText>
-                            </View>
-                          )}
-                          {note.dueDate && (
-                            <View style={[styles.dueBadge, isDark ? styles.dueBadgeDark : styles.dueBadgeLight]}>
-                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                                <AppIcon name="calendar" size={11} color={isDark ? '#fbbf24' : '#d97706'} />
-                                <ThemedText style={[styles.dueBadgeText, isDark && { color: '#fbbf24' }]}>
-                                  Due: {note.dueDate}
-                                </ThemedText>
-                              </View>
-                            </View>
-                          )}
-                          {note.staffName && note.staffName !== 'Maintenance Staff' && (
-                            <View style={[styles.metaItem, isDark ? styles.metaStaffDark : styles.metaStaffLight]}>
-                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                                <AppIcon name="user" size={11} color={isDark ? '#34d399' : '#047857'} />
-                                <ThemedText style={[styles.metaText, { color: isDark ? '#34d399' : '#047857' }]} numberOfLines={1}>
-                                  {note.staffName}
-                                </ThemedText>
-                              </View>
-                            </View>
-                          )}
-                        </View>
-                      )}
-
-                      {/* Admin Verification Remarks snippet if present */}
-                      {note.verificationRemarks ? (
-                        <View style={[styles.notifVerificationBanner, isDark ? styles.notifVerificationDark : styles.notifVerificationLight]}>
-                          <AppIcon name="shield" size={13} color={isDark ? '#c4b5fd' : '#7e22ce'} />
-                          <ThemedText style={[styles.notifVerificationText, isDark && { color: '#c4b5fd' }]} numberOfLines={2}>
-                            Admin Remarks: {note.verificationRemarks}
-                          </ThemedText>
-                        </View>
-                      ) : null}
-
-                      {/* Quick Direct Link Button (Redesigned) */}
-                      {note.relatedReportId && (
-                        <Pressable
-                          onPress={(e) => {
-                            e.stopPropagation();
-                            handleOpenTask(note);
-                          }}
-                          style={({ pressed }) => [
-                            styles.actionBtn,
-                            isDark ? styles.actionBtnDark : styles.actionBtnLight,
-                            pressed && { opacity: 0.8, transform: [{ scale: 0.98 }] },
-                          ]}
-                        >
-                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
-                            <Image
-                              source={{ uri: ICON_CHECKLIST }}
-                              style={{ width: 14, height: 14, tintColor: isDark ? '#34d399' : '#059669' }}
-                              contentFit="contain"
-                            />
-                            <ThemedText style={[styles.actionBtnText, isDark && { color: '#34d399' }]}>
-                              Launch Checklist #{note.relatedReportId}
-                            </ThemedText>
-                          </View>
-                          <ThemedText style={{ fontSize: 13, color: isDark ? '#34d399' : '#059669', fontWeight: '800' }}>→</ThemedText>
-                        </Pressable>
-                      )}
-                    </View>
-
-                    {/* Right Dot & Options */}
-                    <View style={styles.rightActions}>
-                      {!isSelectionMode && (
-                        <View
-                          style={[
-                            styles.unreadDot,
-                            { backgroundColor: styleInfo.accentBorder },
-                          ]}
-                        />
-                      )}
-                      <Pressable
-                        hitSlop={8}
-                        onPress={(e) => {
-                          e.stopPropagation();
-                          if (isSelectionMode) {
-                            toggleSelectNotification(note.id);
-                          } else {
-                            openOptions(note);
-                          }
-                        }}
-                        style={styles.moreDotButton}
-                      >
-                        <ThemedText style={[styles.moreDotFallback, isDark && { color: '#64748b' }]}>•••</ThemedText>
-                      </Pressable>
-                    </View>
-                  </Pressable>
-                );
-              })}
+              <View style={[styles.fbListGroup, isDark ? styles.fbListGroupDark : styles.fbListGroupLight]}>
+                {unreadItems.map((note, idx) =>
+                  renderNotificationItem(note, true, idx === unreadItems.length - 1)
+                )}
+              </View>
             </View>
           )}
 
@@ -1121,195 +1089,15 @@ export default function NotificationScreen() {
           {!loading && readItems.length > 0 && (
             <View style={styles.groupSection}>
               <View style={styles.groupHeader}>
-                <ThemedText style={[styles.groupTitle, isDark && { color: '#94a3b8' }]}>Earlier Reminders</ThemedText>
+                <ThemedText style={[styles.groupTitle, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
+                  Earlier
+                </ThemedText>
               </View>
-              {readItems.map((note) => {
-                const styleInfo = getPriorityStyle(note);
-                const isSelected = selectedIds.includes(note.id);
-                return (
-                  <Pressable
-                    key={note.id}
-                    onPress={() => {
-                      if (isSelectionMode) {
-                        toggleSelectNotification(note.id);
-                      } else {
-                        openDetails(note);
-                      }
-                    }}
-                    onLongPress={() => {
-                      if (!isSelectionMode) {
-                        setIsSelectionMode(true);
-                        setSelectedIds([note.id]);
-                      }
-                    }}
-                    style={({ pressed }) => [
-                      styles.notificationItem,
-                      isDark ? styles.itemReadDark : styles.itemReadLight,
-                      { borderLeftColor: styleInfo.accentBorder, borderLeftWidth: 3 },
-                      isSelectionMode && isSelected && (isDark ? styles.itemSelectedDark : styles.itemSelectedLight),
-                      pressed && styles.itemPressed,
-                    ]}
-                  >
-                    {/* Multi-Select Checkbox Column */}
-                    {isSelectionMode && (
-                      <View style={styles.selectCheckboxWrapper}>
-                        <View
-                          style={[
-                            styles.selectCheckbox,
-                            isDark ? styles.selectCheckboxDark : styles.selectCheckboxLight,
-                            isSelected && styles.selectCheckboxChecked,
-                          ]}
-                        >
-                          {isSelected && <ThemedText style={styles.selectCheckmark}>✓</ThemedText>}
-                        </View>
-                      </View>
-                    )}
-
-                    {/* Left Icon */}
-                    <View style={styles.avatarWrapper}>
-                      <View
-                        style={[
-                          styles.avatarCircle,
-                          {
-                            backgroundColor: styleInfo.bg,
-                            borderColor: styleInfo.border,
-                            borderWidth: 1,
-                            opacity: 0.8,
-                          },
-                        ]}
-                      >
-                        <Image
-                          source={{ uri: styleInfo.icon }}
-                          style={{ width: 20, height: 20 }}
-                          contentFit="contain"
-                        />
-                      </View>
-                    </View>
-
-                    {/* Content Body */}
-                    <View style={styles.itemBody}>
-                      <View style={styles.itemHeaderLine}>
-                        <View
-                          style={[
-                            styles.levelChip,
-                            {
-                              backgroundColor: styleInfo.badgeBg,
-                              borderColor: styleInfo.badgeBorder,
-                            },
-                          ]}
-                        >
-                          <ThemedText
-                            style={[
-                              styles.levelChipText,
-                              { color: styleInfo.badgeText },
-                            ]}
-                          >
-                            {styleInfo.tagLabel}
-                          </ThemedText>
-                        </View>
-                        <ThemedText style={[styles.timeText, isDark && { color: '#64748b' }]}>
-                          {formatTime(note.createdAt)}
-                        </ThemedText>
-                      </View>
-
-                      <ThemedText style={styles.msgText}>
-                        <ThemedText style={[styles.boldSubject, { color: isDark ? '#f1f5f9' : '#374151' }]}>
-                          {note.title}
-                        </ThemedText>{' '}
-                        <ThemedText style={[styles.normalBody, isDark && { color: '#94a3b8' }]}>{note.message}</ThemedText>
-                      </ThemedText>
-
-                      {/* Equipment & Location Meta Row */}
-                      {(note.airconName || note.location || note.dueDate) && (
-                        <View style={styles.cardMetaRow}>
-                          {note.airconName && (
-                            <View style={[styles.metaItem, isDark ? styles.metaEquipmentDark : styles.metaEquipmentLight]}>
-                              <Image
-                                source={{ uri: ICON_AIRCONSTATE }}
-                                style={{ width: 10, height: 10, tintColor: isDark ? '#34d399' : '#059669' }}
-                                contentFit="contain"
-                              />
-                              <ThemedText style={[styles.metaText, isDark && { color: '#34d399' }]} numberOfLines={1}>
-                                {note.airconName}{note.airconType ? ` • ${note.airconType}` : ''}
-                              </ThemedText>
-                            </View>
-                          )}
-                          {note.location && (
-                            <View style={[styles.metaItem, isDark ? styles.metaItemDark : styles.metaItemLight]}>
-                              <Image
-                                source={{ uri: ICON_PIN }}
-                                style={{ width: 11, height: 11, tintColor: isDark ? '#34d399' : '#059669' }}
-                                contentFit="contain"
-                              />
-                              <ThemedText style={[styles.metaText, isDark && { color: '#94a3b8' }]} numberOfLines={1}>
-                                {note.location}
-                              </ThemedText>
-                            </View>
-                          )}
-                          {note.dueDate && (
-                            <View style={[styles.dueBadge, isDark ? styles.dueBadgeDark : styles.dueBadgeLight]}>
-                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                                <AppIcon name="calendar" size={11} color={isDark ? '#fbbf24' : '#d97706'} />
-                                <ThemedText style={[styles.dueBadgeText, isDark && { color: '#fbbf24' }]}>
-                                  Due: {note.dueDate}
-                                </ThemedText>
-                              </View>
-                            </View>
-                          )}
-                        </View>
-                      )}
-
-                      {/* Admin Remarks snippet if present */}
-                      {note.verificationRemarks ? (
-                        <View style={[styles.notifVerificationBanner, isDark ? styles.notifVerificationDark : styles.notifVerificationLight]}>
-                          <AppIcon name="shield" size={12} color={isDark ? '#c4b5fd' : '#7e22ce'} />
-                          <ThemedText style={[styles.notifVerificationText, isDark && { color: '#c4b5fd' }]} numberOfLines={1}>
-                            Admin Remarks: {note.verificationRemarks}
-                          </ThemedText>
-                        </View>
-                      ) : null}
-
-                      {/* Quick Direct Link Button (Redesigned) */}
-                      {note.relatedReportId && (
-                        <Pressable
-                          onPress={(e) => {
-                            e.stopPropagation();
-                            handleOpenTask(note);
-                          }}
-                          style={({ pressed }) => [
-                            styles.actionBtnSecondary,
-                            isDark ? styles.actionBtnSecondaryDark : styles.actionBtnSecondaryLight,
-                            pressed && { opacity: 0.8 },
-                          ]}
-                        >
-                          <ThemedText style={[styles.actionBtnSecondaryText, isDark && { color: '#34d399' }]}>
-                            Launch Checklist (#{note.relatedReportId})
-                          </ThemedText>
-                          <ThemedText style={{ fontSize: 12, color: isDark ? '#34d399' : '#059669', fontWeight: '800' }}>→</ThemedText>
-                        </Pressable>
-                      )}
-                    </View>
-
-                    {/* Options */}
-                    <View style={styles.rightActions}>
-                      <Pressable
-                        hitSlop={8}
-                        onPress={(e) => {
-                          e.stopPropagation();
-                          if (isSelectionMode) {
-                            toggleSelectNotification(note.id);
-                          } else {
-                            openOptions(note);
-                          }
-                        }}
-                        style={styles.moreDotButton}
-                      >
-                        <ThemedText style={[styles.moreDotFallback, isDark && { color: '#64748b' }]}>•••</ThemedText>
-                      </Pressable>
-                    </View>
-                  </Pressable>
-                );
-              })}
+              <View style={[styles.fbListGroup, isDark ? styles.fbListGroupDark : styles.fbListGroupLight]}>
+                {readItems.map((note, idx) =>
+                  renderNotificationItem(note, false, idx === readItems.length - 1)
+                )}
+              </View>
             </View>
           )}
 
@@ -1321,7 +1109,7 @@ export default function NotificationScreen() {
         {isSelectionMode && (
           <View style={[styles.selectionBarContainer, isDark ? styles.selectionBarDark : styles.selectionBarLight]}>
             <View style={styles.selectionBarLeft}>
-              <ThemedText style={[styles.selectionCountText, isDark && { color: '#f1f5f9' }]}>
+              <ThemedText style={[styles.selectionCountText, isDark && { color: UiColors[effectiveTheme].text }]}>
                 <ThemedText style={styles.selectionCountNumber}>{selectedIds.length}</ThemedText> of {filteredNotifications.length} selected
               </ThemedText>
             </View>
@@ -1337,10 +1125,10 @@ export default function NotificationScreen() {
                 ]}
               >
                 {isDeletingSelected ? (
-                  <ActivityIndicator size="small" color="#ffffff" />
+                  <ActivityIndicator size="small" color={UiColors[effectiveTheme].onPrimary} />
                 ) : (
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                    <AppIcon name="trash" size={13} color="#ffffff" />
+                    <AppIcon name="trash" size={13} color={UiColors[effectiveTheme].onPrimary} />
                     <ThemedText style={styles.deleteSelectedText}>
                       Delete ({selectedIds.length})
                     </ThemedText>
@@ -1365,9 +1153,9 @@ export default function NotificationScreen() {
               <View style={[styles.sheetHandle, isDark && { backgroundColor: '#475569' }]} />
 
               <View style={styles.sheetHeader}>
-                <ThemedText style={[styles.sheetTitle, isDark && { color: '#f1f5f9' }]}>Notification Details</ThemedText>
-                <Pressable onPress={closeDetails} style={[styles.closeBtn, isDark && { backgroundColor: '#1e293b', borderRadius: 12 }]}>
-                  <ThemedText style={{ fontSize: 16, fontWeight: '700', color: isDark ? '#94a3b8' : '#6b7280' }}>
+                <ThemedText style={[styles.sheetTitle, isDark && { color: UiColors[effectiveTheme].text }]}>Notification Details</ThemedText>
+                <Pressable onPress={closeDetails} style={[styles.closeBtn, isDark && { backgroundColor: UiColors[effectiveTheme].backgroundSelected, borderRadius: 12 }]}>
+                  <ThemedText style={{ fontSize: 16, fontWeight: '700', color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }}>
                     ✕
                   </ThemedText>
                 </Pressable>
@@ -1375,18 +1163,18 @@ export default function NotificationScreen() {
 
               <ScrollView style={styles.sheetBody} showsVerticalScrollIndicator={false}>
                 <View style={[styles.detailCard, isDark ? styles.detailCardDark : styles.detailCardLight]}>
-                  <ThemedText style={[styles.detailCardTitle, isDark && { color: '#f1f5f9' }]}>
+                  <ThemedText style={[styles.detailCardTitle, isDark && { color: UiColors[effectiveTheme].text }]}>
                     {selectedNotification.title}
                   </ThemedText>
-                  <ThemedText style={[styles.detailCardMessage, isDark && { color: '#cbd5e1' }]}>
+                  <ThemedText style={[styles.detailCardMessage, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                     {selectedNotification.message}
                   </ThemedText>
                 </View>
 
                 {selectedNotification.createdAt && (
                   <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
-                    <ThemedText style={[styles.detailLabel, isDark && { color: '#94a3b8' }]}>Date & Time:</ThemedText>
-                    <ThemedText style={[styles.detailValue, isDark && { color: '#f1f5f9' }]}>
+                    <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Date & Time:</ThemedText>
+                    <ThemedText style={[styles.detailValue, isDark && { color: UiColors[effectiveTheme].text }]}>
                       {formatTime(selectedNotification.createdAt)}
                     </ThemedText>
                   </View>
@@ -1394,41 +1182,64 @@ export default function NotificationScreen() {
 
                 {selectedNotification.location && (
                   <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
-                    <ThemedText style={[styles.detailLabel, isDark && { color: '#94a3b8' }]}>Location:</ThemedText>
-                    <ThemedText style={[styles.detailValue, isDark && { color: '#f1f5f9' }]}>
+                    <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Location:</ThemedText>
+                    <ThemedText style={[styles.detailValue, isDark && { color: UiColors[effectiveTheme].text }]}>
                       {selectedNotification.location}
                     </ThemedText>
                   </View>
                 )}
 
-                {selectedNotification.airconName && (
+                {(selectedNotification.controllerName || selectedNotification.airconId) && (
                   <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
-                    <ThemedText style={[styles.detailLabel, isDark && { color: '#94a3b8' }]}>Equipment:</ThemedText>
-                    <ThemedText style={[styles.detailValue, isDark && { color: '#f1f5f9' }]}>
-                      {selectedNotification.airconName}{selectedNotification.airconType ? ` (${selectedNotification.airconType})` : ''}
+                    <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>AC Device:</ThemedText>
+                    <ThemedText style={[styles.detailValue, isDark && { color: UiColors[effectiveTheme].text }]}>
+                      {selectedNotification.controllerName || 'Name unavailable'}
                     </ThemedText>
+                  </View>
+                )}
+
+                {(selectedNotification.airconName || selectedNotification.airconId) && (
+                  <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
+                    <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Custom Aircon Name:</ThemedText>
+                    <ThemedText style={[styles.detailValue, isDark && { color: UiColors[effectiveTheme].text }]}>
+                      {selectedNotification.airconName || 'Name unavailable'}
+                    </ThemedText>
+                  </View>
+                )}
+
+                {selectedNotification.airconType && (
+                  <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
+                    <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Aircon Type:</ThemedText>
+                    <ThemedText style={[styles.detailValue, isDark && { color: UiColors[effectiveTheme].text }]}>{selectedNotification.airconType}</ThemedText>
+                  </View>
+                )}
+
+                {selectedNotification.protocolName && (
+                  <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
+                    <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>IR Protocol:</ThemedText>
+                    <ThemedText style={[styles.detailValue, isDark && { color: UiColors[effectiveTheme].text }]}>{selectedNotification.protocolName}</ThemedText>
                   </View>
                 )}
 
                 {selectedNotification.dueDate && (
                   <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
-                    <ThemedText style={[styles.detailLabel, isDark && { color: '#94a3b8' }]}>Due Date:</ThemedText>
-                    <ThemedText style={[styles.detailValue, { color: isDark ? '#fbbf24' : '#d97706', fontWeight: '700' }]}>
+                    <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Due Date:</ThemedText>
+                    <ThemedText style={[styles.detailValue, { color: isDark ? UiColors[effectiveTheme].warning : UiColors[effectiveTheme].warning, fontWeight: '700' }]}>
                       {selectedNotification.dueDate}
                     </ThemedText>
                   </View>
                 )}
 
                 <View style={[styles.detailRow, isDark ? styles.detailRowDark : styles.detailRowLight]}>
-                  <ThemedText style={[styles.detailLabel, isDark && { color: '#94a3b8' }]}>Assigned To:</ThemedText>
-                  <ThemedText style={[styles.detailValue, isDark && { color: '#f1f5f9' }]}>
+                  <ThemedText style={[styles.detailLabel, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Assigned To:</ThemedText>
+                  <ThemedText style={[styles.detailValue, isDark && { color: UiColors[effectiveTheme].text }]}>
                     {selectedNotification.staffName}
                   </ThemedText>
                 </View>
 
                 {selectedNotification.verificationRemarks && (
                   <View style={[styles.detailRow, isDark ? styles.notifVerificationDark : { backgroundColor: '#f5f3ff', padding: 10, borderRadius: 10 }]}>
-                    <ThemedText style={[styles.detailLabel, { color: isDark ? '#c4b5fd' : '#6b21a8' }]}>Admin Remarks:</ThemedText>
+                    <ThemedText style={[styles.detailLabel, { color: isDark ? '#c4b5fd' : UiColors[effectiveTheme].info }]}>Admin Remarks:</ThemedText>
                     <ThemedText style={[styles.detailValue, { color: isDark ? '#e0e7ff' : '#4338ca', fontWeight: '600' }]}>
                       {selectedNotification.verificationRemarks}
                     </ThemedText>
@@ -1447,11 +1258,7 @@ export default function NotificationScreen() {
                   >
                     <View style={styles.sheetActionBtnContent}>
                       <View style={styles.sheetActionBtnIconBadge}>
-                        <Image
-                          source={{ uri: ICON_CHECKLIST }}
-                          style={{ width: 18, height: 18, tintColor: '#ffffff' }}
-                          contentFit="contain"
-                        />
+                        <AppIcon name="checklist" size={18} color={UiColors[effectiveTheme].onPrimary} />
                       </View>
                       <View style={{ flex: 1 }}>
                         <ThemedText style={styles.sheetActionBtnTitle}>
@@ -1482,40 +1289,40 @@ export default function NotificationScreen() {
               ]}
             >
               <View style={[styles.sheetHandle, isDark && { backgroundColor: '#475569' }]} />
-              <ThemedText style={[styles.optionsTitle, isDark && { color: '#f1f5f9' }]}>Notification Options</ThemedText>
+              <ThemedText style={[styles.optionsTitle, isDark && { color: UiColors[effectiveTheme].text }]}>Notification Options</ThemedText>
 
               <Pressable
-                style={[styles.optionRow, isDark && { borderBottomColor: '#1e293b' }]}
+                style={[styles.optionRow, isDark && { borderBottomColor: UiColors[effectiveTheme].border }]}
                 onPress={() => {
                   handleToggleRead(optionsNotification);
                   closeOptions();
                 }}
               >
-                <ThemedText style={[styles.optionText, isDark && { color: '#f1f5f9' }]}>
+                <ThemedText style={[styles.optionText, isDark && { color: UiColors[effectiveTheme].text }]}>
                   {optionsNotification.isRead ? 'Mark as Unread' : 'Mark as Read'}
                 </ThemedText>
               </Pressable>
 
               <Pressable
-                style={[styles.optionRow, isDark && { borderBottomColor: '#1e293b' }]}
+                style={[styles.optionRow, isDark && { borderBottomColor: UiColors[effectiveTheme].border }]}
                 onPress={() => openSnoozePicker(optionsNotification.id)}
               >
-                <ThemedText style={[styles.optionText, isDark && { color: '#f1f5f9' }]}>
+                <ThemedText style={[styles.optionText, isDark && { color: UiColors[effectiveTheme].text }]}>
                   {optionsNotification.isSnoozed ? '⏰ Change Snooze Time...' : '⏰ Snooze Reminder...'}
                 </ThemedText>
               </Pressable>
 
               {optionsNotification.isSnoozed && (
                 <Pressable
-                  style={[styles.optionRow, isDark && { borderBottomColor: '#1e293b' }]}
+                  style={[styles.optionRow, isDark && { borderBottomColor: UiColors[effectiveTheme].border }]}
                   onPress={() => {
                     handleCancelSnooze(optionsNotification.id);
                     closeOptions();
                   }}
                 >
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                    <AppIcon name="bell" size={14} color="#10b981" />
-                    <ThemedText style={[styles.optionText, { color: '#10b981' }]}>
+                    <AppIcon name="bell" size={14} color={UiColors[effectiveTheme].emerald} />
+                    <ThemedText style={[styles.optionText, { color: UiColors[effectiveTheme].emerald }]}>
                       Resume Notification (Cancel Snooze)
                     </ThemedText>
                   </View>
@@ -1527,8 +1334,8 @@ export default function NotificationScreen() {
                 onPress={() => handleDelete(optionsNotification.id)}
               >
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                  <AppIcon name="trash" size={14} color="#dc2626" />
-                  <ThemedText style={[styles.optionText, { color: '#dc2626' }]}>
+                  <AppIcon name="trash" size={14} color={UiColors[effectiveTheme].error} />
+                  <ThemedText style={[styles.optionText, { color: UiColors[effectiveTheme].error }]}>
                     Delete Notification
                   </ThemedText>
                 </View>
@@ -1557,9 +1364,9 @@ export default function NotificationScreen() {
               <View style={styles.snoozeHeaderRow}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
                   <AppIcon name="clock" size={16} color={isDark ? '#34d399' : '#059669'} />
-                  <ThemedText style={[styles.snoozeTitle, isDark && { color: '#f1f5f9' }]}>Snooze Reminder</ThemedText>
+                  <ThemedText style={[styles.snoozeTitle, isDark && { color: UiColors[effectiveTheme].text }]}>Snooze Reminder</ThemedText>
                 </View>
-                <ThemedText style={[styles.snoozeSubtitle, isDark && { color: '#94a3b8' }]}>Choose when to be reminded again</ThemedText>
+                <ThemedText style={[styles.snoozeSubtitle, isDark && { color: UiColors[effectiveTheme].textMuted }]}>Choose when to be reminded again</ThemedText>
               </View>
 
               {/* Current Active Snooze Alert Banner */}
@@ -1570,7 +1377,7 @@ export default function NotificationScreen() {
                       <View style={styles.activeSnoozeDot} />
                       <ThemedText style={styles.currentSnoozeTag}>CURRENT SNOOZE ACTIVE</ThemedText>
                     </View>
-                    <ThemedText style={[styles.currentSnoozeTimeText, isDark && { color: '#f1f5f9' }]}>
+                    <ThemedText style={[styles.currentSnoozeTimeText, isDark && { color: UiColors[effectiveTheme].text }]}>
                       Reminding at {currentSnoozeFormatted}
                       {remainingMins ? ` • ${remainingMins}m left` : ''}
                     </ThemedText>
@@ -1603,17 +1410,17 @@ export default function NotificationScreen() {
                     onPress={() => handleSnoozeWithDuration(opt.minutes)}
                     style={({ pressed }) => [
                       styles.snoozeOptionRow,
-                      { borderBottomColor: isDark ? '#1e293b' : '#f1f5f9' },
+                      { borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
                       idx === 6 && { borderBottomWidth: 0 },
                       isOptionActive && (isDark ? styles.snoozeOptionRowActiveDark : styles.snoozeOptionRowActiveLight),
-                      pressed && { backgroundColor: isDark ? '#1e293b' : '#f8fafc' },
+                      pressed && { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].background },
                     ]}
                   >
                     <View style={[
                       styles.snoozeIconCircle,
                       isOptionActive
-                        ? (isDark ? { backgroundColor: 'rgba(16, 185, 129, 0.25)' } : { backgroundColor: '#d1fae5' })
-                        : { backgroundColor: isDark ? 'rgba(245, 158, 11, 0.15)' : '#fffbeb' },
+                        ? (isDark ? { backgroundColor: UiColors[effectiveTheme].accentSurface } : { backgroundColor: UiColors[effectiveTheme].accentSurface })
+                        : { backgroundColor: isDark ? UiColors[effectiveTheme].warningSurface : UiColors[effectiveTheme].warningSurface },
                     ]}>
                       <AppIcon
                         name={opt.minutes === 1440 ? 'calendar' : 'clock'}
@@ -1624,19 +1431,19 @@ export default function NotificationScreen() {
                     <View style={{ flex: 1, marginLeft: 12 }}>
                       <ThemedText style={[
                         styles.snoozeOptionLabel,
-                        isDark && { color: '#f1f5f9' },
-                        isOptionActive && { color: '#10b981', fontWeight: '800' },
+                        isDark && { color: UiColors[effectiveTheme].text },
+                        isOptionActive && { color: UiColors[effectiveTheme].textSecondary, fontWeight: '800' },
                       ]}>
                         {opt.label}
                       </ThemedText>
                       <ThemedText style={[
                         styles.snoozeOptionHint,
-                        isDark && { color: '#64748b' },
-                        isOptionActive && { color: '#10b981', fontWeight: '700' },
+                        isDark && { color: UiColors[effectiveTheme].textSecondary },
+                        isOptionActive && { color: UiColors[effectiveTheme].textSecondary, fontWeight: '700' },
                       ]}>
                         {isOptionActive
-                          ? `Currently set • Reminding at ${currentSnoozeFormatted || getSnoozeTimeLabel(opt.minutes)}`
-                          : `Remind at ${getSnoozeTimeLabel(opt.minutes)}`}
+                          ? `Currently set • Reminding at ${currentSnoozeFormatted || getSnoozeTimeLabel(opt.minutes, now)}`
+                          : `Remind at ${getSnoozeTimeLabel(opt.minutes, now)}`}
                       </ThemedText>
                     </View>
 
@@ -1646,7 +1453,7 @@ export default function NotificationScreen() {
                         <ThemedText style={styles.activeSnoozeBadgeText}>CURRENT</ThemedText>
                       </View>
                     ) : (
-                      <ThemedText style={{ color: isDark ? '#475569' : '#cbd5e1', fontSize: 16 }}>›</ThemedText>
+                      <ThemedText style={{ color: isDark ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].textMuted, fontSize: 16 }}>›</ThemedText>
                     )}
                   </Pressable>
                 );
@@ -1675,22 +1482,22 @@ export default function NotificationScreen() {
                   setMenuVisible(false);
                   handleMarkAllRead();
                 }}
-                disabled={totalUnreadCount === 0}
+                disabled={totalUnreadCount === 0 || updating}
                 style={({ pressed }) => [
                   styles.menuRow,
-                  { borderBottomColor: isDark ? '#334155' : '#f1f5f9' },
-                  pressed && { backgroundColor: isDark ? '#1e293b' : '#f8fafc' },
-                  totalUnreadCount === 0 && { opacity: 0.4 },
+                  { borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
+                  pressed && { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].background },
+                  (totalUnreadCount === 0 || updating) && { opacity: 0.4 },
                 ]}
               >
-                <View style={[styles.menuIconCircle, { backgroundColor: isDark ? 'rgba(16, 185, 129, 0.15)' : '#ecfdf5' }]}>
-                  <ThemedText style={{ color: '#059669', fontSize: 13, fontWeight: '800' }}>✓</ThemedText>
+                <View style={[styles.menuIconCircle, { backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface }]}>
+                  <ThemedText style={{ color: UiColors[effectiveTheme].emerald, fontSize: 13, fontWeight: '800' }}>✓</ThemedText>
                 </View>
                 <View style={{ flex: 1, marginLeft: 10 }}>
-                  <ThemedText style={[styles.menuRowTitle, isDark && { color: '#f1f5f9' }]}>
+                  <ThemedText style={[styles.menuRowTitle, isDark && { color: UiColors[effectiveTheme].text }]}>
                     Mark All as Read
                   </ThemedText>
-                  <ThemedText style={[styles.menuRowDesc, isDark && { color: '#94a3b8' }]}>
+                  <ThemedText style={[styles.menuRowDesc, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                     {totalUnreadCount > 0 ? `${totalUnreadCount} unread alert${totalUnreadCount > 1 ? 's' : ''}` : 'All caught up'}
                   </ThemedText>
                 </View>
@@ -1705,19 +1512,19 @@ export default function NotificationScreen() {
                 disabled={filteredNotifications.length === 0}
                 style={({ pressed }) => [
                   styles.menuRow,
-                  { borderBottomColor: isDark ? '#334155' : '#f1f5f9' },
-                  pressed && { backgroundColor: isDark ? '#1e293b' : '#f8fafc' },
+                  { borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
+                  pressed && { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].background },
                   filteredNotifications.length === 0 && { opacity: 0.4 },
                 ]}
               >
-                <View style={[styles.menuIconCircle, { backgroundColor: isDark ? 'rgba(59, 130, 246, 0.15)' : '#eff6ff' }]}>
-                  <ThemedText style={{ color: '#3b82f6', fontSize: 13, fontWeight: '800' }}>☑</ThemedText>
+                <View style={[styles.menuIconCircle, { backgroundColor: isDark ? 'rgba(59, 130, 246, 0.15)' : UiColors[effectiveTheme].infoSurface }]}>
+                  <ThemedText style={{ color: UiColors[effectiveTheme].info, fontSize: 13, fontWeight: '800' }}>☑</ThemedText>
                 </View>
                 <View style={{ flex: 1, marginLeft: 10 }}>
-                  <ThemedText style={[styles.menuRowTitle, isDark && { color: '#f1f5f9' }]}>
+                  <ThemedText style={[styles.menuRowTitle, isDark && { color: UiColors[effectiveTheme].text }]}>
                     Select Multiple
                   </ThemedText>
-                  <ThemedText style={[styles.menuRowDesc, isDark && { color: '#94a3b8' }]}>
+                  <ThemedText style={[styles.menuRowDesc, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                     Pick alerts to delete or mark
                   </ThemedText>
                 </View>
@@ -1733,18 +1540,18 @@ export default function NotificationScreen() {
                 style={({ pressed }) => [
                   styles.menuRow,
                   { borderBottomWidth: 0 },
-                  pressed && { backgroundColor: isDark ? '#1e293b' : '#f8fafc' },
+                  pressed && { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].background },
                   notifications.length === 0 && { opacity: 0.4 },
                 ]}
               >
-                <View style={[styles.menuIconCircle, { backgroundColor: isDark ? 'rgba(239, 68, 68, 0.15)' : '#fee2e2' }]}>
-                  <AppIcon name="trash" size={14} color="#dc2626" />
+                <View style={[styles.menuIconCircle, { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface }]}>
+                  <AppIcon name="trash" size={14} color={UiColors[effectiveTheme].error} />
                 </View>
                 <View style={{ flex: 1, marginLeft: 10 }}>
-                  <ThemedText style={[styles.menuRowTitle, { color: '#dc2626' }]}>
+                  <ThemedText style={[styles.menuRowTitle, { color: UiColors[effectiveTheme].error }]}>
                     Clear All Notifications
                   </ThemedText>
-                  <ThemedText style={[styles.menuRowDesc, isDark && { color: '#94a3b8' }]}>
+                  <ThemedText style={[styles.menuRowDesc, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                     Delete all alerts permanently
                   </ThemedText>
                 </View>
@@ -1779,14 +1586,14 @@ export default function NotificationScreen() {
               <View
                 style={[
                   styles.deleteIconBadge,
-                  { backgroundColor: isDark ? 'rgba(239, 68, 68, 0.15)' : '#fee2e2' },
+                  { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface },
                 ]}
               >
-                <AppIcon name="trash" size={28} color="#ef4444" />
+                <AppIcon name="trash" size={28} color={UiColors[effectiveTheme].error} />
               </View>
 
               {/* Title */}
-              <ThemedText style={[styles.deleteModalTitle, isDark && { color: '#f8fafc' }]}>
+              <ThemedText style={[styles.deleteModalTitle, isDark && { color: UiColors[effectiveTheme].text }]}>
                 {deleteModalConfig?.title || 'Delete Notifications'}
               </ThemedText>
 
@@ -1794,19 +1601,19 @@ export default function NotificationScreen() {
               <View
                 style={[
                   styles.deleteCountPill,
-                  { backgroundColor: isDark ? 'rgba(239, 68, 68, 0.18)' : '#fee2e2' },
+                  { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface },
                 ]}
               >
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
                   <AppIcon name="alert-octagon" size={12} color={isDark ? '#f87171' : '#dc2626'} />
-                  <ThemedText style={[styles.deleteCountPillText, { color: isDark ? '#f87171' : '#dc2626' }]}>
+                  <ThemedText style={[styles.deleteCountPillText, { color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error }]}>
                     {deleteModalConfig?.count || 0} {deleteModalConfig?.isClearAll ? 'Total' : 'Selected'} Alert{(deleteModalConfig?.count || 0) > 1 ? 's' : ''}
                   </ThemedText>
                 </View>
               </View>
 
               {/* Message */}
-              <ThemedText style={[styles.deleteModalMessage, isDark && { color: '#94a3b8' }]}>
+              <ThemedText style={[styles.deleteModalMessage, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                 {deleteModalConfig?.description || 'Are you sure you want to delete these notifications?'}
               </ThemedText>
 
@@ -1814,10 +1621,10 @@ export default function NotificationScreen() {
               <View
                 style={[
                   styles.deleteWarningBox,
-                  { backgroundColor: isDark ? 'rgba(15, 23, 42, 0.6)' : '#f8fafc', borderColor: isDark ? '#334155' : '#e2e8f0' },
+                  { backgroundColor: isDark ? 'rgba(15, 23, 42, 0.6)' : UiColors[effectiveTheme].background, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
                 ]}
               >
-                <ThemedText style={[styles.deleteWarningBoxText, isDark && { color: '#cbd5e1' }]}>
+                <ThemedText style={[styles.deleteWarningBoxText, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                   This action is permanent and cannot be undone.
                 </ThemedText>
               </View>
@@ -1833,7 +1640,7 @@ export default function NotificationScreen() {
                     pressed && { opacity: 0.7 },
                   ]}
                 >
-                  <ThemedText style={[styles.deleteCancelBtnText, isDark && { color: '#cbd5e1' }]}>
+                  <ThemedText style={[styles.deleteCancelBtnText, isDark && { color: UiColors[effectiveTheme].textMuted }]}>
                     Cancel
                   </ThemedText>
                 </Pressable>
@@ -1852,7 +1659,7 @@ export default function NotificationScreen() {
                   ]}
                 >
                   {isDeletingSelected ? (
-                    <ActivityIndicator size="small" color="#ffffff" />
+                    <ActivityIndicator size="small" color={UiColors[effectiveTheme].onPrimary} />
                   ) : (
                     <ThemedText style={styles.deleteConfirmBtnText}>
                       Delete {deleteModalConfig?.count ? `(${deleteModalConfig.count})` : ''}
@@ -1871,7 +1678,7 @@ export default function NotificationScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
   container: {
     flex: 1,
   },
@@ -1904,7 +1711,7 @@ const styles = StyleSheet.create({
   headerTitle: {
     fontSize: 20,
     fontWeight: '800',
-    color: '#0b291d',
+    color: colors.text,
   },
   headerRight: {
     flexDirection: 'row',
@@ -1918,38 +1725,38 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     borderRadius: 16,
     borderWidth: 1,
-    shadowColor: '#000',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.04,
     shadowRadius: 2,
     elevation: 1,
   },
   headerStatusBadgeLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e5e7eb',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
   },
   headerStatusBadgeDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   headerStatusDot: {
     width: 7,
     height: 7,
     borderRadius: 3.5,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
   },
   headerStatusText: {
     fontSize: 11,
     fontWeight: '700',
     letterSpacing: 0.5,
-    color: '#059669',
+    color: colors.emerald,
   },
   markAllReadBtn: {
-    backgroundColor: '#059669',
+    backgroundColor: colors.primaryFill,
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 14,
-    shadowColor: '#059669',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.2,
     shadowRadius: 3,
@@ -1958,7 +1765,7 @@ const styles = StyleSheet.create({
   markAllReadText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#ffffff',
+    color: colors.onPrimary,
     letterSpacing: 0.3,
   },
   filterScrollView: {
@@ -1976,29 +1783,29 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   pillActive: {
-    backgroundColor: '#059669',
-    borderColor: '#059669',
+    backgroundColor: colors.primaryFill,
+    borderColor: colors.emerald,
   },
   pillInactiveLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e5e7eb',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
   },
   pillInactiveDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   pillText: {
     fontSize: 13,
     fontWeight: '600',
   },
   pillTextActive: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
   pillTextInactiveLight: {
     color: '#4b5563',
   },
   pillTextInactiveDark: {
-    color: '#cbd5e1',
+    color: colors.textMuted,
   },
   pillWithDot: {
     flexDirection: 'row',
@@ -2023,22 +1830,22 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   cardLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e5e7eb',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
   },
   cardDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.panelBorder,
   },
   loadingTitle: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#111827',
+    color: colors.text,
     marginTop: 12,
   },
   loadingSubtitle: {
     fontSize: 13,
-    color: '#6b7280',
+    color: colors.textSecondary,
     marginTop: 4,
     textAlign: 'center',
   },
@@ -2054,10 +1861,10 @@ const styles = StyleSheet.create({
     borderRadius: 38,
   },
   beaconOuterLight: {
-    backgroundColor: '#d1fae5',
+    backgroundColor: colors.accentSurface,
   },
   beaconOuterDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    backgroundColor: colors.accentSurface,
   },
   emptyBeaconInner: {
     width: 64,
@@ -2069,22 +1876,22 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   beaconInnerLight: {
-    backgroundColor: '#ecfdf5',
-    borderColor: '#a7f3d0',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   beaconInnerDark: {
-    backgroundColor: '#1e293b',
-    borderColor: 'rgba(16, 185, 129, 0.4)',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   emptyTitle: {
     fontSize: 18,
     fontWeight: '700',
-    color: '#111827',
+    color: colors.text,
     marginBottom: 4,
   },
   emptySubtitle: {
     fontSize: 13,
-    color: '#6b7280',
+    color: colors.textSecondary,
     textAlign: 'center',
     maxWidth: 260,
   },
@@ -2107,27 +1914,27 @@ const styles = StyleSheet.create({
     padding: 14,
     marginBottom: 10,
     borderWidth: 1,
-    shadowColor: '#000',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.05,
     shadowRadius: 3,
     elevation: 1,
   },
   itemUnreadLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e5e7eb',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
   },
   itemUnreadDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   itemReadLight: {
-    backgroundColor: '#f9fafb',
-    borderColor: '#f3f4f6',
+    backgroundColor: colors.background,
+    borderColor: colors.border,
   },
   itemReadDark: {
     backgroundColor: '#131d2e',
-    borderColor: '#1e293b',
+    borderColor: colors.border,
   },
   itemPressed: {
     opacity: 0.9,
@@ -2167,7 +1974,7 @@ const styles = StyleSheet.create({
   },
   timeText: {
     fontSize: 11,
-    color: '#9ca3af',
+    color: colors.textMuted,
     fontWeight: '500',
     flexShrink: 0,
     textAlign: 'right',
@@ -2203,26 +2010,26 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
   metaItemLight: {
-    backgroundColor: '#f3f4f6',
+    backgroundColor: colors.backgroundSelected,
   },
   metaItemDark: {
     backgroundColor: '#0f172a',
   },
   metaEquipmentLight: {
-    backgroundColor: '#ecfdf5',
+    backgroundColor: colors.accentSurface,
     borderWidth: 0.5,
-    borderColor: '#a7f3d0',
+    borderColor: colors.border,
   },
   metaEquipmentDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    backgroundColor: colors.accentSurface,
     borderWidth: 0.5,
-    borderColor: 'rgba(16, 185, 129, 0.35)',
+    borderColor: colors.border,
   },
   metaStaffLight: {
-    backgroundColor: '#f0fdf4',
+    backgroundColor: colors.accentSurface,
   },
   metaStaffDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    backgroundColor: colors.accentSurface,
   },
   metaText: {
     fontSize: 11,
@@ -2242,16 +2049,16 @@ const styles = StyleSheet.create({
   },
   notifVerificationLight: {
     backgroundColor: '#f5f3ff',
-    borderColor: '#ddd6fe',
+    borderColor: colors.border,
   },
   notifVerificationDark: {
     backgroundColor: 'rgba(139, 92, 246, 0.15)',
-    borderColor: 'rgba(139, 92, 246, 0.35)',
+    borderColor: colors.border,
   },
   notifVerificationText: {
     fontSize: 11.5,
     fontWeight: '600',
-    color: '#6b21a8',
+    color: colors.info,
     flex: 1,
   },
   dueBadge: {
@@ -2261,17 +2068,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   dueBadgeLight: {
-    backgroundColor: '#fffbeb',
-    borderColor: '#fde68a',
+    backgroundColor: colors.warningSurface,
+    borderColor: colors.border,
   },
   dueBadgeDark: {
-    backgroundColor: 'rgba(245, 158, 11, 0.15)',
-    borderColor: 'rgba(245, 158, 11, 0.35)',
+    backgroundColor: colors.warningSurface,
+    borderColor: colors.border,
   },
   dueBadgeText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#b45309',
+    color: colors.warning,
   },
   actionBtn: {
     flexDirection: 'row',
@@ -2284,17 +2091,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   actionBtnLight: {
-    backgroundColor: '#ecfdf5',
-    borderColor: '#a7f3d0',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   actionBtnDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.18)',
-    borderColor: 'rgba(16, 185, 129, 0.45)',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   actionBtnText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#047857',
+    color: colors.text,
   },
   actionBtnSecondary: {
     flexDirection: 'row',
@@ -2308,7 +2115,7 @@ const styles = StyleSheet.create({
   actionBtnSecondaryText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#059669',
+    color: colors.emerald,
   },
   rightActions: {
     alignItems: 'center',
@@ -2326,7 +2133,7 @@ const styles = StyleSheet.create({
   },
   moreDotFallback: {
     fontSize: 12,
-    color: '#9ca3af',
+    color: colors.textMuted,
     fontWeight: '900',
   },
   modalOverlay: {
@@ -2354,12 +2161,12 @@ const styles = StyleSheet.create({
     maxHeight: SCREEN_HEIGHT * 0.75,
   },
   sheetContainerLight: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
   },
   sheetContainerDark: {
-    backgroundColor: '#151e32',
+    backgroundColor: colors.backgroundElement,
     borderTopWidth: 1.5,
-    borderTopColor: 'rgba(16, 185, 129, 0.35)',
+    borderTopColor: colors.border,
   },
   sheetHandle: {
     width: 40,
@@ -2379,7 +2186,7 @@ const styles = StyleSheet.create({
   sheetTitle: {
     fontSize: 18,
     fontWeight: '700',
-    color: '#111827',
+    color: colors.text,
   },
   closeBtn: {
     padding: 6,
@@ -2394,17 +2201,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   detailCardLight: {
-    backgroundColor: '#f9fafb',
-    borderColor: '#e5e7eb',
+    backgroundColor: colors.background,
+    borderColor: colors.panelBorder,
   },
   detailCardDark: {
     backgroundColor: '#0f172a',
-    borderColor: '#334155',
+    borderColor: colors.panelBorder,
   },
   detailCardTitle: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#111827',
+    color: colors.text,
     marginBottom: 6,
   },
   detailCardMessage: {
@@ -2415,23 +2222,28 @@ const styles = StyleSheet.create({
   detailRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    gap: 12,
     paddingVertical: 10,
     borderBottomWidth: 1,
   },
   detailRowLight: {
-    borderBottomColor: '#f3f4f6',
+    borderBottomColor: colors.border,
   },
   detailRowDark: {
-    borderBottomColor: '#1e293b',
+    borderBottomColor: colors.border,
   },
   detailLabel: {
+    flexShrink: 1,
+    maxWidth: '44%',
     fontSize: 14,
-    color: '#6b7280',
+    color: colors.textSecondary,
     fontWeight: '600',
   },
   detailValue: {
+    flex: 1,
+    minWidth: 0,
     fontSize: 14,
-    color: '#111827',
+    color: colors.text,
     fontWeight: '600',
     maxWidth: '60%',
     textAlign: 'right',
@@ -2445,7 +2257,7 @@ const styles = StyleSheet.create({
     marginTop: 20,
     ...Platform.select({
       ios: {
-        shadowColor: '#10b981',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 6 },
         shadowOpacity: 0.35,
         shadowRadius: 10,
@@ -2456,10 +2268,10 @@ const styles = StyleSheet.create({
     }),
   },
   sheetActionBtnLight: {
-    backgroundColor: '#059669',
+    backgroundColor: colors.primaryFill,
   },
   sheetActionBtnDark: {
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
   },
   sheetActionBtnPressed: {
     transform: [{ scale: 0.98 }],
@@ -2479,7 +2291,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   sheetActionBtnTitle: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 14.5,
     fontWeight: '800',
     letterSpacing: 0.3,
@@ -2492,7 +2304,7 @@ const styles = StyleSheet.create({
   },
   sheetActionBtnArrow: {
     fontSize: 18,
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontWeight: '900',
     marginRight: 4,
   },
@@ -2504,24 +2316,24 @@ const styles = StyleSheet.create({
     paddingBottom: 34,
   },
   optionsContainerLight: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
   },
   optionsContainerDark: {
-    backgroundColor: '#151e32',
+    backgroundColor: colors.backgroundElement,
     borderTopWidth: 1.5,
-    borderTopColor: 'rgba(16, 185, 129, 0.35)',
+    borderTopColor: colors.border,
   },
   optionsTitle: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#111827',
+    color: colors.text,
     marginBottom: 14,
     textAlign: 'center',
   },
   optionRow: {
     paddingVertical: 16,
     borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    borderBottomColor: colors.border,
   },
   optionText: {
     fontSize: 15,
@@ -2545,30 +2357,30 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   snoozeCardLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e2e8f0',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
   },
   snoozeCardDark: {
-    backgroundColor: '#151e32',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
   },
   snoozeHeaderRow: {
     paddingHorizontal: 20,
     paddingTop: 20,
     paddingBottom: 14,
     borderBottomWidth: 1,
-    borderBottomColor: '#f1f5f9',
+    borderBottomColor: colors.border,
     alignItems: 'center',
   },
   snoozeTitle: {
     fontSize: 16,
     fontWeight: '800',
-    color: '#0f172a',
+    color: colors.text,
     textAlign: 'center',
   },
   snoozeSubtitle: {
     fontSize: 12,
-    color: '#64748b',
+    color: colors.textSecondary,
     marginTop: 4,
     textAlign: 'center',
   },
@@ -2589,11 +2401,11 @@ const styles = StyleSheet.create({
   snoozeOptionLabel: {
     fontSize: 14,
     fontWeight: '700',
-    color: '#0f172a',
+    color: colors.text,
   },
   snoozeOptionHint: {
     fontSize: 11,
-    color: '#94a3b8',
+    color: colors.textMuted,
     marginTop: 1,
   },
   currentSnoozeAlertBanner: {
@@ -2609,47 +2421,47 @@ const styles = StyleSheet.create({
     borderWidth: 1.2,
   },
   currentSnoozeAlertLight: {
-    backgroundColor: '#ecfdf5',
-    borderColor: '#a7f3d0',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   currentSnoozeAlertDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.14)',
-    borderColor: '#059669',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   currentSnoozeTag: {
     fontSize: 10,
     fontWeight: '800',
-    color: '#10b981',
+    color: colors.emerald,
     letterSpacing: 0.5,
   },
   currentSnoozeTimeText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#0f172a',
+    color: colors.text,
     marginTop: 2,
   },
   cancelSnoozeBtn: {
     paddingHorizontal: 10,
     paddingVertical: 5,
     borderRadius: 8,
-    backgroundColor: 'rgba(239, 68, 68, 0.12)',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.3)',
+    borderColor: colors.border,
   },
   cancelSnoozeBtnText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#ef4444',
+    color: colors.error,
   },
   snoozeOptionRowActiveLight: {
-    backgroundColor: '#ecfdf5',
+    backgroundColor: colors.accentSurface,
     borderLeftWidth: 4,
-    borderLeftColor: '#10b981',
+    borderLeftColor: colors.emerald,
   },
   snoozeOptionRowActiveDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    backgroundColor: colors.accentSurface,
     borderLeftWidth: 4,
-    borderLeftColor: '#10b981',
+    borderLeftColor: colors.emerald,
   },
   activeSnoozeBadge: {
     flexDirection: 'row',
@@ -2658,24 +2470,24 @@ const styles = StyleSheet.create({
     paddingHorizontal: 7,
     paddingVertical: 3,
     borderRadius: 6,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
   },
   activeSnoozeDot: {
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
   },
   activeSnoozeDotWhite: {
     width: 5,
     height: 5,
     borderRadius: 2.5,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
   },
   activeSnoozeBadgeText: {
     fontSize: 10,
     fontWeight: '800',
-    color: '#ffffff',
+    color: colors.onPrimary,
     letterSpacing: 0.3,
   },
 
@@ -2689,12 +2501,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   headerThreeDotsBtnLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e2e8f0',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
   },
   headerThreeDotsBtnDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   threeDotsColumn: {
     flexDirection: 'column',
@@ -2719,19 +2531,19 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     borderWidth: 1,
     paddingVertical: 4,
-    shadowColor: '#000',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.18,
     shadowRadius: 12,
     elevation: 10,
   },
   menuDropdownCardLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e2e8f0',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
   },
   menuDropdownCardDark: {
-    backgroundColor: '#151e32',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
   },
   menuRow: {
     flexDirection: 'row',
@@ -2750,12 +2562,12 @@ const styles = StyleSheet.create({
   menuRowTitle: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#0f172a',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   menuRowDesc: {
     fontSize: 11,
-    color: '#64748b',
+    color: colors.textSecondary,
     marginTop: 1,
     fontFamily: 'Roboto',
   },
@@ -2768,12 +2580,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   selectModeBtnLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#d1d5db',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
   },
   selectModeBtnDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   selectModeBtnText: {
     fontSize: 11.5,
@@ -2787,17 +2599,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   selectAllHeaderBtnLight: {
-    backgroundColor: '#ecfdf5',
-    borderColor: '#10b981',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   selectAllHeaderBtnDark: {
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
-    borderColor: 'rgba(16, 185, 129, 0.4)',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
   },
   selectAllHeaderText: {
     fontSize: 11,
     fontWeight: '600',
-    color: '#059669',
+    color: colors.emerald,
   },
   cancelSelectBtn: {
     paddingHorizontal: 7,
@@ -2806,28 +2618,28 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   cancelSelectBtnLight: {
-    backgroundColor: '#f3f4f6',
-    borderColor: '#e5e7eb',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   cancelSelectBtnDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   cancelSelectText: {
     fontSize: 11,
     fontWeight: '600',
-    color: '#6b7280',
+    color: colors.textSecondary,
   },
 
   // Card Selection Highlights
   itemSelectedLight: {
-    backgroundColor: '#f0fdf4',
-    borderColor: '#10b981',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.emerald,
     borderWidth: 1.5,
   },
   itemSelectedDark: {
     backgroundColor: '#0c281e',
-    borderColor: '#10b981',
+    borderColor: colors.emerald,
     borderWidth: 1.5,
   },
 
@@ -2846,19 +2658,19 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   selectCheckboxLight: {
-    borderColor: '#9ca3af',
-    backgroundColor: '#ffffff',
+    borderColor: colors.border,
+    backgroundColor: colors.backgroundElement,
   },
   selectCheckboxDark: {
-    borderColor: '#475569',
+    borderColor: colors.border,
     backgroundColor: '#0f172a',
   },
   selectCheckboxChecked: {
-    backgroundColor: '#10b981',
-    borderColor: '#10b981',
+    backgroundColor: colors.primaryFill,
+    borderColor: colors.border,
   },
   selectCheckmark: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 12,
     fontWeight: '900',
     lineHeight: 14,
@@ -2877,7 +2689,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 18,
     borderWidth: 1.5,
-    shadowColor: '#000000',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.25,
     shadowRadius: 12,
@@ -2885,12 +2697,12 @@ const styles = StyleSheet.create({
     zIndex: 1100,
   },
   selectionBarLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#10b981',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
   },
   selectionBarDark: {
-    backgroundColor: '#151e32',
-    borderColor: '#10b981',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
   },
   selectionBarLeft: {
     flex: 1,
@@ -2898,12 +2710,12 @@ const styles = StyleSheet.create({
   selectionCountText: {
     fontSize: 13,
     fontWeight: '600',
-    color: '#1f2937',
+    color: colors.text,
   },
   selectionCountNumber: {
     fontSize: 14,
     fontWeight: '800',
-    color: '#10b981',
+    color: colors.emerald,
   },
   selectionBarRight: {
     marginLeft: 10,
@@ -2916,7 +2728,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#ef4444',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 4,
@@ -2929,7 +2741,7 @@ const styles = StyleSheet.create({
     elevation: 0,
   },
   deleteSelectedText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 13,
     fontWeight: '800',
     letterSpacing: 0.3,
@@ -2961,7 +2773,7 @@ const styles = StyleSheet.create({
     borderWidth: 1.2,
     ...Platform.select({
       ios: {
-        shadowColor: '#000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 12 },
         shadowOpacity: 0.35,
         shadowRadius: 20,
@@ -2972,12 +2784,12 @@ const styles = StyleSheet.create({
     }),
   },
   deleteModalCardLight: {
-    backgroundColor: '#ffffff',
-    borderColor: '#e2e8f0',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.panelBorder,
   },
   deleteModalCardDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.panelBorder,
   },
   deleteIconBadge: {
     width: 60,
@@ -2990,7 +2802,7 @@ const styles = StyleSheet.create({
   deleteModalTitle: {
     fontSize: 18,
     fontWeight: '800',
-    color: '#0f172a',
+    color: colors.text,
     textAlign: 'center',
     marginBottom: 8,
     fontFamily: 'Roboto',
@@ -3009,7 +2821,7 @@ const styles = StyleSheet.create({
   deleteModalMessage: {
     fontSize: 13,
     lineHeight: 18,
-    color: '#64748b',
+    color: colors.textSecondary,
     textAlign: 'center',
     marginBottom: 14,
     paddingHorizontal: 4,
@@ -3026,7 +2838,7 @@ const styles = StyleSheet.create({
   },
   deleteWarningBoxText: {
     fontSize: 11,
-    color: '#94a3b8',
+    color: colors.textMuted,
     fontWeight: '600',
     textAlign: 'center',
     fontFamily: 'Roboto',
@@ -3046,17 +2858,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   deleteCancelBtnLight: {
-    backgroundColor: '#f1f5f9',
-    borderColor: '#e2e8f0',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   deleteCancelBtnDark: {
-    backgroundColor: '#334155',
-    borderColor: '#475569',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   deleteCancelBtnText: {
     fontSize: 13.5,
     fontWeight: '700',
-    color: '#64748b',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
   deleteConfirmBtn: {
@@ -3066,7 +2878,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#dc2626',
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#dc2626',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
     shadowRadius: 8,
@@ -3075,7 +2887,248 @@ const styles = StyleSheet.create({
   deleteConfirmBtnText: {
     fontSize: 13.5,
     fontWeight: '800',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
+  textWhite: {
+    color: colors.onPrimary,
+  },
+  fbListGroup: {
+    borderRadius: 16,
+    overflow: 'hidden',
+    borderWidth: 1,
+    marginBottom: 16,
+  },
+  fbListGroupLight: {
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
+  },
+  fbListGroupDark: {
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
+  },
+  fbNotificationRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    gap: 12,
+  },
+  fbRowDividerLight: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  fbRowDividerDark: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  fbRowUnreadLight: {
+    backgroundColor: colors.accentSurface,
+  },
+  fbRowUnreadDark: {
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+  },
+  fbRowReadLight: {
+    backgroundColor: 'transparent',
+  },
+  fbRowReadDark: {
+    backgroundColor: 'transparent',
+  },
+  fbAvatarWrapper: {
+    position: 'relative',
+    width: 46,
+    height: 46,
+    flexShrink: 0,
+    marginTop: 2,
+  },
+  fbAvatarCircle: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  fbMiniBadge: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+  },
+  fbBody: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: 'center',
+  },
+  fbMainText: {
+    fontSize: 14,
+    lineHeight: 20,
+    fontFamily: 'Roboto',
+  },
+  fbTitleBold: {
+    fontSize: 14,
+    lineHeight: 19,
+    fontWeight: '800',
+    fontFamily: 'Roboto',
+  },
+  fbMessageText: {
+    fontSize: 13,
+    lineHeight: 18,
+    fontFamily: 'Roboto',
+    marginTop: 2,
+  },
+  fbMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 4,
+    marginTop: 5,
+  },
+  fbTimeText: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    fontWeight: '500',
+    fontFamily: 'Roboto',
+  },
+  fbTimeUnread: {
+    fontSize: 12,
+    color: colors.emerald,
+    fontWeight: '700',
+    fontFamily: 'Roboto',
+  },
+  fbMetaDotText: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    fontWeight: '500',
+    fontFamily: 'Roboto',
+    maxWidth: 160,
+  },
+  fbMetaDueText: {
+    fontSize: 12,
+    color: colors.warning,
+    fontWeight: '700',
+    fontFamily: 'Roboto',
+  },
+  fbVerificationChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    marginTop: 6,
+    alignSelf: 'flex-start',
+  },
+  fbVerificationLight: {
+    backgroundColor: colors.infoSurface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  fbVerificationDark: {
+    backgroundColor: colors.infoSurface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  fbVerificationText: {
+    fontSize: 11,
+    fontWeight: '600',
+    fontFamily: 'Roboto',
+  },
+  fbReportId: {
+    marginTop: 8,
+    fontSize: 11,
+    lineHeight: 16,
+    color: colors.textSecondary,
+    fontFamily: 'Roboto',
+  },
+  fbActionIcon: {
+    flexShrink: 0,
+  },
+  fbActionRow: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 9,
+  },
+  fbPrimaryActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: colors.primaryFill,
+    minHeight: 44,
+    flexBasis: 108,
+    flexGrow: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    flexShrink: 1,
+  },
+  fbPrimaryActionBtnText: {
+    flexShrink: 1,
+    textAlign: 'center',
+    lineHeight: 18,
+    color: colors.onPrimary,
+    fontSize: 12,
+    fontWeight: '700',
+    fontFamily: 'Roboto',
+  },
+  fbSecondaryActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 44,
+    flexBasis: 76,
+    flexGrow: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    flexShrink: 1,
+  },
+  fbSecondaryActionBtnLight: {
+    backgroundColor: colors.backgroundSelected,
+  },
+  fbSecondaryActionBtnDark: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+  },
+  fbSecondaryActionBtnText: {
+    flexShrink: 1,
+    textAlign: 'center',
+    lineHeight: 18,
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    fontFamily: 'Roboto',
+  },
+  fbRightActions: {
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingTop: 2,
+    gap: 10,
+    minHeight: 44,
+  },
+  fbMoreBtn: {
+    padding: 4,
+    borderRadius: 12,
+  },
+  fbMoreDots: {
+    fontSize: 13,
+    color: colors.textMuted,
+    fontWeight: '900',
+    letterSpacing: -1,
+  },
+  fbUnreadDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    backgroundColor: colors.primaryFill,
+  },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };
+import { DataListSkeleton } from '@/components/data-list-skeleton';

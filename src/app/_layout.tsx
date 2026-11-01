@@ -1,10 +1,64 @@
+// Isomorphic environment guard for Node.js SSR / static export
+if (typeof window === 'undefined') {
+  const dummyStorage = {
+    getItem: () => null,
+    setItem: () => {},
+    removeItem: () => {},
+    clear: () => {},
+    key: () => null,
+    length: 0,
+  };
+  (globalThis as any).window = {
+    localStorage: dummyStorage,
+    sessionStorage: dummyStorage,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    location: { href: '', origin: '', pathname: '', search: '', hash: '' },
+  };
+}
+
 import { DarkTheme, DefaultTheme, ThemeProvider, Stack, router, usePathname } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import React, { useState, useEffect, useRef } from 'react';
-import { useColorScheme, Animated, View, StyleSheet, Platform, Pressable, TextInput, PanResponder, Dimensions, Modal } from 'react-native';
+import { useColorScheme, Animated, View, StyleSheet, Platform, Pressable, TextInput, PanResponder, Dimensions, Modal, LogBox } from 'react-native';
 import { Image } from 'expo-image';
 import { ThemedText } from '@/components/themed-text';
 import Constants from 'expo-constants';
+
+// Ignore React Native Web style deprecation warnings, web push token warnings, and useNativeDriver on web
+LogBox.ignoreLogs([
+  '"shadow*" style props are deprecated',
+  '"textShadow*" style props are deprecated',
+  'shadow* style props are deprecated',
+  '[expo-notifications] Listening to push token changes is not yet fully supported on web',
+  'Animated: `useNativeDriver` is not supported',
+]);
+
+if (Platform.OS === 'web' && typeof console !== 'undefined') {
+  const isIgnored = (args: any[]) => {
+    const full = args
+      .map((a) => (typeof a === 'string' ? a : typeof a?.message === 'string' ? a.message : ''))
+      .join(' ');
+    return (
+      full.includes('style props are deprecated') ||
+      full.includes('shadow') ||
+      full.includes('[expo-notifications]') ||
+      full.includes('useNativeDriver')
+    );
+  };
+
+  const origWarn = console.warn;
+  console.warn = (...args: any[]) => {
+    if (isIgnored(args)) return;
+    origWarn.apply(console, args);
+  };
+
+  const origError = console.error;
+  console.error = (...args: any[]) => {
+    if (isIgnored(args)) return;
+    origError.apply(console, args);
+  };
+}
 
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import { AuthScreen } from '@/components/auth-screen';
@@ -12,6 +66,7 @@ import { ArchivedAccountModal } from '@/components/archived-account-modal';
 import { AuthProvider, useAuth } from '@/context/auth-context';
 import { SettingsProvider, useSettings } from '@/context/settings-context';
 import { NotificationEmitter } from '@/utils/notification-emitter';
+import { subscribeToIncomingNotifications, registerMobilePushToken } from '@/services/mobile-notifications';
 
 export { useAuth } from '@/context/auth-context';
 export { useSettings } from '@/context/settings-context';
@@ -19,11 +74,59 @@ export { useSettings } from '@/context/settings-context';
 SplashScreen.preventAutoHideAsync();
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
+const isExpoGo =
+  (Constants.executionEnvironment as string) === 'store-client' ||
+  Constants.appOwnership === 'expo';
+
+// Configure native presentation before any notification screen is visited.
+let Notifications: any = null;
+if (!isExpoGo && Platform.OS !== 'web') {
+  try {
+    Notifications = require('expo-notifications');
+    if (typeof Notifications?.setNotificationHandler === 'function') {
+      Notifications.setNotificationHandler({
+        handleNotification: async () => ({
+          shouldShowAlert: true,
+          shouldPlaySound: true,
+          shouldSetBadge: true,
+          shouldShowBanner: true,
+          shouldShowList: true,
+        }),
+      });
+    }
+  } catch (_e) {
+    // Not supported in this environment.
+  }
+}
+
+async function setupNotificationChannels() {
+  if (!Notifications) return;
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('alerts', {
+      name: 'Alert Notifications',
+      importance: Notifications.AndroidImportance.HIGH,
+      sound: 'default',
+      vibrationPattern: [0, 250, 250, 250],
+      lightColor: '#ef4444',
+    });
+    await Notifications.setNotificationChannelAsync('messages', {
+      name: 'Maintenance Task Reminders',
+      importance: Notifications.AndroidImportance.HIGH,
+      sound: 'default',
+      vibrationPattern: [0, 200, 100, 200],
+      lightColor: '#10b981',
+    });
+  }
+  // Android 13+ requires a channel before the notification permission prompt.
+  const { status } = await Notifications.getPermissionsAsync();
+  if (status !== 'granted') await Notifications.requestPermissionsAsync();
+}
 
 function NavigationRoot() {
   const { effectiveTheme } = useSettings();
   const {
     isAuthenticated,
+    isRestoringSession,
     userName,
     userRole,
     isArchived,
@@ -38,8 +141,8 @@ function NavigationRoot() {
 
   return (
     <ThemeProvider value={effectiveTheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <AnimatedSplashOverlay />
-      {isAuthenticated && !isArchived ? (
+      <AnimatedSplashOverlay ready={!isRestoringSession} />
+      {isRestoringSession ? null : isAuthenticated && !isArchived ? (
         <>
           <Stack screenOptions={{ headerShown: false, animation: 'fade' }} />
           <GlobalNotificationBanner />
@@ -79,20 +182,34 @@ export default function RootLayout() {
 }
 
 function GlobalNotificationBanner() {
+  const { userName, userId, isAuthenticated, userType } = useAuth();
   const { settings, triggerHaptic } = useSettings();
   const [visible, setVisible] = useState(false);
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
   const [isAlert, setIsAlert] = useState(false);
 
-  const slideAnim = useRef(new Animated.Value(-150)).current;
-  const panX = useRef(new Animated.Value(0)).current;
+  const [slideAnim] = useState(() => new Animated.Value(-150));
+  const [panX] = useState(() => new Animated.Value(0));
   const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const remotePushReady = useRef(false);
+  const remotePushRegistration = useRef<Promise<boolean> | null>(null);
+  const seenNotifications = useRef(new Set<string>());
+
+  useEffect(() => {
+    let disposed = false;
+    remotePushReady.current = false;
+    if (isAuthenticated && userType === 'staff') {
+      remotePushRegistration.current = setupNotificationChannels().then(() => registerMobilePushToken({
+        critical: settings.criticalAlertsEnabled, maintenance: settings.maintenanceRemindersEnabled,
+      })).then(registered => { if (!disposed) remotePushReady.current = registered; return registered; }).catch(() => false);
+    }
+    return () => { disposed = true; remotePushReady.current = false; remotePushRegistration.current = null; seenNotifications.current.clear(); };
+  }, [isAuthenticated, userId, userType, settings.criticalAlertsEnabled, settings.maintenanceRemindersEnabled]);
 
   // Clear delivered/system notifications from the device tray
   const handleDismissAllSystemNotifications = () => {
-    const isExpoGo = (Constants.executionEnvironment as string) === 'store-client' || Constants.appOwnership === 'expo';
-    if (!isExpoGo) {
+    if (!isExpoGo && Platform.OS !== 'web') {
       try {
         const Notifications = require('expo-notifications');
         if (Notifications && typeof Notifications.dismissAllNotificationsAsync === 'function') {
@@ -144,8 +261,10 @@ function GlobalNotificationBanner() {
   };
 
   // Bi-directional swipe (left & right) or upward swipe-to-dismiss PanResponder
-  const panResponder = useRef(
-    PanResponder.create({
+  const [panResponder, setPanResponder] = useState<ReturnType<typeof PanResponder.create> | null>(null);
+  const handleBannerLayout = () => {
+    if (panResponder) return;
+    setPanResponder(PanResponder.create({
       onStartShouldSetPanResponder: () => false,
       onMoveShouldSetPanResponder: (evt, gestureState) => {
         // Handle horizontal swiping (both left & right) or upward swipe
@@ -186,10 +305,56 @@ function GlobalNotificationBanner() {
           ]).start();
         }
       },
-    })
-  ).current;
+    }));
+  };
 
   useEffect(() => {
+    let disposed = false;
+    const notificationSetup = setupNotificationChannels();
+    // Native initialization failures must not interrupt the in-app banner.
+    notificationSetup.catch(() => {});
+    // Real-time listener for incoming notifications dispatched to this technician
+    const unsubscribeIncoming = subscribeToIncomingNotifications(userName, (item) => {
+      if (item.id && seenNotifications.current.has(item.id)) return;
+      if (item.id) seenNotifications.current.add(item.id);
+      const isUrgent =
+        item.priority === 'critical' ||
+        item.priority === 'high' ||
+        item.type === 'urgent_repair' ||
+        item.type === 'overdue_alert';
+
+      NotificationEmitter.trigger(
+        item.title || 'New Maintenance Notification',
+        item.message || '',
+        isUrgent
+      );
+
+      if (!isExpoGo && Platform.OS !== 'web' && !remotePushReady.current) {
+        try {
+          const Notifications = require('expo-notifications');
+          if (Notifications && typeof Notifications.scheduleNotificationAsync === 'function') {
+            const channelId = isUrgent ? 'alerts' : 'messages';
+            notificationSetup.then(async () => {
+              await remotePushRegistration.current;
+              return disposed || remotePushReady.current ? undefined : Notifications.scheduleNotificationAsync({
+              content: {
+                title: item.title || 'New Maintenance Notification',
+                body: item.message || '',
+                sound: true,
+                data: {
+                  relatedReportId: item.relatedReportId,
+                  type: item.type,
+                  channelId,
+                },
+              },
+              trigger: Platform.OS === 'android' ? { channelId } : null,
+              });
+            }).catch(() => {});
+          }
+        } catch (_) {}
+      }
+    });
+
     const removeListener = NotificationEmitter.addListener((newTitle, newBody, newIsAlert) => {
       // Respect user's System Settings notification preferences
       if (newIsAlert && !settings.criticalAlertsEnabled) {
@@ -228,13 +393,13 @@ function GlobalNotificationBanner() {
 
     // Safely listen to native push notification taps (if supported in standalone dev builds)
     let nativeSubscription: any = null;
-    const isExpoGo = (Constants.executionEnvironment as string) === 'store-client' || Constants.appOwnership === 'expo';
+    let receivedSubscription: any = null;
     
-    if (!isExpoGo) {
+    if (!isExpoGo && Platform.OS !== 'web') {
       try {
         const Notifications = require('expo-notifications');
         if (Notifications && typeof Notifications.addNotificationResponseReceivedListener === 'function') {
-          nativeSubscription = Notifications.addNotificationResponseReceivedListener((response: any) => {
+          const handleResponse = (response: any) => {
             if (response.actionIdentifier === 'turn_off') {
               if (typeof Notifications.dismissAllNotificationsAsync === 'function') {
                 Notifications.dismissAllNotificationsAsync();
@@ -244,13 +409,27 @@ function GlobalNotificationBanner() {
                 Notifications.dismissNotificationAsync(response.notification.request.identifier);
               }
             } else {
-              const channelId = response.notification?.request?.content?.android?.channelId;
+              const channelId = response.notification?.request?.content?.data?.channelId
+                || response.notification?.request?.trigger?.channelId
+                || response.notification?.request?.content?.android?.channelId;
               if (channelId === 'alerts') {
                 router.push('/notification');
               } else if (channelId === 'messages') {
                 router.push('/Maintenance' as any);
               }
             }
+          };
+          nativeSubscription = Notifications.addNotificationResponseReceivedListener(handleResponse);
+          const initialResponse = Notifications.getLastNotificationResponse?.();
+          if (initialResponse) handleResponse(initialResponse);
+        }
+        if (typeof Notifications.addNotificationReceivedListener === 'function') {
+          receivedSubscription = Notifications.addNotificationReceivedListener((notification: any) => {
+            const content = notification.request?.content;
+            const id = content?.data?.notificationId;
+            if (!id || seenNotifications.current.has(id)) return;
+            seenNotifications.current.add(id);
+            NotificationEmitter.trigger(content.title || 'Maintenance notification', content.body || '', content.data.channelId === 'alerts');
           });
         }
       } catch (e) {
@@ -259,15 +438,18 @@ function GlobalNotificationBanner() {
     }
 
     return () => {
+      disposed = true;
       removeListener();
+      unsubscribeIncoming();
       if (dismissTimerRef.current) {
         clearTimeout(dismissTimerRef.current);
       }
       if (nativeSubscription && typeof nativeSubscription.remove === 'function') {
         nativeSubscription.remove();
       }
+      receivedSubscription?.remove();
     };
-  }, []);
+  }, [userName]);
 
   const handleBannerPress = () => {
     dismissNotification('up');
@@ -313,7 +495,8 @@ function GlobalNotificationBanner() {
           ],
         },
       ]}
-      {...panResponder.panHandlers}
+      onLayout={handleBannerLayout}
+      {...panResponder?.panHandlers}
     >
       <Pressable 
         onPress={handleBannerPress} 
@@ -508,7 +691,7 @@ function RemoteLogoutNoticeModal({
           </View>
           <ThemedText style={remoteLogoutStyles.title}>Session Terminated</ThemedText>
           <ThemedText style={remoteLogoutStyles.description}>
-            An administrator has remotely signed you out from the desktop central console.
+            An administrator signed you out.
           </ThemedText>
           <Pressable onPress={onDismiss} style={remoteLogoutStyles.button}>
             <ThemedText style={remoteLogoutStyles.buttonText}>RETURN TO LOGIN</ThemedText>

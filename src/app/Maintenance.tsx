@@ -1,8 +1,16 @@
+import { AppState } from 'react-native';
+import { useSessionPageSnapshot } from '@/hooks/use-session-page-snapshot';
+import { getStatusPalette, Colors as UiColors, type AppColors, Spacing } from '@/constants/theme';
+
+import { createReadScope } from '@/services/query-utils';
+import { createRefreshCoordinator, type RefreshCoordinator } from '@/services/refresh-coordinator';
+import { DataListSkeleton } from '@/components/data-list-skeleton';
+import { isChecklistItemComplete, isRepairDone, isRepairAwaitingVerification } from '@/services/maintenance-status';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useLocalSearchParams } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -19,6 +27,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/app-icon';
+import { MaintenancePhoto } from '@/components/maintenance-photo';
 import { FloatingBottomNavbar } from '@/components/floating-navbar';
 import { LocationIcon } from '@/components/location-icon';
 import { ThemedText } from '@/components/themed-text';
@@ -30,9 +39,10 @@ import {
   ICON_CHEVRON_RIGHT,
   ICON_SEARCH
 } from '@/constants/custom-icons';
-import { Spacing } from '@/constants/theme';
+
 import { useAuth } from '@/context/auth-context';
 import { useSettings } from '@/context/settings-context';
+import { createMaintenanceMutationTracker, type MaintenanceMutationResult } from '@/services/maintenance-rpc';
 import {
   fetchLiveMaintenanceReports,
   submitRepairAndSyncParent,
@@ -46,7 +56,7 @@ const SCREEN_HEIGHT = Dimensions.get('window').height;
 const SCREEN_WIDTH = Dimensions.get('window').width;
 
 // Status types
-export type ChecklistStatus = 'Not Started' | 'In Progress' | 'Completed' | 'Needs Repair' | 'Under Repair';
+export type ChecklistStatus = 'Not Started' | 'In Progress' | 'Completed' | 'Needs Repair' | 'Under Repair' | 'For Verification';
 export type ReportStatus = 'Pending' | 'In Progress' | 'For Verification' | 'Completed' | 'Needs Repair' | 'Under Repair';
 export type PriorityLevel = 'Critical' | 'High' | 'Medium' | 'Low';
 
@@ -75,6 +85,9 @@ export interface MaintenanceReport {
   airconId: string;
   airconName?: string;
   airconType?: string;
+  controllerId?: string;
+  controllerName?: string;
+  protocolName?: string;
   roomId?: string;
   location: string;
   title: string;
@@ -87,6 +100,7 @@ export interface MaintenanceReport {
   createdDate?: string;
   status: ReportStatus;
   lastUpdated?: string;
+  updatedAt?: string | null;
   items: MaintenanceItem[];
   issue?: {
     component?: string;
@@ -99,9 +113,9 @@ export interface MaintenanceReport {
   timeline?: any[];
   parentReportId?: string | null;
   linkedRepairId?: string | null;
-  reworkInstructions?: string | null;
   isRepaired?: boolean;
   isVerified?: boolean;
+  allChildRepairsDone?: boolean;
 }
 
 function formatMaintenanceTimestamp(timestamp: string = new Date().toISOString()): string {
@@ -116,43 +130,73 @@ function formatMaintenanceTimestamp(timestamp: string = new Date().toISOString()
 }
 
 export default function MaintenanceScreen() {
-  const { userName } = useAuth();
+  const { userId, userName } = useAuth();
   const { effectiveTheme, colors } = useSettings();
+  const styles = themedStyles[effectiveTheme];
   const params = useLocalSearchParams<{ reportId?: string; screen?: string; repairId?: string }>();
 
   // Reports state
-  const [reports, setReports] = useState<MaintenanceReport[]>([]);
-  const [loading, setLoading] = useState(true);
+  const fetchUser = userId || userName;
+  const { data: reports, loading, error: fetchError, setData: setReports, commit, startLoading, fail, isCurrent: isSessionCurrent } =
+    useSessionPageSnapshot<MaintenanceReport[]>(fetchUser ? `maintenance:${fetchUser}` : undefined, () => []);
   const [refreshing, setRefreshing] = useState(false);
+  const refreshRef = useRef<RefreshCoordinator | null>(null);
+  const requestedReportId = params?.reportId;
   const [activeFilter, setActiveFilter] = useState<'All' | 'Pending' | 'In Progress' | 'For Verification' | 'Needs Repair' | 'Completed'>('All');
   const [searchQuery, setSearchQuery] = useState('');
 
   // Selected Report & Navigation state
-  // currentScreen: 'DASHBOARD' | 'DETAILS' | 'SUCCESS' | 'REWORK' | 'REPAIR'
-  const [currentScreen, setCurrentScreen] = useState<'DASHBOARD' | 'DETAILS' | 'SUCCESS' | 'REWORK' | 'REPAIR'>('DASHBOARD');
+  // currentScreen: 'DASHBOARD' | 'DETAILS' | 'SUCCESS' | 'REPAIR'
+  const [currentScreen, setCurrentScreen] = useState<'DASHBOARD' | 'DETAILS' | 'SUCCESS' | 'REPAIR'>('DASHBOARD');
   const [selectedReportId, setSelectedReportId] = useState<string>('');
   const [editingReportId, setEditingReportId] = useState<string>('');
   const [activeRepairId, setActiveRepairId] = useState<string | null>(null);
+  const itemEditorSnapshot = useRef<MaintenanceReport | null>(null);
+  const confirmationSnapshot = useRef<MaintenanceReport | null>(null);
+  const mutationAttempts = useRef(createMaintenanceMutationTracker());
+  const [handledRouteParams, setHandledRouteParams] = useState<string | null>(null);
 
-  const loadReports = async () => {
+  const mutationContext = (report: MaintenanceReport, changes: unknown) => {
+    return mutationAttempts.current(report.id, report.updatedAt, changes);
+  };
+
+  const rememberSavedVersion = (reportId: string, result: MaintenanceMutationResult) => {
+    if (result.updated) setReports(previous => previous.map(report => report.id === reportId
+      ? { ...report, updatedAt: result.updated, status: (result.status as ReportStatus) || report.status } : report));
+    if (result.updatedParentId) void loadReports();
+  };
+
+  const fetchReports = useCallback(async (isCurrent: () => boolean) => {
+    if (!isSessionCurrent()) return;
+    startLoading();
+    const scope = createReadScope();
     try {
-      const live = await fetchLiveMaintenanceReports(userName);
-      setReports(live || []);
+      const live = await fetchLiveMaintenanceReports(userName, scope);
+      scope.assertSuccessful();
+      if (!isCurrent() || !isSessionCurrent()) return;
+      commit(previous => (live || []).map(report => {
+        const saved = previous.find(existing => existing.id === report.id);
+        return saved && Date.parse(saved.updatedAt || '') > Date.parse(report.updatedAt || '') ? saved : report;
+      }));
       if (live && live.length > 0) {
-        if (params?.reportId) {
-          const matched = live.find((r) => r.id === params.reportId);
-          setSelectedReportId(matched ? matched.id : live[0].id);
-        } else {
-          setSelectedReportId((prev) => (prev && live.some((r) => r.id === prev) ? prev : live[0].id));
-        }
+        setSelectedReportId((prev) => {
+          if (prev && live.some((r) => r.id === prev)) return prev;
+          if (requestedReportId) {
+            const matched = live.find((r) => r.id === requestedReportId);
+            if (matched) return matched.id;
+          }
+          return live[0].id;
+        });
       }
     } catch (e) {
       console.error('Error fetching live maintenance reports:', e);
+      if (isCurrent() && isSessionCurrent()) fail('Unable to refresh maintenance. Pull down to try again.');
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (isCurrent() && isSessionCurrent()) setRefreshing(false);
     }
-  };
+  }, [userName, requestedReportId, setSelectedReportId, commit, startLoading, fail, isSessionCurrent]);
+
+  const loadReports = () => refreshRef.current?.refresh() ?? Promise.resolve();
 
   const onRefresh = () => {
     setRefreshing(true);
@@ -160,21 +204,30 @@ export default function MaintenanceScreen() {
   };
 
   useEffect(() => {
-    loadReports();
-    const unsubscribe = subscribeToMaintenanceReports(() => {
-      loadReports();
-    });
+    const refresh = createRefreshCoordinator(fetchReports, 150, AppState);
+    refreshRef.current = refresh;
+    void refresh.refresh();
+    const unsubscribe = subscribeToMaintenanceReports(() => refresh.schedule());
     return () => {
+      refresh.dispose();
+      if (refreshRef.current === refresh) refreshRef.current = null;
       unsubscribe();
     };
-  }, [userName]);
+  }, [fetchReports]);
 
-  useEffect(() => {
-    if (params?.repairId && reports.length > 0) {
-      const matchedRepair = reports.find((r) => r.id.toLowerCase() === params.repairId!.toLowerCase());
+  const routeKey = params?.reportId || params?.repairId || params?.screen
+    ? `${params.reportId || ''}_${params.repairId || ''}_${params.screen || ''}`
+    : null;
+
+  // Apply each route once when reports arrive, before committing a stale screen.
+  if (reports.length > 0 && routeKey && handledRouteParams !== routeKey) {
+    setHandledRouteParams(routeKey);
+    if (params?.repairId) {
+      const targetRepairId = params.repairId.toLowerCase();
+      const matchedRepair = reports.find((r) => (r.id || '').toLowerCase() === targetRepairId);
       const parentReport = matchedRepair?.parentReportId
-        ? reports.find((r) => r.id.toLowerCase() === matchedRepair.parentReportId!.toLowerCase())
-        : reports.find((r) => r.items?.some((it) => it.linkedRepairId?.toLowerCase() === params.repairId!.toLowerCase()));
+        ? reports.find((r) => (r.id || '').toLowerCase() === (matchedRepair.parentReportId || '').toLowerCase())
+        : reports.find((r) => r.items?.some((it) => (it.linkedRepairId || '').toLowerCase() === targetRepairId));
 
       if (parentReport) {
         setSelectedReportId(parentReport.id);
@@ -185,7 +238,7 @@ export default function MaintenanceScreen() {
         setActiveRepairId(params.repairId);
         setCurrentScreen('REPAIR');
       }
-    } else if (params?.reportId && reports.length > 0) {
+    } else if (params?.reportId) {
       const matched = reports.find((r) => r.id === params.reportId);
       if (matched) {
         setSelectedReportId(matched.id);
@@ -197,7 +250,7 @@ export default function MaintenanceScreen() {
         }
       }
     }
-  }, [params?.reportId, params?.repairId, params?.screen, reports]);
+  }
 
   // Currently expanded checklist item for editing remarks / photos / defect
   const [expandedItem, setExpandedItem] = useState<MaintenanceItem | null>(null);
@@ -213,10 +266,20 @@ export default function MaintenanceScreen() {
 
   // Submit Confirmation Dialog state
   const [confirmModalVisible, setConfirmModalVisible] = useState(false);
+  const [confirmRepairModalVisible, setConfirmRepairModalVisible] = useState(false);
+  const [pendingRepairToSubmit, setPendingRepairToSubmit] = useState<MaintenanceReport | null>(null);
+  const [repairSuccessModalVisible, setRepairSuccessModalVisible] = useState(false);
+  const [submittedRepairInfo, setSubmittedRepairInfo] = useState<{
+    id: string;
+    aircon: string;
+    location: string;
+    parentId?: string | null;
+    isRepair?: boolean;
+  } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Animated values
-  const progressAnim = useRef(new Animated.Value(0.5)).current;
+  const [progressAnim] = useState(() => new Animated.Value(0.5));
 
   const activeReport = reports.find((r) => r.id === selectedReportId) || reports[0];
   const isCurrentRepair = Boolean(
@@ -240,17 +303,27 @@ export default function MaintenanceScreen() {
   const inProgressCount = topLevelReports.filter((r) => r.status === 'In Progress').length;
   const forVerificationCount = topLevelReports.filter((r) => r.status === 'For Verification').length;
   const completedCount = topLevelReports.filter((r) => r.status === 'Completed').length;
-  const needsRepairCount = topLevelReports.filter((r) => r.status === 'Needs Repair' || r.status === 'Under Repair').length;
+  // Calculate total repairs needing attention across all reports (matching individual card defect/repair counts)
+  const needsRepairCount = topLevelReports.reduce((total, rep) => {
+    const repItems = rep.items || [];
+    const repNeedsRepair = repItems.filter(
+      (i) => i.status !== 'For Verification' && !i.isRepaired && !i.repaired && (i.status === 'Needs Repair' || i.status === 'Under Repair' || Boolean(i.linkedRepairId))
+    ).length;
+    if (repNeedsRepair > 0) {
+      return total + repNeedsRepair;
+    }
+    return (rep.status === 'Needs Repair' || rep.status === 'Under Repair') ? total + 1 : total;
+  }, 0);
 
   // Calculate active report progress
   const activeReportItems = activeReport?.items || [];
   const totalItems = activeReportItems.length;
-  const completedItems = activeReportItems.filter((i) => i.status === 'Completed').length;
+  const completedItems = activeReportItems.filter(isChecklistItemComplete).length;
   const inProgressItems = activeReportItems.filter((i) => i.status === 'In Progress').length;
   const notStartedItems = activeReportItems.filter((i) => i.status === 'Not Started').length;
   const needsRepairItems = isCurrentRepair
     ? 0
-    : activeReportItems.filter((i) => !i.isRepaired && !i.repaired && (i.status === 'Needs Repair' || i.status === 'Under Repair' || Boolean(i.linkedRepairId))).length;
+    : activeReportItems.filter((i) => i.status !== 'For Verification' && !i.isRepaired && !i.repaired && (i.status === 'Needs Repair' || i.status === 'Under Repair' || Boolean(i.linkedRepairId))).length;
   const progressRatio = totalItems > 0 ? completedItems / totalItems : 0;
   const progressPercentage = Math.round(progressRatio * 100);
 
@@ -277,10 +350,11 @@ export default function MaintenanceScreen() {
 
   // Quick Status change from dropdown
   const handleQuickStatusChange = (itemId: string, newStatus: ChecklistStatus) => {
+    if (isSubmitting) return;
     const targetRep = reports.find((r) => r.id === selectedReportId);
     if (!targetRep) return;
     const selectedItem = targetRep.items.find((item) => item.id === itemId);
-    if (!selectedItem) return;
+    if (!selectedItem || selectedItem.linkedRepairId || selectedItem.status === 'Under Repair') return;
     if (newStatus === 'Needs Repair') {
       setDropdownVisible(false);
       handleOpenItemEditor(selectedItem, targetRep.id);
@@ -303,17 +377,14 @@ export default function MaintenanceScreen() {
     // Determine overall report status
     const repairItems = !isTargetRepair ? updatedItems.filter((it) => it.status === 'Needs Repair') : [];
     const anyRepair = repairItems.length > 0;
-    const allDone = updatedItems.every((it) => it.status === 'Completed');
     const anyActive = updatedItems.some(
       (it) => it.status === 'In Progress' || it.status === 'Completed' || (!isTargetRepair && it.status === 'Needs Repair')
     );
     const overallStatus: ReportStatus = anyRepair
-      ? 'Needs Repair'
-      : allDone
-        ? 'For Verification'
-        : anyActive
-          ? 'In Progress'
-          : 'Pending';
+      ? (updatedItems.some(it => it.status === 'Under Repair') ? 'Under Repair' : 'Needs Repair')
+      : anyActive
+        ? 'In Progress'
+        : 'Pending';
 
     const updatedIssue = anyRepair ? {
       component: repairItems.map((i) => i.title).join(', '),
@@ -339,8 +410,11 @@ export default function MaintenanceScreen() {
     );
     setDropdownVisible(false);
 
-    // Persist status change directly to Supabase
+    setIsSubmitting(true);
+    // Persist item progress quietly; final submission remains explicit.
     updateLiveMaintenanceReport(selectedReportId, {
+      saveMode: 'item',
+      ...mutationContext(targetRep, { saveMode: 'item', status: overallStatus, items: updatedItems }),
       status: overallStatus,
       items: updatedItems,
       workerName: userName,
@@ -348,6 +422,7 @@ export default function MaintenanceScreen() {
       airconId: targetRep.airconId,
       existingTimeline: targetRep.timeline,
     }).then((result) => {
+      if (result.success) rememberSavedVersion(targetRep.id, result);
       if (!result.success) {
         alert(result.error || 'The status update could not be saved.');
         loadReports();
@@ -355,17 +430,27 @@ export default function MaintenanceScreen() {
     }).catch((err) => {
       console.warn('Background Supabase status update error:', err);
       loadReports();
-    });
+    }).finally(() => setIsSubmitting(false));
   };
 
   // Flexible interactive checkbox toggle for tasks and subtasks
   const handleToggleTaskCheck = (taskId: string, targetRepId?: string) => {
+    if (isSubmitting) return;
     const reportId = targetRepId || selectedReportId;
     const targetRep = reports.find((r) => r.id === reportId);
     if (!targetRep) return;
 
+    if (targetRep.status === 'Completed') {
+      alert('This maintenance report has been verified and completed.');
+      return;
+    }
+    if (targetRep.status === 'For Verification') {
+      alert('This maintenance report has already been submitted for verification and is locked awaiting admin review.');
+      return;
+    }
+
     const currentItem = targetRep.items.find((it) => it.id === taskId);
-    if (!currentItem) return;
+    if (!currentItem || currentItem.linkedRepairId || currentItem.status === 'Under Repair') return;
 
     const nextStatus: ChecklistStatus = currentItem.status === 'Completed' ? 'In Progress' : 'Completed';
     const itemUpdatedAt = new Date().toISOString();
@@ -382,17 +467,14 @@ export default function MaintenanceScreen() {
     );
 
     const anyRepair = !isTargetRepair && updatedItems.some((it) => it.status === 'Needs Repair');
-    const allDone = updatedItems.length > 0 && updatedItems.every((it) => it.status === 'Completed' || it.repaired || it.isRepaired);
     const anyActive = updatedItems.some(
       (it) => it.status === 'In Progress' || it.status === 'Completed' || (!isTargetRepair && it.status === 'Needs Repair')
     );
     const overallStatus: ReportStatus = anyRepair
-      ? 'Needs Repair'
-      : allDone
-        ? 'For Verification'
-        : anyActive
-          ? 'In Progress'
-          : 'Pending';
+      ? (updatedItems.some(it => it.status === 'Under Repair') ? 'Under Repair' : 'Needs Repair')
+      : anyActive
+        ? 'In Progress'
+        : 'Pending';
 
     setReports((prev) =>
       prev.map((rep) => {
@@ -407,7 +489,10 @@ export default function MaintenanceScreen() {
       })
     );
 
+    setIsSubmitting(true);
     updateLiveMaintenanceReport(reportId, {
+      saveMode: 'item',
+      ...mutationContext(targetRep, { saveMode: 'item', status: overallStatus, items: updatedItems }),
       status: overallStatus,
       items: updatedItems,
       workerName: userName,
@@ -415,23 +500,28 @@ export default function MaintenanceScreen() {
       airconId: targetRep.airconId,
       existingTimeline: targetRep.timeline,
     }).then((result) => {
-      if (!result.success) {
+      if (result.success) {
+        rememberSavedVersion(targetRep.id, result);
+      } else {
         alert(result.error || 'The checklist update could not be saved.');
         loadReports();
       }
     }).catch((err) => {
       console.warn('Background Supabase toggle task error:', err);
       loadReports();
-    });
+    }).finally(() => setIsSubmitting(false));
   };
 
   // Open Item Detail & Edit Modal (Screen 4 / Screen 7)
   const handleOpenItemEditor = (item: MaintenanceItem, reportId?: string) => {
+    itemEditorSnapshot.current = reports.find(report => report.id === (reportId || selectedReportId)) || null;
     setExpandedItem(item);
     setEditingReportId(reportId || selectedReportId);
     // If item is Under Repair, has linkedRepairId, or was flagged Needs Repair,
     // ensure the modal shows 'Needs Repair' selected, NEVER defaulting to 'Not Started'!
-    if (item.status === 'Under Repair' || item.status === 'Needs Repair' || Boolean(item.linkedRepairId)) {
+    if (item.status === 'For Verification') {
+      setItemStatus('For Verification');
+    } else if (item.status === 'Under Repair' || item.status === 'Needs Repair' || Boolean(item.linkedRepairId)) {
       setItemStatus('Needs Repair');
     } else {
       setItemStatus(item.status);
@@ -450,7 +540,9 @@ export default function MaintenanceScreen() {
     if (!expandedItem) return;
     if (isSubmitting) return;
     const targetReportId = editingReportId || selectedReportId;
-    const targetRep = reports.find((r) => r.id === targetReportId);
+    // Keep the version and tasks shown when the editor opened. Realtime refresh
+    // must not silently rebase a draft over another worker's changes.
+    const targetRep = itemEditorSnapshot.current?.id === targetReportId ? itemEditorSnapshot.current : null;
     if (!targetRep) return;
 
     if (itemStatus === 'Needs Repair' && !itemProblemDesc.trim()) {
@@ -471,8 +563,7 @@ export default function MaintenanceScreen() {
               `proof_${targetReportId}_${expandedItem.id}_${idx}`
             );
           } catch (e) {
-            console.warn('Photo upload failed:', e);
-            return uri;
+            throw new Error('Photo upload failed. Please try again before saving this checklist.');
           }
         }
         return uri;
@@ -484,14 +575,14 @@ export default function MaintenanceScreen() {
     const itemUpdatedAt = new Date().toISOString();
     const updatedItems = targetRep.items.map((it) => {
       if (it.id !== expandedItem.id) return it;
-      const resolvedStatus = (itemStatus === 'Needs Repair' && (it.linkedRepairId || expandedItem.linkedRepairId || it.status === 'Under Repair'))
-        ? 'Under Repair'
+      const resolvedStatus = it.linkedRepairId
+        ? (isChecklistItemComplete(it) ? 'Completed' : it.status === 'For Verification' ? 'For Verification' : 'Under Repair')
         : itemStatus;
       return {
         ...it,
         status: resolvedStatus,
         remarks: itemRemarks.trim(),
-        problemDescription: (itemStatus === 'Needs Repair' || resolvedStatus === 'Under Repair') ? itemProblemDesc.trim() : undefined,
+        problemDescription: (itemStatus === 'Needs Repair' || resolvedStatus === 'Under Repair' || resolvedStatus === 'For Verification') ? itemProblemDesc.trim() : undefined,
         photoUri: primaryPhoto,
         photoUris: uploadedPhotos,
         updatedAt: itemUpdatedAt,
@@ -501,17 +592,14 @@ export default function MaintenanceScreen() {
 
     const repairItems = updatedItems.filter((it) => it.status === 'Needs Repair' || it.status === 'Under Repair');
     const anyRepair = repairItems.length > 0;
-    const allDone = updatedItems.length > 0 && updatedItems.every((it) => it.status === 'Completed' || it.repaired || it.isRepaired);
     const anyActive = updatedItems.some(
       (it) => it.status === 'In Progress' || it.status === 'Completed' || it.status === 'Needs Repair' || it.status === 'Under Repair'
     );
     const overallStatus: ReportStatus = anyRepair
-      ? 'Needs Repair'
-      : allDone
-        ? 'For Verification'
-        : anyActive
-          ? 'In Progress'
-          : 'Pending';
+      ? (updatedItems.some(it => it.status === 'Under Repair') ? 'Under Repair' : 'Needs Repair')
+      : anyActive
+        ? 'In Progress'
+        : 'Pending';
 
     const updatedIssue = anyRepair ? {
       component: repairItems.map((i) => i.title).join(', '),
@@ -525,6 +613,8 @@ export default function MaintenanceScreen() {
     } : null;
 
     const result = await updateLiveMaintenanceReport(targetReportId, {
+      saveMode: 'item',
+      ...mutationContext(targetRep, { saveMode: 'item', status: overallStatus, items: updatedItems }),
       status: overallStatus,
       items: updatedItems,
       workerName: userName,
@@ -538,13 +628,15 @@ export default function MaintenanceScreen() {
       return;
     }
 
+    rememberSavedVersion(targetReportId, result);
+
     setReports((prev) =>
       prev.map((rep) => {
         if (rep.id !== targetReportId) return rep;
         return {
           ...rep,
           items: updatedItems,
-          status: overallStatus,
+          status: (result.status as ReportStatus) || overallStatus,
           issue: updatedIssue,
           lastUpdated: formatMaintenanceTimestamp(itemUpdatedAt),
         };
@@ -632,7 +724,17 @@ export default function MaintenanceScreen() {
 
   // Submit update confirmation to Supabase
   const handleConfirmSubmit = async () => {
-    if (!activeReport) return;
+    const activeReport = confirmationSnapshot.current;
+    if (!activeReport || isSubmitting) return;
+
+    if (activeReport.status === 'For Verification' || activeReport.status === 'Completed') {
+      setConfirmModalVisible(false);
+      alert(activeReport.status === 'Completed'
+        ? 'This maintenance report has already been completed and verified.'
+        : 'This maintenance report has already been submitted for verification.');
+      return;
+    }
+
     const validationError = validateLiveMaintenanceItems(activeReport.items);
     if (validationError) {
       alert(validationError);
@@ -652,7 +754,7 @@ export default function MaintenanceScreen() {
       const dateString = now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
       const formattedTimestamp = `${dateString} — ${timeString}`;
 
-      const allDone = activeReport.items.length > 0 && activeReport.items.every((it) => it.status === 'Completed');
+      const allDone = activeReport.items.length > 0 && activeReport.items.every(isChecklistItemComplete);
       const anyRepair = activeReport.items.some((it) => it.status === 'Needs Repair');
       const anyActive = activeReport.items.some(
         (it) => it.status === 'In Progress' || it.status === 'Completed' || it.status === 'Needs Repair'
@@ -667,6 +769,7 @@ export default function MaintenanceScreen() {
 
       // Persist to Supabase maintenance_reports table
       const res = await updateLiveMaintenanceReport(activeReport.id, {
+        ...mutationContext(activeReport, { status: overallStatus, items: activeReport.items }),
         status: overallStatus,
         items: activeReport.items,
         workerName: userName,
@@ -681,19 +784,30 @@ export default function MaintenanceScreen() {
         return;
       }
 
+      rememberSavedVersion(activeReport.id, res);
+
       setReports((prev) =>
         prev.map((rep) => {
           if (rep.id !== activeReport.id) return rep;
           return {
             ...rep,
-            status: overallStatus,
+            status: (res.status as ReportStatus) || overallStatus,
             lastUpdated: formattedTimestamp,
             issue: anyRepair ? rep.issue : null,
           };
         })
       );
 
+      setSubmittedRepairInfo({
+        id: activeReport.id,
+        aircon: activeReport.airconName || activeReport.controllerName || 'Name unavailable',
+        location: activeReport.location || 'Assigned Area',
+        parentId: activeReport.parentReportId || null,
+        isRepair: isCurrentRepair,
+      });
+
       setConfirmModalVisible(false);
+      setRepairSuccessModalVisible(true);
       setCurrentScreen('SUCCESS');
     } catch (e) {
       console.error('Error submitting maintenance update to Supabase:', e);
@@ -732,7 +846,7 @@ export default function MaintenanceScreen() {
     }
 
     // If report is already completed/verified and all its tasks are done, do not attach or display active repair order
-    const allRepTasksDone = rep.items && rep.items.length > 0 && rep.items.every((i) => i.status === 'Completed' || i.repaired || i.isRepaired);
+    const allRepTasksDone = rep.items && rep.items.length > 0 && rep.items.every(isChecklistItemComplete);
     if (allRepTasksDone && (rep.status === 'Completed' || rep.isVerified)) {
       return { hasDispatchedRepair: false, repairId: null as string | null, linkedRepairReport: null as MaintenanceReport | null };
     }
@@ -758,15 +872,6 @@ export default function MaintenanceScreen() {
     return { hasDispatchedRepair: false, repairId: null as string | null, linkedRepairReport: null as MaintenanceReport | null };
   };
 
-  // Helper to determine if report has supervisor rework requested (Image 2 output)
-  const hasReworkRequest = (rep?: MaintenanceReport | null) => {
-    if (!rep) return false;
-    if (rep.reworkInstructions && rep.reworkInstructions.trim().length > 0) return true;
-    return Array.isArray(rep.timeline) && rep.timeline.some(
-      (t: any) => typeof t?.title === 'string' && (t.title.includes('Supervisor requested rework') || t.title.includes('rework:'))
-    );
-  };
-
   // Flexible Order Classification helper for any maintenance type
   const getOrderClassification = (rep?: MaintenanceReport | null) => {
     if (!rep) {
@@ -779,23 +884,6 @@ export default function MaintenanceScreen() {
         instructionsLabel: 'Work Scope & Maintenance Instructions *:',
         instructionsText: 'Scheduled maintenance and diagnostic inspection.',
         submitButtonText: 'Submit for Admin Verification',
-        isRework: false,
-        isRepair: false,
-      };
-    }
-
-    const isRework = hasReworkRequest(rep);
-    if (isRework) {
-      return {
-        kind: 'rework' as const,
-        tag: 'QUALITY CONTROL & REWORK',
-        tagIcon: 'refresh',
-        title: 'Request Maintenance Rework',
-        accentColor: '#f59e0b',
-        instructionsLabel: 'Supervisor Rework Instructions *:',
-        instructionsText: rep.reworkInstructions || 'Checklist items require rework and re-inspection.',
-        submitButtonText: 'Submit Rework',
-        isRework: true,
         isRepair: false,
       };
     }
@@ -817,9 +905,8 @@ export default function MaintenanceScreen() {
         instructionsLabel: 'Scope of Work & Repair Instructions *:',
         instructionsText:
           rep.description ||
-          'Diagnose and repair component defect. Inspect parts, calibrate telemetry sensors, and validate operational safety.',
+          'Diagnose and repair component defect. Inspect AC device, verify electrical connections, and validate operational safety.',
         submitButtonText: 'Submit Repair',
-        isRework: false,
         isRepair: true,
       };
     }
@@ -835,20 +922,26 @@ export default function MaintenanceScreen() {
       instructionsLabel: 'Work Scope & Maintenance Instructions *:',
       instructionsText: rep.description || 'Perform scheduled checklist procedures, safety inspection, and telemetry checks.',
       submitButtonText: 'Submit for Verification',
-      isRework: false,
       isRepair: false,
     };
   };
 
-  // Direct Submission for Admin Verification (for any order or rework)
+  // Direct Submission for Admin Verification
   const handleSubmitForVerification = async (targetRepId?: string) => {
     const reportId = targetRepId || selectedReportId;
-    const targetRep = reports.find((r) => r.id === reportId);
-    if (!targetRep) return;
+    const targetRep = pendingRepairToSubmit?.id === reportId ? pendingRepairToSubmit : reports.find((r) => r.id === reportId);
+    if (!targetRep || isSubmitting) return;
+
+    if (targetRep.status === 'For Verification' || targetRep.status === 'Completed') {
+      alert(targetRep.status === 'Completed'
+        ? 'This report has already been completed and verified by the administrator.'
+        : 'This report has already been submitted for verification.');
+      return;
+    }
 
     // Completion & Verification Invariant:
     // A report cannot become Completed or Submitted for Verification while its own required tasks are unfinished!
-    const allTasksDone = targetRep.items.length > 0 && targetRep.items.every((it) => it.status === 'Completed' || it.repaired || it.isRepaired);
+    const allTasksDone = targetRep.items.length > 0 && targetRep.items.every(isChecklistItemComplete);
     if (!allTasksDone) {
       alert('Cannot submit for verification: All required checklist tasks must be completed first.');
       return;
@@ -870,31 +963,40 @@ export default function MaintenanceScreen() {
 
       const classification = getOrderClassification(targetRep);
       let customTimelineTitle = `Checklist completed & submitted for admin verification by ${userName || 'Maintenance Staff'}`;
-      if (classification.kind === 'rework') {
-        customTimelineTitle = `Rework completed & submitted for admin verification by ${userName || 'Maintenance Staff'}`;
-      } else if (classification.kind === 'repair') {
+      if (classification.kind === 'repair') {
         customTimelineTitle = `Corrective repair completed & submitted for admin verification by ${userName || 'Maintenance Staff'}`;
       }
 
       const isRepair = reportId.startsWith('REP-') || targetRep.type?.toLowerCase().includes('repair');
 
       if (isRepair) {
-        const syncRes = await submitRepairAndSyncParent(reportId, userName);
+        const syncRes = await submitRepairAndSyncParent(reportId, userName, mutationContext(targetRep, { submitRepair: true }));
         if (!syncRes.success) {
           console.warn('Failed to submit repair to Supabase:', syncRes.error);
           alert(syncRes.error || 'The repair order could not be submitted. Please try again.');
           return;
         }
 
+        setSubmittedRepairInfo({
+          id: reportId,
+          aircon: targetRep.airconName || targetRep.controllerName || 'Name unavailable',
+          location: targetRep.location || 'Assigned Area',
+          parentId: targetRep.parentReportId || null,
+          isRepair: true,
+        });
+
         // Reload all live reports from Supabase so both child repair and parent reports have their updated statuses, tasks, and completion counts
         await loadReports();
+        setConfirmRepairModalVisible(false);
         setConfirmModalVisible(false);
+        setRepairSuccessModalVisible(true);
         setSelectedReportId(reportId);
         setCurrentScreen('SUCCESS');
         return;
       }
 
       const res = await updateLiveMaintenanceReport(reportId, {
+        ...mutationContext(targetRep, { status: 'For Verification', items: finalizedItems }),
         status: 'For Verification',
         items: finalizedItems,
         workerName: userName,
@@ -910,6 +1012,8 @@ export default function MaintenanceScreen() {
         return;
       }
 
+      rememberSavedVersion(reportId, res);
+
       setReports((prev) =>
         prev.map((rep) => {
           if (rep.id !== reportId) return rep;
@@ -923,7 +1027,17 @@ export default function MaintenanceScreen() {
         })
       );
 
+      setSubmittedRepairInfo({
+        id: reportId,
+        aircon: targetRep.airconName || targetRep.controllerName || 'Name unavailable',
+        location: targetRep.location || 'Assigned Area',
+        parentId: targetRep.parentReportId || null,
+        isRepair: false,
+      });
+
+      setConfirmRepairModalVisible(false);
       setConfirmModalVisible(false);
+      setRepairSuccessModalVisible(true);
       setSelectedReportId(reportId);
       setCurrentScreen('SUCCESS');
     } catch (e) {
@@ -933,143 +1047,70 @@ export default function MaintenanceScreen() {
     }
   };
 
-  // Summary Metric Card dynamic theme styling with high-contrast active state
-  const getMetricCardStyle = (filterType: string, active: boolean) => {
-    if (!active) {
-      return {
-        cardBg: isDark ? '#151e32' : '#ffffff',
-        border: isDark ? '#334155' : '#e2e8f0',
-        countColor: isDark ? '#f8fafc' : '#0f172a',
-        labelColor: isDark ? '#94a3b8' : '#64748b',
-      };
-    }
-    switch (filterType) {
-      case 'In Progress':
-        return {
-          cardBg: isDark ? 'rgba(217, 119, 6, 0.22)' : '#fffbeb',
-          border: isDark ? '#f59e0b' : '#d97706',
-          countColor: isDark ? '#fbbf24' : '#b45309',
-          labelColor: isDark ? '#fde68a' : '#92400e',
-        };
-      case 'For Verification':
-        return {
-          cardBg: isDark ? 'rgba(147, 51, 234, 0.22)' : '#faf5ff',
-          border: isDark ? '#a855f7' : '#9333ea',
-          countColor: isDark ? '#c084fc' : '#7e22ce',
-          labelColor: isDark ? '#e9d5ff' : '#6b21a8',
-        };
-      case 'Needs Repair':
-        return {
-          cardBg: isDark ? 'rgba(220, 38, 38, 0.22)' : '#fef2f2',
-          border: isDark ? '#ef4444' : '#dc2626',
-          countColor: isDark ? '#f87171' : '#b91c1c',
-          labelColor: isDark ? '#fca5a5' : '#991b1b',
-        };
-      case 'Pending':
-      case 'Completed':
-      default:
-        return {
-          cardBg: isDark ? 'rgba(16, 185, 129, 0.22)' : '#ecfdf5',
-          border: isDark ? '#10b981' : '#059669',
-          countColor: isDark ? '#34d399' : '#065f46',
-          labelColor: isDark ? '#a7f3d0' : '#047857',
-        };
-    }
-  };
-
-  // Status Badge styling helper
-  const getStatusColor = (status: ChecklistStatus | ReportStatus) => {
-    if (isDark) {
-      switch (status) {
-        case 'Completed':
-          return { bg: 'rgba(16, 185, 129, 0.2)', text: '#34d399', border: 'rgba(16, 185, 129, 0.45)' };
-        case 'In Progress':
-          return { bg: 'rgba(245, 158, 11, 0.2)', text: '#fbbf24', border: 'rgba(245, 158, 11, 0.45)' };
-        case 'Needs Repair':
-          return { bg: 'rgba(239, 68, 68, 0.2)', text: '#f87171', border: 'rgba(239, 68, 68, 0.45)' };
-        case 'Under Repair':
-          return { bg: 'rgba(56, 189, 248, 0.2)', text: '#38bdf8', border: 'rgba(56, 189, 248, 0.45)' };
-        case 'For Verification':
-          return { bg: 'rgba(168, 85, 247, 0.2)', text: '#c084fc', border: 'rgba(168, 85, 247, 0.45)' };
-        case 'Pending':
-        case 'Not Started':
-        default:
-          return { bg: 'rgba(148, 163, 184, 0.15)', text: '#cbd5e1', border: 'rgba(148, 163, 184, 0.3)' };
-      }
-    }
-    switch (status) {
-      case 'Completed':
-        return { bg: '#d1fae5', text: '#059669', border: '#a7f3d0' };
-      case 'In Progress':
-        return { bg: '#fef3c7', text: '#d97706', border: '#fde68a' };
-      case 'Needs Repair':
-        return { bg: '#fee2e2', text: '#dc2626', border: '#fca5a5' };
-      case 'Under Repair':
-        return { bg: '#e0f2fe', text: '#0284c7', border: '#bae6fd' };
-      case 'For Verification':
-        return { bg: '#f3e8ff', text: '#9333ea', border: '#e9d5ff' };
-      case 'Pending':
-      case 'Not Started':
-      default:
-        return { bg: '#f1f5f9', text: '#64748b', border: '#e2e8f0' };
-    }
-  };
-
+  // Presentation helpers share the same status roles as the desktop app.
+  const getMetricCardStyle = (_filterType: string, active: boolean) => ({
+    cardBg: active ? colors.accentSurface : colors.backgroundElement,
+    border: active ? colors.emerald : colors.border,
+    countColor: colors.text,
+    labelColor: colors.textSecondary,
+  });
+  const getStatusColor = (status: ChecklistStatus | ReportStatus) => getStatusPalette(status, colors);
   const getPriorityColor = (priority: PriorityLevel) => {
-    switch (priority) {
-      case 'Critical':
-        return {
-          bg: isDark ? 'rgba(244, 63, 94, 0.25)' : '#ffe4e6',
-          text: isDark ? '#fb7185' : '#e11d48',
-          border: isDark ? 'rgba(244, 63, 94, 0.5)' : '#fda4af',
-        };
-      case 'High':
-        return {
-          bg: isDark ? 'rgba(239, 68, 68, 0.22)' : '#fee2e2',
-          text: isDark ? '#f87171' : '#dc2626',
-          border: isDark ? 'rgba(239, 68, 68, 0.5)' : '#fca5a5',
-        };
-      case 'Medium':
-        return {
-          bg: isDark ? 'rgba(245, 158, 11, 0.22)' : '#fef3c7',
-          text: isDark ? '#fbbf24' : '#d97706',
-          border: isDark ? 'rgba(245, 158, 11, 0.5)' : '#fde68a',
-        };
-      case 'Low':
-      default:
-        return {
-          bg: isDark ? 'rgba(56, 189, 248, 0.22)' : '#e0f2fe',
-          text: isDark ? '#38bdf8' : '#0284c7',
-          border: isDark ? 'rgba(56, 189, 248, 0.5)' : '#bae6fd',
-        };
-    }
+    const tone = priority === 'Critical' || priority === 'High' ? 'error'
+      : priority === 'Medium' ? 'warning' : 'info';
+    return { bg: colors[`${tone}Surface`], text: colors[tone], border: colors[tone] };
   };
 
   // Filtered reports list for dashboard (Option B: child repairs are accessed via parent checklist items)
   const visibleReports = reports.filter((rep) => !isChildRepairReport(rep));
   const filteredReports = visibleReports.filter((rep) => {
-    if (activeFilter !== 'All' && rep.status !== activeFilter) return false;
+    if (activeFilter !== 'All') {
+      if (activeFilter === 'Needs Repair') {
+        const repItems = rep.items || [];
+        const hasRepairs =
+          rep.status === 'Needs Repair' ||
+          rep.status === 'Under Repair' ||
+          repItems.some((i) => i.status !== 'For Verification' && !i.isRepaired && !i.repaired && (i.status === 'Needs Repair' || i.status === 'Under Repair' || Boolean(i.linkedRepairId)));
+        if (!hasRepairs) return false;
+      } else if (rep.status !== activeFilter) {
+        return false;
+      }
+    }
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       return (
-        rep.id.toLowerCase().includes(q) ||
-        rep.airconId.toLowerCase().includes(q) ||
-        rep.location.toLowerCase().includes(q) ||
-        rep.title.toLowerCase().includes(q) ||
+        (rep.id || '').toLowerCase().includes(q) ||
+        (rep.airconId || '').toLowerCase().includes(q) ||
+        (rep.airconName || '').toLowerCase().includes(q) ||
+        (rep.controllerName || '').toLowerCase().includes(q) ||
+        (rep.location || '').toLowerCase().includes(q) ||
+        (rep.title || '').toLowerCase().includes(q) ||
         (rep.assignedWorker && rep.assignedWorker.toLowerCase().includes(q)) ||
         (rep.description && rep.description.toLowerCase().includes(q)) ||
         (rep.parentReportId && rep.parentReportId.toLowerCase().includes(q)) ||
         (rep.linkedRepairId && rep.linkedRepairId.toLowerCase().includes(q)) ||
-        (rep.reworkInstructions && rep.reworkInstructions.toLowerCase().includes(q)) ||
         (rep.type && rep.type.toLowerCase().includes(q))
       );
     }
     return true;
   });
 
+  const defaultRepairInfo = getDispatchedRepairInfo(activeReport);
+  const hasDispatchedRepair = Boolean(activeRepairId || defaultRepairInfo.hasDispatchedRepair);
+  const repairId = activeRepairId || defaultRepairInfo.repairId;
+  const targetRepair = repairId
+    ? reports.find((report) => report.id.toLowerCase() === repairId.toLowerCase())
+    : null;
+  const linkedRepairReport = targetRepair;
+  const repairItems = targetRepair?.items || [];
+  const isRepairVerified = targetRepair ? isRepairDone(targetRepair) : false;
+  const isRepairSubmitted = targetRepair
+    ? !isRepairVerified && (isRepairAwaitingVerification(targetRepair) || targetRepair.status === 'For Verification')
+    : false;
+
   return (
     <LinearGradient
-      colors={effectiveTheme === 'dark' ? ['#0f172a', '#0a0f1d'] : ['#d1fae5', '#ffffff']}
+      colors={[UiColors[effectiveTheme].background, UiColors[effectiveTheme].background]}
       style={[styles.container, { backgroundColor: colors.background }]}
       start={{ x: 0, y: 0 }}
       end={{ x: 0, y: 0.35 }}
@@ -1097,16 +1138,16 @@ export default function MaintenanceScreen() {
                 <Image source={require('@/assets/images/ecoTrack.png')} style={styles.headerLogo} contentFit="contain" />
                 <View>
                   <ThemedText style={[styles.headerTitle, { color: colors.text }]}>EcoTrack</ThemedText>
-                  <ThemedText style={[styles.headerSubtitle, { color: colors.emerald }]}>Maintenance Module</ThemedText>
+                  <ThemedText style={[styles.headerSubtitle, { color: colors.textSecondary }]}>Maintenance Module</ThemedText>
                 </View>
               </View>
             </View>
 
             {/* Workflow Notice Banner */}
-            <View style={[styles.workflowNotice, { backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff', borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0' }]}>
+            <View style={[styles.workflowNotice, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
               <AppIcon name="checklist" size={16} color={colors.emerald} />
               <ThemedText style={[styles.workflowNoticeText, { color: colors.textSecondary }]}>
-                Assigned maintenance reports from the desktop dashboard. View, update checklists, and submit progress.
+                View assigned maintenance, update checklists and submit progress.
               </ThemedText>
             </View>
 
@@ -1120,9 +1161,9 @@ export default function MaintenanceScreen() {
                   return (
                     <Pressable
                       onPress={() => setActiveFilter('Pending')}
-                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: s.border }]}
+                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: UiColors[effectiveTheme].panelBorder }]}
                     >
-                      <View style={[styles.summaryBadgeDot, { backgroundColor: '#64748b' }]} />
+                      <View style={[styles.summaryBadgeDot, { backgroundColor: getStatusPalette('Pending', colors).text }]} />
                       <ThemedText style={[styles.summaryCount, { color: s.countColor }]}>{pendingCount}</ThemedText>
                       <ThemedText style={[styles.summaryLabel, { color: s.labelColor }]}>Pending</ThemedText>
                     </Pressable>
@@ -1135,9 +1176,9 @@ export default function MaintenanceScreen() {
                   return (
                     <Pressable
                       onPress={() => setActiveFilter('In Progress')}
-                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: s.border }]}
+                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: UiColors[effectiveTheme].panelBorder }]}
                     >
-                      <View style={[styles.summaryBadgeDot, { backgroundColor: '#d97706' }]} />
+                      <View style={[styles.summaryBadgeDot, { backgroundColor: getStatusPalette('In Progress', colors).text }]} />
                       <ThemedText style={[styles.summaryCount, { color: s.countColor }]}>{inProgressCount}</ThemedText>
                       <ThemedText style={[styles.summaryLabel, { color: s.labelColor }]}>In Progress</ThemedText>
                     </Pressable>
@@ -1150,9 +1191,9 @@ export default function MaintenanceScreen() {
                   return (
                     <Pressable
                       onPress={() => setActiveFilter('For Verification')}
-                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: s.border }]}
+                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: UiColors[effectiveTheme].panelBorder }]}
                     >
-                      <View style={[styles.summaryBadgeDot, { backgroundColor: '#9333ea' }]} />
+                      <View style={[styles.summaryBadgeDot, { backgroundColor: getStatusPalette('For Verification', colors).text }]} />
                       <ThemedText style={[styles.summaryCount, { color: s.countColor }]}>{forVerificationCount}</ThemedText>
                       <ThemedText style={[styles.summaryLabel, { color: s.labelColor }]} numberOfLines={1}>Verification</ThemedText>
                     </Pressable>
@@ -1165,9 +1206,9 @@ export default function MaintenanceScreen() {
                   return (
                     <Pressable
                       onPress={() => setActiveFilter('Needs Repair')}
-                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: s.border }]}
+                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: UiColors[effectiveTheme].panelBorder }]}
                     >
-                      <View style={[styles.summaryBadgeDot, { backgroundColor: '#dc2626' }]} />
+                      <View style={[styles.summaryBadgeDot, { backgroundColor: getStatusPalette('Needs Repair', colors).text }]} />
                       <ThemedText style={[styles.summaryCount, { color: s.countColor }]}>{needsRepairCount}</ThemedText>
                       <ThemedText style={[styles.summaryLabel, { color: s.labelColor }]} numberOfLines={1}>Repairs</ThemedText>
                     </Pressable>
@@ -1180,9 +1221,9 @@ export default function MaintenanceScreen() {
                   return (
                     <Pressable
                       onPress={() => setActiveFilter('Completed')}
-                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: s.border }]}
+                      style={[styles.summaryCard, { backgroundColor: s.cardBg, borderColor: UiColors[effectiveTheme].panelBorder }]}
                     >
-                      <View style={[styles.summaryBadgeDot, { backgroundColor: '#059669' }]} />
+                      <View style={[styles.summaryBadgeDot, { backgroundColor: getStatusPalette('Completed', colors).text }]} />
                       <ThemedText style={[styles.summaryCount, { color: s.countColor }]}>{completedCount}</ThemedText>
                       <ThemedText style={[styles.summaryLabel, { color: s.labelColor }]}>Completed</ThemedText>
                     </Pressable>
@@ -1192,8 +1233,8 @@ export default function MaintenanceScreen() {
             </View>
 
             {/* Search Bar */}
-            <View style={[styles.searchBarContainer, { backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff', borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0' }]}>
-              <Image source={{ uri: ICON_SEARCH }} style={[styles.searchIcon, { tintColor: colors.textSecondary }]} contentFit="contain" />
+            <View style={[styles.searchBarContainer, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].inputBorder : UiColors[effectiveTheme].inputBorder }]}>
+              <AppIcon name="search" size={16} color={colors.textSecondary} style={styles.searchIcon} />
               <TextInput
                 style={[styles.searchInput, { color: colors.text }]}
                 placeholder="Search report ID, AC unit, room, or type..."
@@ -1222,11 +1263,11 @@ export default function MaintenanceScreen() {
                     onPress={() => setActiveFilter(filter)}
                     style={[
                       styles.filterChip,
-                      { backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff', borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0' },
-                      isSelected && { backgroundColor: effectiveTheme === 'dark' ? '#059669' : '#0b291d', borderColor: effectiveTheme === 'dark' ? '#059669' : '#0b291d' }
+                      { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
+                      isSelected && { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].primaryFill, borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }
                     ]}
                   >
-                    <ThemedText style={[styles.filterChipText, { color: effectiveTheme === 'dark' ? '#94a3b8' : '#475569' }, isSelected && styles.filterChipTextActive]}>
+                    <ThemedText style={[styles.filterChipText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }, isSelected && styles.filterChipTextActive]}>
                       {filter}
                     </ThemedText>
                   </Pressable>
@@ -1234,6 +1275,7 @@ export default function MaintenanceScreen() {
               })}
             </ScrollView>
 
+            {fetchError && <ThemedText style={{ color: colors.textSecondary, marginBottom: 12 }}>{fetchError}</ThemedText>}
             {/* Report Cards List */}
             <View style={styles.reportsList}>
               <View style={styles.listHeaderRow}>
@@ -1241,27 +1283,22 @@ export default function MaintenanceScreen() {
               </View>
 
               {loading && reports.length === 0 ? (
-                <View style={{ paddingVertical: 40, alignItems: 'center', justifyContent: 'center' }}>
-                  <ActivityIndicator size="large" color="#059669" />
-                  <ThemedText style={{ marginTop: 12, fontSize: 13, color: '#6b7280', fontWeight: '600' }}>
-                    Loading maintenance reports from database...
-                  </ThemedText>
-                </View>
+                <DataListSkeleton label="Loading assigned maintenance reports..." />
               ) : (
                 filteredReports.map((report) => {
                   const repItems = report.items || [];
                   const repTotal = repItems.length;
-                  const repDone = repItems.filter((i) => i.status === 'Completed').length;
+                  const repDone = repItems.filter(isChecklistItemComplete).length;
                   const repRatio = repTotal > 0 ? repDone / repTotal : 0;
                   const repPct = Math.round(repRatio * 100);
                   const statusStyle = getStatusColor(report.status);
                   const priorityStyle = getPriorityColor(report.priority);
                   const repNeedsRepairCount = repItems.filter(
-                    (i) => !i.isRepaired && !i.repaired && (i.status === 'Needs Repair' || i.status === 'Under Repair' || Boolean(i.linkedRepairId))
+                    (i) => i.status !== 'For Verification' && !i.isRepaired && !i.repaired && (i.status === 'Needs Repair' || i.status === 'Under Repair' || Boolean(i.linkedRepairId))
                   ).length;
 
                   return (
-                    <View key={report.id} style={[styles.reportCard, { backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff', borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0' }]}>
+                    <View key={report.id} style={[styles.reportCard, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
                       {/* Top Row: Report ID and Status Badge */}
                       <View style={styles.cardHeaderRow}>
                         <View style={styles.reportIdPill}>
@@ -1280,7 +1317,7 @@ export default function MaintenanceScreen() {
                                 styles.statusBadgeCount,
                                 {
                                   backgroundColor: isDark ? '#ef4444' : '#dc2626',
-                                  borderColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff',
+                                  borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                                 },
                               ]}
                             >
@@ -1292,41 +1329,44 @@ export default function MaintenanceScreen() {
                         </View>
                       </View>
 
-                      {/* Friendly Connected Rework & Repair Badges with Counts */}
+                      {/* Friendly Connected Repair Badge */}
                       {(() => {
-                        const reworkCount = hasReworkRequest(report) ? 1 : 0;
-                        const { hasDispatchedRepair, repairId, linkedRepairReport } = getDispatchedRepairInfo(report);
-                        const isRepairedAlready = Boolean(
-                          (isCorrectiveRepair(report) && (report.isVerified || (report.status === 'Completed' && repItems.length > 0 && repItems.every((i) => i.status === 'Completed')))) ||
-                          (hasDispatchedRepair && linkedRepairReport && (linkedRepairReport.isRepaired || linkedRepairReport.isVerified || (linkedRepairReport.status === 'Completed' && (linkedRepairReport.items?.length === 0 || linkedRepairReport.items?.every((i) => i.status === 'Completed')))))
-                        );
+                        const { hasDispatchedRepair, repairId } = getDispatchedRepairInfo(report);
+                        const itemWithRepair = report.items?.find((i) => i.linkedRepairId);
+                        const effectiveRepairId = repairId || itemWithRepair?.linkedRepairId || null;
+                        const isRepairActive = Boolean(hasDispatchedRepair || effectiveRepairId);
 
-                        if (reworkCount === 0 && !isRepairedAlready) return null;
+                        const isRepairedAlready = isCorrectiveRepair(report)
+                          ? isRepairDone(report)
+                          : report.allChildRepairsDone === true && repNeedsRepairCount === 0;
+
+
+                        if (!isRepairedAlready && !isRepairActive) return null;
 
                         return (
                           <View style={styles.cardBadgesRow}>
 
-                            {reworkCount > 0 && (
+                            {isRepairActive && !isRepairedAlready && (
                               <View
                                 style={[
                                   styles.cardCountBadge,
                                   {
-                                    backgroundColor: isDark ? 'rgba(245, 158, 11, 0.16)' : '#fef3c7',
-                                    borderColor: isDark ? '#f59e0b' : '#fde68a',
+                                    backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface,
+                                    borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                                   },
                                 ]}
                               >
-                                <AppIcon name="refresh" size={11} color={isDark ? '#fbbf24' : '#b45309'} />
+                                <AppIcon name="gear" size={11} color={isDark ? '#fb7185' : '#e11d48'} />
                                 <ThemedText
                                   style={[
                                     styles.cardCountBadgeText,
                                     {
-                                      color: isDark ? '#fbbf24' : '#b45309',
+                                      color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error,
                                       fontWeight: '800',
                                     },
                                   ]}
                                 >
-                                  {reworkCount} {reworkCount === 1 ? 'Rework' : 'Reworks'}
+                                  {repNeedsRepairCount > 1 ? `${repNeedsRepairCount} Repair Orders` : 'Repair Order'}
                                 </ThemedText>
                               </View>
                             )}
@@ -1336,8 +1376,8 @@ export default function MaintenanceScreen() {
                                 style={[
                                   styles.cardCountBadge,
                                   {
-                                    backgroundColor: isDark ? 'rgba(16, 185, 129, 0.16)' : '#ecfdf5',
-                                    borderColor: isDark ? '#10b981' : '#a7f3d0',
+                                    backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
+                                    borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                                   },
                                 ]}
                               >
@@ -1346,7 +1386,7 @@ export default function MaintenanceScreen() {
                                   style={[
                                     styles.cardCountBadgeText,
                                     {
-                                      color: isDark ? '#34d399' : '#047857',
+                                      color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text,
                                       fontWeight: '800',
                                     },
                                   ]}
@@ -1361,13 +1401,13 @@ export default function MaintenanceScreen() {
 
                       {/* Complete — Awaiting Admin Verification Notice */}
                       {report.status === 'For Verification' ? (
-                        <View style={[styles.verificationNoticeCard, { backgroundColor: effectiveTheme === 'dark' ? 'rgba(147, 51, 234, 0.16)' : '#faf5ff', borderColor: effectiveTheme === 'dark' ? 'rgba(168, 85, 247, 0.45)' : '#e9d5ff' }]}>
-                          <AppIcon name="shield" size={15} color={effectiveTheme === 'dark' ? '#c084fc' : '#7e22ce'} />
+                        <View style={[styles.verificationNoticeCard, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].warningSurface : UiColors[effectiveTheme].warningSurface, borderColor: UiColors[effectiveTheme].panelBorder }]}>
+                          <AppIcon name="shield" size={15} color={colors.warning} />
                           <View style={{ flex: 1 }}>
-                            <ThemedText style={[styles.verificationNoticeHeader, { color: effectiveTheme === 'dark' ? '#c084fc' : '#7e22ce' }]}>
+                            <ThemedText style={[styles.verificationNoticeHeader, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].warning : UiColors[effectiveTheme].warning }]}>
                               Complete — Needs Admin Verification
                             </ThemedText>
-                            <ThemedText style={[styles.verificationNoticeContent, { color: effectiveTheme === 'dark' ? '#e9d5ff' : '#6b21a8' }]}>
+                            <ThemedText style={[styles.verificationNoticeContent, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].warning }]}>
                               Checklist completed (100%). Submitted for administrator review and approval.
                             </ThemedText>
                           </View>
@@ -1379,40 +1419,44 @@ export default function MaintenanceScreen() {
                         <View style={styles.acHeaderLine}>
                           <View style={styles.acTitleGroup}>
                             <View style={styles.acIconCircle}>
-                              <Image source={{ uri: ICON_AIRCONSTATE }} style={{ width: 14, height: 14, tintColor: colors.emerald }} contentFit="contain" />
+                              <AppIcon name="snowflake" size={14} color={colors.emerald} />
                             </View>
                             <ThemedText style={[styles.acTitleText, { color: colors.text }]}>
-                              {report.airconName || report.airconId}
+                              {report.controllerName || 'AC Device name unavailable'}
                             </ThemedText>
                           </View>
                           {report.type ? (
                             <View style={[
                               styles.reportTypeBadge,
                               {
-                                backgroundColor: isDark ? 'rgba(16, 185, 129, 0.15)' : '#ecfdf5',
-                                borderColor: isDark ? 'rgba(16, 185, 129, 0.35)' : '#a7f3d0',
+                                backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
+                                borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                               }
                             ]}>
-                              <ThemedText style={[styles.reportTypeBadgeText, { color: isDark ? '#34d399' : '#047857' }]} numberOfLines={1}>
+                              <ThemedText style={[styles.reportTypeBadgeText, { color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text }]} numberOfLines={1}>
                                 {report.type}
                               </ThemedText>
                             </View>
                           ) : null}
                         </View>
 
+                        <ThemedText style={[styles.airconTypeTagText, { color: colors.textSecondary }]}>
+                          Aircon: {report.airconName || 'Name unavailable'}
+                        </ThemedText>
+
                         {/* Equipment Model & Aircon Type Row */}
                         <View style={styles.acMetaTagsRow}>
                           {report.airconType ? (
-                            <View style={[styles.airconTypeTag, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : '#ecfdf5', borderColor: effectiveTheme === 'dark' ? '#1e293b' : '#a7f3d0' }]}>
+                            <View style={[styles.airconTypeTag, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].accentSurface, borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                               <AppIcon name="gear" size={11} color={effectiveTheme === 'dark' ? '#34d399' : '#047857'} />
-                              <ThemedText style={[styles.airconTypeTagText, { color: effectiveTheme === 'dark' ? '#34d399' : '#047857' }]}>
+                              <ThemedText style={[styles.airconTypeTagText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text }]}>
                                 {report.airconType}
                               </ThemedText>
                             </View>
                           ) : null}
 
-                          <View style={[styles.locationBadgeRow, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : '#f8fafc', borderColor: effectiveTheme === 'dark' ? '#1e293b' : '#e2e8f0' }]}>
-                            <LocationIcon size={12} color="#059669" />
+                          <View style={[styles.locationBadgeRow, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].background, borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
+                            <LocationIcon size={12} color={UiColors[effectiveTheme].emerald} />
                             <ThemedText style={[styles.locationBadgeText, { color: colors.textSecondary }]}>
                               {report.location}
                             </ThemedText>
@@ -1421,7 +1465,7 @@ export default function MaintenanceScreen() {
                       </View>
 
                       {/* Description UI Card (Work Scope) */}
-                      <View style={[styles.descriptionCardBox, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : '#f8fafc', borderColor: effectiveTheme === 'dark' ? '#1e293b' : '#e2e8f0' }]}>
+                      <View style={[styles.descriptionCardBox, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].background, borderColor: UiColors[effectiveTheme].panelBorder }]}>
                         <View style={styles.descriptionBoxHeader}>
                           <AppIcon name="checklist" size={12} color={colors.textSecondary} />
                           <ThemedText style={styles.descriptionBoxLabel}>WORK SCOPE / DESCRIPTION</ThemedText>
@@ -1433,13 +1477,13 @@ export default function MaintenanceScreen() {
 
                       {/* Admin Verification Remarks banner if present */}
                       {report.verificationRemarks ? (
-                        <View style={[styles.verificationRemarksCard, { backgroundColor: effectiveTheme === 'dark' ? '#1e1b4b' : '#f5f3ff', borderColor: effectiveTheme === 'dark' ? '#3730a3' : '#ddd6fe' }]}>
+                        <View style={[styles.verificationRemarksCard, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].warningSurface : UiColors[effectiveTheme].warningSurface, borderColor: UiColors[effectiveTheme].panelBorder }]}>
                           <AppIcon name="shield" size={14} color={effectiveTheme === 'dark' ? '#c4b5fd' : '#6b21a8'} />
                           <View style={{ flex: 1 }}>
-                            <ThemedText style={[styles.verificationRemarksHeader, { color: effectiveTheme === 'dark' ? '#c4b5fd' : '#6b21a8' }]}>
+                            <ThemedText style={[styles.verificationRemarksHeader, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].warning }]}>
                               Admin Verification Remarks
                             </ThemedText>
-                            <ThemedText style={[styles.verificationRemarksContent, { color: effectiveTheme === 'dark' ? '#e0e7ff' : '#4338ca' }]}>
+                            <ThemedText style={[styles.verificationRemarksContent, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].textSecondary }]}>
                               {report.verificationRemarks}
                             </ThemedText>
                           </View>
@@ -1454,7 +1498,7 @@ export default function MaintenanceScreen() {
                           </ThemedText>
                         </View>
                         <View style={styles.dueTag}>
-                          <Image source={{ uri: ICON_CALENDAR }} style={styles.calendarIcon} contentFit="contain" />
+                          <AppIcon name="calendar" size={14} color={colors.textSecondary} style={styles.calendarIcon} />
                           <ThemedText style={[styles.dueTagText, { color: colors.textSecondary }]}>Due: {report.dueDate}</ThemedText>
                         </View>
                       </View>
@@ -1467,13 +1511,13 @@ export default function MaintenanceScreen() {
                           </ThemedText>
                           <ThemedText style={styles.cardProgressPct}>{repPct}%</ThemedText>
                         </View>
-                        <View style={[styles.progressBarTrack, { backgroundColor: isDark ? '#1e293b' : '#e2e8f0' }]}>
+                        <View style={[styles.progressBarTrack, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected }]}>
                           <View
                             style={[
                               styles.progressBarFill,
                               {
                                 width: `${repPct}%`,
-                                backgroundColor: repPct === 100 ? '#059669' : '#10b981',
+                                backgroundColor: repPct === 100 ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].primaryFill,
                               },
                             ]}
                           />
@@ -1486,25 +1530,25 @@ export default function MaintenanceScreen() {
                         style={[
                           styles.viewButton,
                           {
-                            backgroundColor: effectiveTheme === 'dark' ? '#064e3b' : '#f0fdf4',
-                            borderColor: effectiveTheme === 'dark' ? '#059669' : '#bbf7d0'
+                            backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].accentSurface,
+                            borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border
                           }
                         ]}
                       >
-                        <ThemedText style={[styles.viewButtonText, { color: effectiveTheme === 'dark' ? '#34d399' : '#065f46' }]}>Open Maintenance Checklist</ThemedText>
-                        <Image source={{ uri: ICON_CHEVRON_RIGHT }} style={[styles.viewButtonIcon, { tintColor: effectiveTheme === 'dark' ? '#34d399' : '#059669' }]} contentFit="contain" />
+                        <ThemedText style={[styles.viewButtonText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text }]}>Open Maintenance Checklist</ThemedText>
+                        <AppIcon name="chevron-right" size={14} color={effectiveTheme === 'dark' ? '#34d399' : '#059669'} style={styles.viewButtonIcon} />
                       </Pressable>
                     </View>
                   );
                 }))}
 
-              {!loading && filteredReports.length === 0 && (
+              {!loading && !fetchError && filteredReports.length === 0 && (
                 <View
                   style={[
                     styles.emptyState,
                     {
-                      backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff',
-                      borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0',
+                      backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                      borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                     },
                   ]}
                 >
@@ -1512,7 +1556,7 @@ export default function MaintenanceScreen() {
                     style={[
                       styles.emptyIconCircle,
                       {
-                        backgroundColor: effectiveTheme === 'dark' ? 'rgba(16, 185, 129, 0.15)' : '#ecfdf5',
+                        backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
                       },
                     ]}
                   >
@@ -1532,15 +1576,15 @@ export default function MaintenanceScreen() {
                       style={[
                         styles.emptyActionBtn,
                         {
-                          backgroundColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9',
-                          borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0',
+                          backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected,
+                          borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                         },
                       ]}
                     >
                       <ThemedText
                         style={[
                           styles.emptyActionBtnText,
-                          { color: effectiveTheme === 'dark' ? '#34d399' : '#059669' },
+                          { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].emerald },
                         ]}
                       >
                         Show All Reports
@@ -1577,109 +1621,52 @@ export default function MaintenanceScreen() {
                   <ThemedText style={[styles.detailsMainSubtitle, { color: colors.textSecondary }]}>{activeReport.title}</ThemedText>
                 </View>
 
-                {/* CONNECTED REWORK CARD (Only if supervisor requested rework) */}
-                {(() => {
-                  const hasRework = hasReworkRequest(activeReport);
-                  if (!hasRework) return null;
-
-                  return (
-                    <View style={styles.connectedCardsContainer}>
-                      <View style={[styles.connectedCard, { backgroundColor: isDark ? 'rgba(245, 158, 11, 0.12)' : '#fffbeb', borderColor: isDark ? 'rgba(245, 158, 11, 0.45)' : '#fde68a' }]}>
-                        <View style={styles.connectedCardHeader}>
-                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
-                            <AppIcon name="refresh" size={14} color={isDark ? '#fbbf24' : '#b45309'} />
-                            <ThemedText style={[styles.connectedCardTag, { color: isDark ? '#fbbf24' : '#b45309' }]}>
-                              QUALITY CONTROL & REWORK
-                            </ThemedText>
-                          </View>
-                          <View style={[styles.connectedCardPill, { backgroundColor: '#f59e0b' }]}>
-                            <ThemedText style={styles.connectedCardPillText}>{activeReport.priority || 'High'}</ThemedText>
-                          </View>
-                        </View>
-
-                        <ThemedText style={[styles.connectedCardInstructions, { color: isDark ? '#fef3c7' : '#78350f' }]} numberOfLines={2}>
-                          "{activeReport.reworkInstructions || 'Supervisor flagged items requiring rework and re-inspection.'}"
-                        </ThemedText>
-
-                        <View style={styles.connectedCardMetaRow}>
-                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                            <AppIcon name="user" size={11} color={isDark ? '#fde68a' : '#92400e'} />
-                            <ThemedText style={[styles.connectedCardMetaText, { color: isDark ? '#fde68a' : '#92400e' }]}>
-                              Assigned: {activeReport.assignedWorker}
-                            </ThemedText>
-                          </View>
-                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                            <AppIcon name="calendar" size={11} color={isDark ? '#fde68a' : '#92400e'} />
-                            <ThemedText style={[styles.connectedCardMetaText, { color: isDark ? '#fde68a' : '#92400e' }]}>
-                              Due: {activeReport.dueDate}
-                            </ThemedText>
-                          </View>
-                        </View>
-
-                        <Pressable
-                          onPress={() => setCurrentScreen('REWORK')}
-                          style={[styles.connectedCardBtn, { backgroundColor: '#f59e0b' }]}
-                        >
-                          <ThemedText style={styles.connectedCardBtnText}>
-                            Open Rework Page →
-                          </ThemedText>
-                        </Pressable>
-                      </View>
-                    </View>
-                  );
-                })()}
-
                 {/* SCREEN 2: Aircon Information Card */}
-                <View style={[styles.airconInfoCard, { backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff', borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0' }]}>
+                <View style={[styles.airconInfoCard, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
                   <View style={styles.cardSectionHeader}>
                     <ThemedText style={[styles.cardSectionTitle, { color: colors.text }]}>AIRCON & EQUIPMENT INFORMATION</ThemedText>
                   </View>
                   <View style={styles.infoGrid}>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
-                      <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Aircon Sensor:</ThemedText>
-                      <ThemedText style={[styles.infoValueBold, { color: colors.text }]}>{activeReport.airconName || activeReport.airconId}</ThemedText>
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
+                      <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>AC Device:</ThemedText>
+                      <ThemedText style={[styles.infoValueBold, { color: colors.text }]}>{activeReport.controllerName || 'Name unavailable'}</ThemedText>
                     </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+                    <View style={[styles.infoRow, { borderBottomColor: UiColors[effectiveTheme].border }]}>
+                      <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Custom Aircon Name:</ThemedText>
+                      <ThemedText style={[styles.infoValue, { color: colors.text }]}>{activeReport.airconName || 'Name unavailable'}</ThemedText>
+                    </View>
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Aircon Type:</ThemedText>
                       <ThemedText style={[styles.infoValue, { color: colors.emerald, fontWeight: '700' }]}>
-                        {activeReport.airconType || 'Split Type (Inverter)'}
+                        {activeReport.airconType || '—'}
                       </ThemedText>
                     </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+                    {activeReport.protocolName ? (
+                      <View style={[styles.infoRow, { borderBottomColor: UiColors[effectiveTheme].border }]}>
+                        <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>IR Protocol:</ThemedText>
+                        <ThemedText style={[styles.infoValue, { color: colors.text }]}>{activeReport.protocolName}</ThemedText>
+                      </View>
+                    ) : null}
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Location:</ThemedText>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                        <LocationIcon size={12} color="#059669" />
+                      <View style={{ flex: 1, minWidth: 0, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 4 }}>
+                        <LocationIcon size={12} color={UiColors[effectiveTheme].emerald} />
                         <ThemedText style={[styles.infoValue, { color: colors.text }]}>{activeReport.location}</ThemedText>
                       </View>
                     </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Maintenance Type:</ThemedText>
                       <ThemedText style={[styles.infoValue, { color: colors.text }]}>{activeReport.type}</ThemedText>
                     </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Latest Update:</ThemedText>
                       <ThemedText style={[styles.infoValue, { color: colors.text }]}>{activeReport.lastUpdated || 'Not updated yet'}</ThemedText>
                     </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9', alignItems: 'flex-start' }]}>
-                      <ThemedText style={[styles.infoKey, { color: colors.textSecondary, marginTop: 2 }]}>Scope / Description:</ThemedText>
-                      <View style={styles.scopeScrollBox}>
-                        <ScrollView
-                          style={styles.scopeScrollView}
-                          nestedScrollEnabled={true}
-                          showsVerticalScrollIndicator={true}
-                          persistentScrollbar={true}
-                        >
-                          <ThemedText style={[styles.infoValue, { color: colors.text, textAlign: 'right', lineHeight: 20 }]}>
-                            {activeReport.description || activeReport.title || 'Scheduled preventive inspection'}
-                          </ThemedText>
-                        </ScrollView>
-                      </View>
-                    </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Assigned Worker:</ThemedText>
                       <ThemedText style={[styles.infoValue, { color: colors.text }]}>{activeReport.assignedWorker}</ThemedText>
                     </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Priority:</ThemedText>
                       <View style={[styles.priorityPillSmall, { backgroundColor: getPriorityColor(activeReport.priority).bg }]}>
                         <ThemedText style={[styles.priorityPillSmallText, { color: getPriorityColor(activeReport.priority).text }]}>
@@ -1687,7 +1674,7 @@ export default function MaintenanceScreen() {
                         </ThemedText>
                       </View>
                     </View>
-                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+                    <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Due Date:</ThemedText>
                       <ThemedText style={[styles.infoValue, { color: colors.text }]}>{activeReport.dueDate}</ThemedText>
                     </View>
@@ -1699,10 +1686,10 @@ export default function MaintenanceScreen() {
 
                   {/* Admin Verification Remarks if verified */}
                   {activeReport.verificationRemarks ? (
-                    <View style={[styles.detailsVerificationBanner, { backgroundColor: effectiveTheme === 'dark' ? '#1e1b4b' : '#f5f3ff', borderColor: effectiveTheme === 'dark' ? '#3730a3' : '#ddd6fe' }]}>
+                    <View style={[styles.detailsVerificationBanner, { backgroundColor: effectiveTheme === 'dark' ? '#1e1b4b' : '#f5f3ff', borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <AppIcon name="shield" size={15} color={effectiveTheme === 'dark' ? '#c4b5fd' : '#6b21a8'} />
                       <View style={{ flex: 1 }}>
-                        <ThemedText style={[styles.detailsVerificationTitle, { color: effectiveTheme === 'dark' ? '#c4b5fd' : '#6b21a8' }]}>
+                        <ThemedText style={[styles.detailsVerificationTitle, { color: effectiveTheme === 'dark' ? '#c4b5fd' : UiColors[effectiveTheme].text }]}>
                           Facility Administrator Remarks
                         </ThemedText>
                         <ThemedText style={[styles.detailsVerificationText, { color: effectiveTheme === 'dark' ? '#e0e7ff' : '#4338ca' }]}>
@@ -1714,22 +1701,31 @@ export default function MaintenanceScreen() {
 
                   {/* Awaiting Admin Verification Banner */}
                   {activeReport.status === 'For Verification' && (
-                    <View style={[styles.detailsPendingVerificationBanner, { backgroundColor: effectiveTheme === 'dark' ? 'rgba(147, 51, 234, 0.15)' : '#f3e8ff', borderColor: effectiveTheme === 'dark' ? 'rgba(168, 85, 247, 0.4)' : '#d8b4fe' }]}>
-                      <AppIcon name="clock" size={16} color={effectiveTheme === 'dark' ? '#c084fc' : '#7e22ce'} />
+                    <View style={[styles.detailsPendingVerificationBanner, { backgroundColor: effectiveTheme === 'dark' ? 'rgba(147, 51, 234, 0.15)' : UiColors[effectiveTheme].infoSurface, borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
+                      <AppIcon name="shield" size={16} color={colors.warning} />
                       <View style={{ flex: 1 }}>
-                        <ThemedText style={[styles.detailsPendingVerificationTitle, { color: effectiveTheme === 'dark' ? '#c084fc' : '#7e22ce' }]}>
+                        <ThemedText style={[styles.detailsPendingVerificationTitle, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>
                           Awaiting Admin Verification
                         </ThemedText>
-                        <ThemedText style={[styles.detailsPendingVerificationText, { color: effectiveTheme === 'dark' ? '#e9d5ff' : '#6b21a8' }]}>
-                          All checklist tasks are completed (100%). This report has been submitted and is awaiting administrator verification and sign-off.
+                        <ThemedText style={[styles.detailsPendingVerificationText, { color: effectiveTheme === 'dark' ? '#e9d5ff' : UiColors[effectiveTheme].info }]}>
+                          Checklist complete. Submitted for administrator approval.
                         </ThemedText>
                       </View>
                     </View>
                   )}
                 </View>
 
+                <View style={[styles.airconInfoCard, { backgroundColor: UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
+                  <View style={styles.cardSectionHeader}>
+                    <ThemedText style={[styles.cardSectionTitle, { color: colors.text }]}>SCOPE / DESCRIPTION</ThemedText>
+                  </View>
+                  <ThemedText style={[styles.scopeDescriptionText, { color: colors.text }]}>
+                    {activeReport.description || activeReport.title || 'No description provided.'}
+                  </ThemedText>
+                </View>
+
                 {/* Maintenance Progress Section */}
-                <View style={[styles.progressCard, { backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff', borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0' }]}>
+                <View style={[styles.progressCard, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
                   <View style={styles.progressCardHeader}>
                     <ThemedText style={[styles.cardSectionTitle, { color: colors.text }]}>MAINTENANCE PROGRESS</ThemedText>
                     <ThemedText style={styles.progressPercentageText}>{progressPercentage}%</ThemedText>
@@ -1740,7 +1736,7 @@ export default function MaintenanceScreen() {
                   </ThemedText>
 
                   {/* Progress Bar */}
-                  <View style={[styles.largeProgressBarTrack, { backgroundColor: effectiveTheme === 'dark' ? '#1e293b' : '#e2e8f0' }]}>
+                  <View style={[styles.largeProgressBarTrack, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected }]}>
                     <Animated.View
                       style={[
                         styles.largeProgressBarFill,
@@ -1749,7 +1745,7 @@ export default function MaintenanceScreen() {
                             inputRange: [0, 1],
                             outputRange: ['0%', '100%'],
                           }),
-                          backgroundColor: progressPercentage === 100 ? '#059669' : '#10b981',
+                          backgroundColor: progressPercentage === 100 ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].primaryFill,
                         },
                       ]}
                     />
@@ -1757,21 +1753,21 @@ export default function MaintenanceScreen() {
 
                   {/* Status Chips Summary */}
                   <View style={styles.statusChipsRow}>
-                    <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : '#f8fafc' }]}>
-                      <ThemedText style={[styles.statusChipNum, { color: '#059669' }]}>{completedItems}</ThemedText>
+                    <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].background }]}>
+                      <ThemedText style={[styles.statusChipNum, { color: UiColors[effectiveTheme].emerald }]}>{completedItems}</ThemedText>
                       <ThemedText style={[styles.statusChipLabel, { color: colors.textSecondary }]}>Done</ThemedText>
                     </View>
-                    <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : '#f8fafc' }]}>
-                      <ThemedText style={[styles.statusChipNum, { color: '#d97706' }]}>{inProgressItems}</ThemedText>
+                    <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].background }]}>
+                      <ThemedText style={[styles.statusChipNum, { color: UiColors[effectiveTheme].warning }]}>{inProgressItems}</ThemedText>
                       <ThemedText style={[styles.statusChipLabel, { color: colors.textSecondary }]}>In Progress</ThemedText>
                     </View>
-                    <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : '#f8fafc' }]}>
-                      <ThemedText style={[styles.statusChipNum, { color: '#64748b' }]}>{notStartedItems}</ThemedText>
+                    <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].background }]}>
+                      <ThemedText style={[styles.statusChipNum, { color: UiColors[effectiveTheme].textSecondary }]}>{notStartedItems}</ThemedText>
                       <ThemedText style={[styles.statusChipLabel, { color: colors.textSecondary }]}>Not Started</ThemedText>
                     </View>
                     {!isCurrentRepair && needsRepairItems > 0 && (
-                      <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : '#f8fafc' }]}>
-                        <ThemedText style={[styles.statusChipNum, { color: '#dc2626' }]}>{needsRepairItems}</ThemedText>
+                      <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].background }]}>
+                        <ThemedText style={[styles.statusChipNum, { color: UiColors[effectiveTheme].error }]}>{needsRepairItems}</ThemedText>
                         <ThemedText style={[styles.statusChipLabel, { color: colors.textSecondary }]}>Needs Repair</ThemedText>
                       </View>
                     )}
@@ -1781,24 +1777,24 @@ export default function MaintenanceScreen() {
                 {/* SCREEN 3: Maintenance Checklist Section */}
                 <View style={styles.checklistSection}>
                   <View style={styles.checklistSectionHeader}>
-                    <Image source={{ uri: ICON_CHECKLIST }} style={[styles.checklistIcon, { tintColor: isDark ? '#34d399' : '#064e3b' }]} contentFit="contain" />
+                    <AppIcon name="checklist" size={18} color={isDark ? '#34d399' : '#064e3b'} style={styles.checklistIcon} />
                     <ThemedText style={[styles.checklistSectionTitle, { color: colors.text }]}>MAINTENANCE CHECKLIST</ThemedText>
                   </View>
                   <ThemedText style={[styles.checklistHint, { color: colors.textSecondary }]}>
-                    Tap any item to add remarks, attach photo proof, or report repairs. Use dropdown to update status.
+                    Tap an item for notes, photos or repairs. Use its dropdown to change status.
                   </ThemedText>
 
                   <View style={styles.checklistItemsList}>
                     {activeReport.items.map((item, index) => {
-                      const isUnderRepair = item.status === 'Under Repair' || Boolean(item.linkedRepairId);
-                      const isItemRepaired = Boolean(
-                        item.isRepaired ||
-                        item.repaired ||
-                        (activeReport.isRepaired && (item.status === 'Needs Repair' || isUnderRepair || item.problemDescription || (activeReport.issue?.component && item.title.toLowerCase().trim() === activeReport.issue.component.toLowerCase().trim())))
-                      );
-                      const isNeedsRepair = (item.status === 'Needs Repair' || item.status === 'Under Repair') && !isItemRepaired;
-                      const statusStyle = getStatusColor(isUnderRepair ? 'Under Repair' : item.status);
-                      const isItemChecked = isItemRepaired || item.status === 'Completed';
+                      const linkedRepair = reports.find(r => r.id.toLowerCase() === item.linkedRepairId?.toLowerCase());
+                      // Service reconciliation also covers repairs assigned to other workers.
+                      const repairDone = linkedRepair ? isRepairDone(linkedRepair) : item.repaired === true;
+                      const isAwaitingVerification = !repairDone && (isRepairAwaitingVerification(linkedRepair) || item.status === 'For Verification');
+                      const isUnderRepair = !repairDone && !isAwaitingVerification && (item.status === 'Under Repair' || Boolean(item.linkedRepairId));
+                      const isItemChecked = isChecklistItemComplete(item) && !isUnderRepair && (!linkedRepair || repairDone);
+                      const isItemRepaired = isItemChecked && Boolean(item.isRepaired || item.repaired);
+                      const isNeedsRepair = item.status === 'Needs Repair' || isUnderRepair;
+                      const statusStyle = getStatusColor(isAwaitingVerification ? 'For Verification' : isUnderRepair ? 'Under Repair' : item.status);
                       const photoCount = Array.isArray(item.photoUris) && item.photoUris.length > 0
                         ? item.photoUris.length
                         : (item.photoUri ? 1 : 0);
@@ -1809,18 +1805,18 @@ export default function MaintenanceScreen() {
                           key={item.id}
                           style={[
                             styles.checklistItemCard,
-                            { backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff', borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0' },
+                            { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder },
                             isUnderRepair && !isItemRepaired && (isDark
-                              ? { backgroundColor: 'rgba(14, 165, 233, 0.08)', borderColor: 'rgba(56, 189, 248, 0.45)' }
-                              : { backgroundColor: '#f0f9ff', borderColor: '#bae6fd' }
+                              ? { backgroundColor: 'rgba(14, 165, 233, 0.08)', borderColor: UiColors[effectiveTheme].panelBorder }
+                              : { backgroundColor: UiColors[effectiveTheme].infoSurface, borderColor: UiColors[effectiveTheme].panelBorder }
                             ),
                             isNeedsRepair && !isUnderRepair && !isItemRepaired && (isDark
-                              ? { backgroundColor: 'rgba(239, 68, 68, 0.12)', borderColor: 'rgba(239, 68, 68, 0.45)' }
+                              ? { backgroundColor: UiColors[effectiveTheme].errorSurface, borderColor: UiColors[effectiveTheme].panelBorder }
                               : styles.checklistItemCardDanger
                             ),
                             isItemRepaired && (isDark
-                              ? { backgroundColor: 'rgba(16, 185, 129, 0.12)', borderColor: 'rgba(16, 185, 129, 0.45)' }
-                              : { backgroundColor: '#ecfdf5', borderColor: '#a7f3d0' }
+                              ? { backgroundColor: UiColors[effectiveTheme].accentSurface, borderColor: UiColors[effectiveTheme].panelBorder }
+                              : { backgroundColor: UiColors[effectiveTheme].accentSurface, borderColor: UiColors[effectiveTheme].panelBorder }
                             ),
                           ]}
                         >
@@ -1835,14 +1831,14 @@ export default function MaintenanceScreen() {
                                 style={[
                                   styles.itemIndexCircle,
                                   {
-                                    backgroundColor: isItemChecked ? '#10b981' : (effectiveTheme === 'dark' ? '#0f172a' : '#f1f5f9'),
-                                    borderWidth: isDark ? 1 : 0,
-                                    borderColor: isItemChecked ? '#10b981' : (isDark ? '#334155' : 'transparent'),
+                                    backgroundColor: isItemChecked ? UiColors[effectiveTheme].primaryFill : (effectiveTheme === 'dark' ? '#0f172a' : '#f1f5f9'),
+                                    borderWidth: isUnderRepair || isDark ? 1 : 0,
+                                    borderColor: isUnderRepair ? UiColors[effectiveTheme].border : isItemChecked ? UiColors[effectiveTheme].border : (isDark ? '#334155' : 'transparent'),
                                   },
                                 ]}
                               >
                                 {isItemChecked ? (
-                                  <ThemedText style={{ color: '#ffffff', fontWeight: '900', fontSize: 13 }}>✓</ThemedText>
+                                  <ThemedText style={{ color: UiColors[effectiveTheme].onPrimary, fontWeight: '900', fontSize: 13 }}>✓</ThemedText>
                                 ) : (
                                   <ThemedText style={[styles.itemIndexNumber, { color: colors.text }]}>{index + 1}</ThemedText>
                                 )}
@@ -1855,9 +1851,9 @@ export default function MaintenanceScreen() {
                                     style={[
                                       styles.itemTitle,
                                       { color: colors.text },
-                                      isUnderRepair && !isItemRepaired && { color: isDark ? '#38bdf8' : '#0369a1' },
-                                      isNeedsRepair && !isUnderRepair && !isItemRepaired && { color: isDark ? '#f87171' : '#dc2626' },
-                                      isItemRepaired && { color: isDark ? '#34d399' : '#059669', fontWeight: '800' },
+                                      isUnderRepair && !isItemRepaired && { color: isDark ? UiColors[effectiveTheme].text : '#0369a1' },
+                                      isNeedsRepair && !isUnderRepair && !isItemRepaired && { color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error },
+                                      isItemRepaired && { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text, fontWeight: '800' },
                                     ]}
                                   >
                                     {item.title}
@@ -1897,10 +1893,12 @@ export default function MaintenanceScreen() {
                                         },
                                       ]}
                                     >
-                                      {isUnderRepair
+                                      {isAwaitingVerification
+                                        ? `For Verification${item.linkedRepairId ? ` (${item.linkedRepairId})` : ''}`
+                                        : isUnderRepair
                                         ? `Under Repair${item.linkedRepairId ? ` (${item.linkedRepairId})` : ''}`
                                         : isItemRepaired
-                                          ? 'Repaired'
+                                          ? `Repaired${item.linkedRepairId ? ` (${item.linkedRepairId})` : ' ✓'}`
                                           : item.status}
                                     </ThemedText>
                                   </View>
@@ -1911,8 +1909,8 @@ export default function MaintenanceScreen() {
                                       style={[
                                         styles.inlinePhotoPill,
                                         {
-                                          backgroundColor: isDark ? 'rgba(56, 189, 248, 0.15)' : '#e0f2fe',
-                                          borderColor: isDark ? 'rgba(56, 189, 248, 0.4)' : '#bae6fd',
+                                          backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface,
+                                          borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                                         },
                                       ]}
                                     >
@@ -1920,7 +1918,7 @@ export default function MaintenanceScreen() {
                                       <ThemedText
                                         style={[
                                           styles.inlinePhotoPillText,
-                                          { color: isDark ? '#38bdf8' : '#0284c7' },
+                                          { color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info },
                                         ]}
                                       >
                                         {photoCount} {photoCount === 1 ? 'Photo' : 'Photos'}
@@ -1934,13 +1932,13 @@ export default function MaintenanceScreen() {
                                   <ThemedText
                                     style={{
                                       fontSize: 12.5,
-                                      color: isDark ? '#94a3b8' : '#64748b',
+                                      color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary,
                                       fontStyle: 'italic',
                                       marginTop: 2,
                                     }}
                                     numberOfLines={1}
                                   >
-                                    "{displayRemarks}"
+                                    &quot;{displayRemarks}&quot;
                                   </ThemedText>
                                 ) : (
                                   <ThemedText style={[styles.itemDescription, { color: colors.textSecondary }]} numberOfLines={1}>
@@ -1958,8 +1956,8 @@ export default function MaintenanceScreen() {
                                   style={[
                                     styles.repairTaskLinkBtn,
                                     {
-                                      backgroundColor: isDark ? 'rgba(56, 189, 248, 0.15)' : '#e0f2fe',
-                                      borderColor: isDark ? '#38bdf8' : '#0284c7',
+                                      backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface,
+                                      borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                                     },
                                   ]}
                                   hitSlop={6}
@@ -1967,12 +1965,12 @@ export default function MaintenanceScreen() {
                                   <ThemedText
                                     style={[
                                       styles.repairTaskLinkBtnText,
-                                      { color: isDark ? '#38bdf8' : '#0284c7' },
+                                      { color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info },
                                     ]}
                                   >
                                     {item.linkedRepairId}
                                   </ThemedText>
-                                  <ThemedText style={{ fontSize: 11, fontWeight: '900', color: isDark ? '#38bdf8' : '#0284c7' }}>
+                                  <ThemedText style={{ fontSize: 11, fontWeight: '900', color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info }}>
                                     ↗
                                   </ThemedText>
                                 </Pressable>
@@ -1995,44 +1993,107 @@ export default function MaintenanceScreen() {
                   </View>
                 </View>
 
-                {/* SCREEN 5: Submit Maintenance Update Button */}
+                {/* SCREEN 5: Submit Maintenance Update Button or Verification Status Card */}
                 <View style={styles.submitSection}>
-                  <Pressable
-                    onPress={() => setConfirmModalVisible(true)}
-                    style={({ pressed }) => [
-                      styles.submitRepairBtn,
-                      pressed && { opacity: 0.88, transform: [{ scale: 0.985 }] },
-                    ]}
-                  >
-                    <LinearGradient
-                      colors={
-                        progressPercentage === 100
-                          ? ['#10b981', '#059669']
-                          : isDark
-                          ? ['#334155', '#1e293b']
-                          : ['#0284c7', '#0369a1']
-                      }
-                      start={{ x: 0, y: 0 }}
-                      end={{ x: 1, y: 1 }}
-                      style={styles.submitRepairGradient}
+                  {activeReport.status === 'For Verification' ? (
+                    <View
+                      style={[
+                        styles.verifiedRepairBox,
+                        {
+                          backgroundColor: isDark ? 'rgba(147, 51, 234, 0.16)' : UiColors[effectiveTheme].infoSurface,
+                          borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                        },
+                      ]}
                     >
-                      <View style={styles.submitBtnInner}>
-                        <AppIcon
-                          name={progressPercentage === 100 ? 'check' : 'checklist'}
-                          size={18}
-                          color="#ffffff"
-                        />
-                        <ThemedText style={styles.submitBtnTextPrimary}>
-                          {progressPercentage === 100 ? 'Submit for Verification' : 'Save Progress'}
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, justifyContent: 'center' }}>
+                        <View
+                          style={[
+                            styles.verifiedIconBadge,
+                            {
+                              backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : '#ede9fe',
+                              borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                            },
+                          ]}
+                        >
+                          <AppIcon name="shield" size={17} color={colors.warning} />
+                        </View>
+                        <ThemedText style={[styles.verifiedRepairBoxTitle, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>
+                          Submitted for Verification
                         </ThemedText>
                       </View>
-                    </LinearGradient>
-                  </Pressable>
-                  <ThemedText style={[styles.submitDisclaimer, { color: colors.textSecondary }]}>
-                    {progressPercentage === 100
-                      ? 'Notifies administrator for review & sign-off.'
-                      : 'Synchronizes updates to desktop dashboard.'}
-                  </ThemedText>
+                      <ThemedText style={[styles.verifiedRepairBoxSubtitle, { color: isDark ? '#e9d5ff' : UiColors[effectiveTheme].text }]}>
+                        Checklist complete. Awaiting administrator approval.
+                      </ThemedText>
+                    </View>
+                  ) : activeReport.status === 'Completed' ? (
+                    <View
+                      style={[
+                        styles.verifiedRepairBox,
+                        {
+                          backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
+                          borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                        },
+                      ]}
+                    >
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, justifyContent: 'center' }}>
+                        <View
+                          style={[
+                            styles.verifiedIconBadge,
+                            {
+                              backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
+                              borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                            },
+                          ]}
+                        >
+                          <AppIcon name="check" size={16} color={isDark ? '#34d399' : '#047857'} />
+                        </View>
+                        <ThemedText style={[styles.verifiedRepairBoxTitle, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>
+                          Verified & Completed by Admin
+                        </ThemedText>
+                      </View>
+                      <ThemedText style={[styles.verifiedRepairBoxSubtitle, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].text }]}>
+                        Maintenance approved by the administrator.
+                      </ThemedText>
+                    </View>
+                  ) : (
+                    <>
+                      <Pressable
+                        disabled={isSubmitting}
+                        accessibilityState={{ disabled: isSubmitting, busy: isSubmitting }}
+                        onPress={() => {
+                          confirmationSnapshot.current = activeReport;
+                          setConfirmModalVisible(true);
+                        }}
+                        style={({ pressed }) => [
+                          styles.submitRepairBtn,
+                          pressed && { opacity: 0.88, transform: [{ scale: 0.985 }] },
+                        ]}
+                      >
+                        <LinearGradient
+                          colors={[colors.primaryFill, colors.primaryFill]}
+                          start={{ x: 0, y: 0 }}
+                          end={{ x: 1, y: 1 }}
+                          style={styles.submitRepairGradient}
+                        >
+                          <View style={styles.submitBtnInner}>
+                            <AppIcon
+                              name={progressPercentage === 100 ? 'check' : 'checklist'}
+                              size={18}
+                              color={UiColors[effectiveTheme].onPrimary}
+                            />
+                            <ThemedText style={styles.submitBtnTextPrimary}>
+                              {isSubmitting ? 'Saving item…' : progressPercentage === 100 ? 'Submit for Verification' : 'Save Progress'}
+                            </ThemedText>
+                          </View>
+                        </LinearGradient>
+                      </Pressable>
+                      <ThemedText style={[styles.submitDisclaimer, { color: colors.textSecondary }]}>
+                        {progressPercentage === 100
+                          ? 'Notifies administrator for review & sign-off.'
+                          : 'Synchronizes updates to desktop dashboard.'}
+                      </ThemedText>
+                    </>
+                  )}
                 </View>
               </ScrollView>
             </View>
@@ -2040,7 +2101,7 @@ export default function MaintenanceScreen() {
             <View style={{ flex: 1, padding: 32, alignItems: 'center', justifyContent: 'center' }}>
               {loading ? (
                 <>
-                  <ActivityIndicator size="large" color="#059669" />
+                  <ActivityIndicator size="large" color={UiColors[effectiveTheme].emerald} />
                   <ThemedText style={{ marginTop: 14, fontSize: 14, color: colors.textSecondary }}>
                     Loading maintenance report...
                   </ThemedText>
@@ -2050,8 +2111,8 @@ export default function MaintenanceScreen() {
                   style={[
                     styles.emptyState,
                     {
-                      backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff',
-                      borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0',
+                      backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                      borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                       width: '100%',
                       maxWidth: 340,
                     },
@@ -2061,11 +2122,11 @@ export default function MaintenanceScreen() {
                     style={[
                       styles.emptyIconCircle,
                       {
-                        backgroundColor: effectiveTheme === 'dark' ? 'rgba(16, 185, 129, 0.15)' : '#ecfdf5',
+                        backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
                       },
                     ]}
                   >
-                    <Image source={{ uri: ICON_SEARCH }} style={{ width: 24, height: 24, tintColor: colors.emerald }} contentFit="contain" />
+                    <AppIcon name="search" size={24} color={colors.emerald} />
                   </View>
                   <ThemedText style={[styles.emptyTitle, { color: colors.text }]}>
                     Report Not Found
@@ -2078,8 +2139,8 @@ export default function MaintenanceScreen() {
                     style={[
                       styles.viewButton,
                       {
-                        backgroundColor: effectiveTheme === 'dark' ? '#064e3b' : '#f0fdf4',
-                        borderColor: effectiveTheme === 'dark' ? '#059669' : '#bbf7d0',
+                        backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].accentSurface,
+                        borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                         width: '100%',
                         justifyContent: 'center',
                       },
@@ -2088,7 +2149,7 @@ export default function MaintenanceScreen() {
                     <ThemedText
                       style={[
                         styles.viewButtonText,
-                        { color: effectiveTheme === 'dark' ? '#34d399' : '#065f46' },
+                        { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text },
                       ]}
                     >
                       Back to Maintenance
@@ -2101,262 +2162,29 @@ export default function MaintenanceScreen() {
         )}
 
         {/* ========================================================================= */}
-        {/* REWORK PAGE (Dedicated Full Page for Quality Control & Rework)             */}
-        {/* ========================================================================= */}
-        {currentScreen === 'REWORK' && activeReport && (
-          <View style={{ flex: 1 }}>
-            <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-              {/* Top Back Navigation & Report ID Header */}
-              <View style={styles.detailsTopBar}>
-                <Pressable onPress={() => setCurrentScreen('DETAILS')} style={styles.backButton}>
-                  <ThemedText style={[styles.backButtonIcon, { color: colors.emerald }]}>‹</ThemedText>
-                  <ThemedText style={[styles.backButtonText, { color: colors.emerald }]}>Back to Checklist</ThemedText>
-                </Pressable>
-
-                <View style={[styles.reportPillLarge, { backgroundColor: isDark ? 'rgba(245, 158, 11, 0.2)' : '#fef3c7' }]}>
-                  <ThemedText style={[styles.reportPillLargeText, { color: isDark ? '#fbbf24' : '#b45309' }]} numberOfLines={1}>
-                    {activeReport.id}
-                  </ThemedText>
-                </View>
-              </View>
-
-              {/* Screen Title Block */}
-              <View style={styles.detailsHeaderBlock}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                  <AppIcon name="refresh" size={16} color={isDark ? '#fbbf24' : '#b45309'} />
-                  <ThemedText style={{ fontSize: 12, fontWeight: '900', color: isDark ? '#fbbf24' : '#b45309', letterSpacing: 0.8, textTransform: 'uppercase' }}>
-                    QUALITY CONTROL & REWORK
-                  </ThemedText>
-                </View>
-                <ThemedText style={[styles.detailsMainTitle, { color: colors.text }]}>Maintenance Rework</ThemedText>
-                <ThemedText style={[styles.detailsMainSubtitle, { color: colors.textSecondary }]}>
-                  {activeReport.airconName || activeReport.airconId} — {activeReport.location}
-                </ThemedText>
-              </View>
-
-              {/* Supervisor Scope & Instructions Box */}
-              <View style={[styles.pageInstructionCard, { backgroundColor: isDark ? 'rgba(245, 158, 11, 0.12)' : '#fffbeb', borderColor: isDark ? 'rgba(245, 158, 11, 0.45)' : '#fde68a' }]}>
-                <ThemedText style={[styles.pageInstructionLabel, { color: isDark ? '#fbbf24' : '#b45309' }]}>
-                  SUPERVISOR REWORK INSTRUCTIONS *
-                </ThemedText>
-                <ThemedText style={[styles.pageInstructionText, { color: isDark ? '#fef3c7' : '#78350f' }]}>
-                  "{activeReport.reworkInstructions || 'Checklist items require rework and re-inspection. Please verify disassembly, part cleaning, and test run.'}"
-                </ThemedText>
-
-                <View style={styles.pageMetaGrid}>
-                  <View style={styles.pageMetaItem}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                      <AppIcon name="user" size={12} color={colors.textSecondary} />
-                      <ThemedText style={[styles.pageMetaKey, { color: colors.textSecondary }]}>Assigned To:</ThemedText>
-                    </View>
-                    <ThemedText style={[styles.pageMetaVal, { color: colors.text }]}>{activeReport.assignedWorker}</ThemedText>
-                  </View>
-                  <View style={styles.pageMetaItem}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                      <AppIcon name="calendar" size={12} color={colors.textSecondary} />
-                      <ThemedText style={[styles.pageMetaKey, { color: colors.textSecondary }]}>Due Date:</ThemedText>
-                    </View>
-                    <ThemedText style={[styles.pageMetaVal, { color: colors.text }]}>{activeReport.dueDate}</ThemedText>
-                  </View>
-                  <View style={styles.pageMetaItem}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                      <AppIcon name="alert-octagon" size={12} color={isDark ? '#fbbf24' : '#d97706'} />
-                      <ThemedText style={[styles.pageMetaKey, { color: colors.textSecondary }]}>Priority:</ThemedText>
-                    </View>
-                    <ThemedText style={[styles.pageMetaVal, { color: isDark ? '#fbbf24' : '#d97706' }]}>{activeReport.priority || 'High'}</ThemedText>
-                  </View>
-                </View>
-              </View>
-
-              {/* Rework Tasks Checklist Section */}
-              <View style={styles.checklistSection}>
-                <View style={styles.checklistSectionHeader}>
-                  <Image source={{ uri: ICON_CHECKLIST }} style={[styles.checklistIcon, { tintColor: isDark ? '#fbbf24' : '#d97706' }]} contentFit="contain" />
-                  <ThemedText style={[styles.checklistSectionTitle, { color: colors.text }]}>REWORK TASKS & RE-INSPECTION</ThemedText>
-                </View>
-                <ThemedText style={[styles.checklistHint, { color: colors.textSecondary }]}>
-                  Check each task as you complete rework. Tap any item to add photo proof or updated remarks.
-                </ThemedText>
-
-                <View style={styles.checklistItemsList}>
-                  {activeReport.items.map((item, index) => {
-                    const statusStyle = getStatusColor(item.status);
-                    const isDone = item.status === 'Completed';
-
-                    return (
-                      <View
-                        key={item.id}
-                        style={[
-                          styles.checklistItemCard,
-                          {
-                            backgroundColor: isDark ? '#151e32' : '#ffffff',
-                            borderColor: isDone ? '#10b981' : (isDark ? '#334155' : '#e2e8f0'),
-                          },
-                        ]}
-                      >
-                        <Pressable onPress={() => handleOpenItemEditor(item, activeReport.id)} style={styles.checklistItemMain}>
-                          <Pressable
-                            onPress={() => handleToggleTaskCheck(item.id, activeReport.id)}
-                            style={[
-                              styles.interactiveCheckBtn,
-                              {
-                                backgroundColor: isDone ? '#10b981' : (isDark ? '#0f172a' : '#f1f5f9'),
-                                borderColor: isDone ? '#10b981' : (isDark ? '#334155' : '#cbd5e1'),
-                              },
-                            ]}
-                          >
-                            {isDone ? (
-                              <ThemedText style={{ color: '#ffffff', fontWeight: '900', fontSize: 13 }}>✓</ThemedText>
-                            ) : (
-                              <ThemedText style={{ color: colors.textSecondary, fontWeight: '800', fontSize: 11 }}>{index + 1}</ThemedText>
-                            )}
-                          </Pressable>
-
-                          <View style={styles.itemTextContainer}>
-                            <ThemedText
-                              style={[
-                                styles.itemTitle,
-                                { color: colors.text, textDecorationLine: isDone ? 'line-through' : 'none' },
-                              ]}
-                            >
-                              {item.title}
-                            </ThemedText>
-                            <ThemedText style={[styles.itemDescription, { color: colors.textSecondary }]} numberOfLines={2}>
-                              {item.description}
-                            </ThemedText>
-
-                            {item.remarks && (
-                              <View style={[
-                                styles.remarksSnippet,
-                                {
-                                  backgroundColor: isDark ? 'rgba(15, 23, 42, 0.85)' : '#f8fafc',
-                                  borderLeftColor: isDark ? '#fbbf24' : '#f59e0b',
-                                  borderColor: isDark ? '#334155' : '#e2e8f0',
-                                  borderWidth: isDark ? 1 : 0,
-                                  borderLeftWidth: 3,
-                                  flexDirection: 'row',
-                                  alignItems: 'center',
-                                  gap: 6,
-                                }
-                              ]}>
-                                <AppIcon name="chat" size={12} color={isDark ? '#fbbf24' : '#d97706'} />
-                                <ThemedText style={[styles.remarksSnippetText, { color: isDark ? '#e2e8f0' : '#334155', flex: 1 }]} numberOfLines={1}>
-                                  {item.remarks}
-                                </ThemedText>
-                              </View>
-                            )}
-
-                            {((item.photoUris && item.photoUris.length > 0) || item.photoUri) && (
-                              <View style={[
-                                styles.photoAttachedBadge,
-                                {
-                                  backgroundColor: isDark ? 'rgba(56, 189, 248, 0.15)' : '#e0f2fe',
-                                  borderWidth: isDark ? 1 : 0,
-                                  borderColor: isDark ? 'rgba(56, 189, 248, 0.35)' : 'transparent',
-                                  flexDirection: 'row',
-                                  alignItems: 'center',
-                                  gap: 4,
-                                }
-                              ]}>
-                                <AppIcon name="camera" size={11} color={isDark ? '#38bdf8' : '#0369a1'} />
-                                <ThemedText style={[styles.photoAttachedText, { color: isDark ? '#38bdf8' : '#0369a1' }]}>
-                                  {(item.photoUris && item.photoUris.length > 1)
-                                    ? `${item.photoUris.length} Photos`
-                                    : 'Photo attached'}
-                                </ThemedText>
-                              </View>
-                            )}
-                          </View>
-                        </Pressable>
-
-                        {/* Output Only Status Badge */}
-                        <View style={styles.dropdownBtnContainer}>
-                          <View
-                            style={[
-                              styles.checklistStatusBadge,
-                              { backgroundColor: statusStyle.bg, borderColor: statusStyle.border },
-                            ]}
-                          >
-                            <View style={[styles.statusDot, { backgroundColor: statusStyle.text }]} />
-                            <ThemedText style={[styles.checklistStatusBadgeText, { color: statusStyle.text }]}>
-                              {item.status}
-                            </ThemedText>
-                          </View>
-                        </View>
-                      </View>
-                    );
-                  })}
-                </View>
-              </View>
-
-              {/* Submit Completed Rework Button */}
-              <View style={styles.submitSection}>
-                <Pressable
-                  onPress={() => handleSubmitForVerification(activeReport.id)}
-                  style={({ pressed }) => [
-                    styles.submitRepairBtn,
-                    pressed && { opacity: 0.88, transform: [{ scale: 0.985 }] },
-                  ]}
-                  disabled={isSubmitting}
-                >
-                  <LinearGradient
-                    colors={['#f59e0b', '#d97706']}
-                    start={{ x: 0, y: 0 }}
-                    end={{ x: 1, y: 1 }}
-                    style={styles.submitRepairGradient}
-                  >
-                    {isSubmitting ? (
-                      <ActivityIndicator color="#ffffff" size="small" />
-                    ) : (
-                      <View style={styles.submitBtnInner}>
-                        <AppIcon name="check" size={18} color="#ffffff" />
-                        <ThemedText style={styles.submitBtnTextPrimary}>
-                          Submit Rework
-                        </ThemedText>
-                      </View>
-                    )}
-                  </LinearGradient>
-                </Pressable>
-                <ThemedText style={[styles.submitDisclaimer, { color: colors.textSecondary }]}>
-                  Notifies administrator for sign-off.
-                </ThemedText>
-              </View>
-            </ScrollView>
-          </View>
-        )}
-
-        {/* ========================================================================= */}
         {/* REPAIR PAGE (Dedicated Full Page for Corrective Repair Order)              */}
         {/* ========================================================================= */}
-        {currentScreen === 'REPAIR' && activeReport && (() => {
-          const explicitRepairReport = activeRepairId
-            ? reports.find((r) => r.id.toLowerCase() === activeRepairId.toLowerCase())
-            : null;
-
-          const defaultInfo = getDispatchedRepairInfo(activeReport);
-          const hasDispatchedRepair = Boolean(activeRepairId || defaultInfo.hasDispatchedRepair);
-          const repairId = activeRepairId || defaultInfo.repairId;
-          const targetRepair = explicitRepairReport || defaultInfo.linkedRepairReport || activeReport;
-
-          if (!hasDispatchedRepair || !repairId) {
-            return (
+        {currentScreen === 'REPAIR' && activeReport && (
+          !hasDispatchedRepair || !repairId || !targetRepair ? (
               <View style={{ flex: 1, padding: 24, justifyContent: 'center', alignItems: 'center' }}>
-                <View style={[styles.emptyState, { backgroundColor: isDark ? '#151e32' : '#ffffff', borderColor: isDark ? '#334155' : '#e2e8f0', width: '100%', maxWidth: 360 }]}>
-                  <View style={[styles.emptyIconCircle, { backgroundColor: isDark ? 'rgba(239, 68, 68, 0.15)' : '#fee2e2' }]}>
+                <View style={[styles.emptyState, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border, width: '100%', maxWidth: 360 }]}>
+                  <View style={[styles.emptyIconCircle, { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface }]}>
                     <AppIcon name="gear" size={28} color={isDark ? '#f87171' : '#dc2626'} />
                   </View>
                   <ThemedText style={[styles.emptyTitle, { color: colors.text, textAlign: 'center' }]}>
-                    No Dispatched Repair Task
+                    {repairId ? `Repair ${repairId} unavailable` : 'No Dispatched Repair Task'}
                   </ThemedText>
                   <ThemedText style={[styles.emptyStateText, { color: colors.textSecondary, textAlign: 'center', marginBottom: 20 }]}>
-                    The administrator or supervisor has not yet created or dispatched a corrective repair task for this report.
+                    {repairId
+                      ? 'Repair record unavailable. Refresh or contact your administrator.'
+                      : 'No repair task has been assigned yet.'}
                   </ThemedText>
                   <Pressable
                     onPress={() => {
                       setActiveRepairId(null);
                       setCurrentScreen('DETAILS');
                     }}
-                    style={[styles.emptyActionBtn, { backgroundColor: isDark ? '#1e293b' : '#f1f5f9', borderColor: isDark ? '#334155' : '#cbd5e1' }]}
+                    style={[styles.emptyActionBtn, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}
                   >
                     <ThemedText style={[styles.emptyActionBtnText, { color: colors.emerald }]}>
                       Back to Checklist
@@ -2364,19 +2192,7 @@ export default function MaintenanceScreen() {
                   </Pressable>
                 </View>
               </View>
-            );
-          }
-
-          const linkedRepairReport = explicitRepairReport || defaultInfo.linkedRepairReport;
-          const repairItems = targetRepair.items || [];
-          const isRepairVerified = Boolean(
-            targetRepair.isRepaired ||
-            targetRepair.isVerified ||
-            (targetRepair.status === 'Completed' && (repairItems.length === 0 || repairItems.every((i) => i.status === 'Completed' || i.repaired || i.isRepaired))) ||
-            targetRepair.timeline?.some((tl: any) => typeof tl?.title === 'string' && tl.title.toLowerCase().includes('verified and approved by admin'))
-          );
-
-          return (
+          ) : (
             <View style={{ flex: 1 }}>
               <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
                 {/* Top Back Navigation & Report ID Header */}
@@ -2392,6 +2208,8 @@ export default function MaintenanceScreen() {
                       {
                         backgroundColor: isRepairVerified
                           ? (isDark ? 'rgba(16, 185, 129, 0.2)' : '#ecfdf5')
+                          : isRepairSubmitted
+                          ? (isDark ? 'rgba(168, 85, 247, 0.2)' : '#f3e8ff')
                           : (isDark ? 'rgba(244, 63, 94, 0.2)' : '#ffe4e6'),
                       },
                     ]}
@@ -2402,12 +2220,18 @@ export default function MaintenanceScreen() {
                         {
                           color: isRepairVerified
                             ? (isDark ? '#34d399' : '#047857')
+                            : isRepairSubmitted
+                            ? (colors.warning)
                             : (isDark ? '#fda4af' : '#be123c'),
                         },
                       ]}
                       numberOfLines={1}
                     >
-                      {isRepairVerified ? `✓ #${repairId} VERIFIED` : `#${repairId}`}
+                      {isRepairVerified
+                        ? `✓ #${repairId} VERIFIED`
+                        : isRepairSubmitted
+                        ? `⏱ #${repairId} FOR VERIFICATION`
+                        : `#${repairId}`}
                     </ThemedText>
                   </View>
                 </View>
@@ -2416,9 +2240,15 @@ export default function MaintenanceScreen() {
                 <View style={styles.detailsHeaderBlock}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 4 }}>
                     <AppIcon
-                      name={isRepairVerified ? 'check' : 'gear'}
+                      name={isRepairVerified ? 'check' : isRepairSubmitted ? 'clock' : 'gear'}
                       size={16}
-                      color={isRepairVerified ? (isDark ? '#34d399' : '#059669') : (isDark ? '#fb7185' : '#e11d48')}
+                      color={
+                        isRepairVerified
+                          ? (isDark ? '#34d399' : '#059669')
+                          : isRepairSubmitted
+                          ? (colors.warning)
+                          : (isDark ? '#fb7185' : '#e11d48')
+                      }
                     />
                     <ThemedText
                       style={{
@@ -2426,17 +2256,23 @@ export default function MaintenanceScreen() {
                         fontWeight: '900',
                         color: isRepairVerified
                           ? (isDark ? '#34d399' : '#059669')
+                          : isRepairSubmitted
+                          ? (colors.warning)
                           : (isDark ? '#fb7185' : '#e11d48'),
                         letterSpacing: 0.8,
                         textTransform: 'uppercase',
                       }}
                     >
-                      {isRepairVerified ? 'CORRECTIVE REPAIR VERIFIED & APPROVED BY ADMIN' : 'CORRECTIVE REPAIR DISPATCH'}
+                      {isRepairVerified
+                        ? 'CORRECTIVE REPAIR VERIFIED & APPROVED BY ADMIN'
+                        : isRepairSubmitted
+                        ? 'CORRECTIVE REPAIR AWAITING ADMIN VERIFICATION'
+                        : 'CORRECTIVE REPAIR DISPATCH'}
                     </ThemedText>
                   </View>
                   <ThemedText style={[styles.detailsMainTitle, { color: colors.text }]}>Repair Order #{repairId}</ThemedText>
                   <ThemedText style={[styles.detailsMainSubtitle, { color: colors.textSecondary }]}>
-                    {targetRepair.airconName || targetRepair.airconId || activeReport.airconName || activeReport.airconId} — {targetRepair.location || activeReport.location}
+                    {targetRepair.controllerName || activeReport.controllerName || 'AC Device name unavailable'} · {targetRepair.airconName || activeReport.airconName || 'Aircon name unavailable'} — {targetRepair.location || activeReport.location}
                   </ThemedText>
                 </View>
 
@@ -2447,10 +2283,10 @@ export default function MaintenanceScreen() {
                     {
                       backgroundColor: isRepairVerified
                         ? (isDark ? 'rgba(16, 185, 129, 0.12)' : '#ecfdf5')
+                        : isRepairSubmitted
+                        ? (isDark ? 'rgba(147, 51, 234, 0.12)' : '#faf5ff')
                         : (isDark ? 'rgba(244, 63, 94, 0.12)' : '#fff1f2'),
-                      borderColor: isRepairVerified
-                        ? (isDark ? 'rgba(16, 185, 129, 0.45)' : '#a7f3d0')
-                        : (isDark ? 'rgba(244, 63, 94, 0.45)' : '#fecdd3'),
+                      borderColor: UiColors[effectiveTheme].panelBorder,
                     },
                   ]}
                 >
@@ -2460,11 +2296,17 @@ export default function MaintenanceScreen() {
                       {
                         color: isRepairVerified
                           ? (isDark ? '#34d399' : '#059669')
+                          : isRepairSubmitted
+                          ? (colors.warning)
                           : (isDark ? '#fb7185' : '#e11d48'),
                       },
                     ]}
                   >
-                    {isRepairVerified ? '✓ SCOPE OF WORK & REPAIR APPROVED BY ADMIN' : 'SCOPE OF WORK & REPAIR INSTRUCTIONS *'}
+                    {isRepairVerified
+                      ? '✓ SCOPE OF WORK & REPAIR APPROVED BY ADMIN'
+                      : isRepairSubmitted
+                      ? '⏱ SCOPE OF WORK & REPAIR SUBMITTED FOR SIGN-OFF'
+                      : 'SCOPE OF WORK & REPAIR INSTRUCTIONS *'}
                   </ThemedText>
                   <ThemedText
                     style={[
@@ -2472,13 +2314,15 @@ export default function MaintenanceScreen() {
                       {
                         color: isRepairVerified
                           ? (isDark ? '#d1fae5' : '#065f46')
+                          : isRepairSubmitted
+                          ? (isDark ? '#e9d5ff' : '#6b21a8')
                           : (isDark ? '#fecdd3' : '#9f1239'),
                       },
                     ]}
                   >
                     {isRepairVerified
                       ? `"Corrective repair #${repairId} was verified and approved by the Facility Administrator. Component defect resolved and operational safety restored."`
-                      : `"${targetRepair.description || 'Diagnose and repair component defect. Inspect parts, calibrate telemetry sensors, and validate operational safety.'}"`}
+                      : `"${targetRepair.description || 'Diagnose and repair component defect. Inspect AC device, verify electrical connections, and validate operational safety.'}"`}
                   </ThemedText>
 
                   <View style={styles.pageMetaGrid}>
@@ -2499,12 +2343,18 @@ export default function MaintenanceScreen() {
                     <View style={styles.pageMetaItem}>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
                         <AppIcon
-                          name={isRepairVerified ? 'check' : 'alert-octagon'}
+                          name={isRepairVerified ? 'check' : isRepairSubmitted ? 'clock' : 'alert-octagon'}
                           size={12}
-                          color={isRepairVerified ? (isDark ? '#34d399' : '#059669') : (isDark ? '#fb7185' : '#e11d48')}
+                          color={
+                            isRepairVerified
+                              ? (isDark ? '#34d399' : '#059669')
+                              : isRepairSubmitted
+                              ? (colors.warning)
+                              : (isDark ? '#fb7185' : '#e11d48')
+                          }
                         />
                         <ThemedText style={[styles.pageMetaKey, { color: colors.textSecondary }]}>
-                          {isRepairVerified ? 'Status:' : 'Priority:'}
+                          {isRepairVerified ? 'Status:' : isRepairSubmitted ? 'Status:' : 'Priority:'}
                         </ThemedText>
                       </View>
                       <ThemedText
@@ -2513,12 +2363,14 @@ export default function MaintenanceScreen() {
                           {
                             color: isRepairVerified
                               ? (isDark ? '#34d399' : '#059669')
+                              : isRepairSubmitted
+                              ? (colors.warning)
                               : (isDark ? '#fb7185' : '#e11d48'),
                             fontWeight: '900',
                           },
                         ]}
                       >
-                        {isRepairVerified ? 'Repaired Already' : (targetRepair.priority || activeReport.priority || 'Critical')}
+                        {isRepairVerified ? 'Repaired Already' : isRepairSubmitted ? 'For Verification' : (targetRepair.priority || activeReport.priority || 'Critical')}
                       </ThemedText>
                     </View>
                   </View>
@@ -2527,21 +2379,31 @@ export default function MaintenanceScreen() {
                 {/* Repair Tasks Checklist Section */}
                 <View style={styles.checklistSection}>
                   <View style={styles.checklistSectionHeader}>
-                    <Image
-                      source={{ uri: ICON_CHECKLIST }}
-                      style={[
-                        styles.checklistIcon,
-                        { tintColor: isRepairVerified ? (isDark ? '#34d399' : '#059669') : (isDark ? '#fb7185' : '#e11d48') },
-                      ]}
-                      contentFit="contain"
+                    <AppIcon
+                      name="checklist"
+                      size={18}
+                      color={
+                        isRepairVerified
+                          ? (isDark ? '#34d399' : '#059669')
+                          : isRepairSubmitted
+                          ? (colors.warning)
+                          : (isDark ? '#fb7185' : '#e11d48')
+                      }
+                      style={styles.checklistIcon}
                     />
                     <ThemedText style={[styles.checklistSectionTitle, { color: colors.text }]}>
-                      {isRepairVerified ? 'VERIFIED REPAIR ACTION STEPS' : 'REPAIR ACTION STEPS & TELEMETRY'}
+                      {isRepairVerified
+                        ? 'VERIFIED REPAIR ACTION STEPS'
+                        : isRepairSubmitted
+                        ? 'REPAIR ACTION STEPS SUBMITTED'
+                        : 'REPAIR ACTION STEPS & TELEMETRY'}
                     </ThemedText>
                   </View>
                   <ThemedText style={[styles.checklistHint, { color: colors.textSecondary }]}>
                     {isRepairVerified
                       ? 'All corrective repair tasks were verified and completed.'
+                      : isRepairSubmitted
+                      ? 'All corrective repair tasks have been completed and submitted for verification.'
                       : 'Execute corrective repair steps. Tap any item to attach photo proof or record telemetry notes.'}
                   </ThemedText>
 
@@ -2556,49 +2418,50 @@ export default function MaintenanceScreen() {
                           style={[
                             styles.checklistItemCard,
                             {
-                              backgroundColor: isDark ? '#151e32' : '#ffffff',
-                              borderColor: isDone ? '#10b981' : (isDark ? '#334155' : '#e2e8f0'),
+                              backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                              borderColor: UiColors[effectiveTheme].panelBorder,
                             },
                           ]}
                         >
-                          <Pressable onPress={() => handleOpenItemEditor(item, targetRepair.id)} style={styles.checklistItemMain}>
+                          <View style={styles.checklistItemMain}>
                             <Pressable
                               onPress={() => handleToggleTaskCheck(item.id, targetRepair.id)}
                               style={[
                                 styles.interactiveCheckBtn,
                                 {
-                                  backgroundColor: isDone ? '#10b981' : (isDark ? '#0f172a' : '#f1f5f9'),
-                                  borderColor: isDone ? '#10b981' : (isDark ? '#334155' : '#cbd5e1'),
+                                  backgroundColor: isDone ? UiColors[effectiveTheme].primaryFill : (isDark ? '#0f172a' : '#f1f5f9'),
+                                  borderColor: isDone ? UiColors[effectiveTheme].emerald : (isDark ? '#334155' : '#cbd5e1'),
                                 },
                               ]}
                             >
                               {isDone ? (
-                                <ThemedText style={{ color: '#ffffff', fontWeight: '900', fontSize: 13 }}>✓</ThemedText>
+                                <ThemedText style={{ color: UiColors[effectiveTheme].onPrimary, fontWeight: '900', fontSize: 13 }}>✓</ThemedText>
                               ) : (
                                 <ThemedText style={{ color: colors.textSecondary, fontWeight: '800', fontSize: 11 }}>{index + 1}</ThemedText>
                               )}
                             </Pressable>
-
-                            <View style={styles.itemTextContainer}>
+                            <Pressable onPress={() => handleOpenItemEditor(item, targetRepair.id)} style={styles.itemTextContainer}>
                               <ThemedText
                                 style={[
                                   styles.itemTitle,
                                   { color: isDone ? (isDark ? '#34d399' : '#059669') : colors.text, textDecorationLine: isDone ? 'line-through' : 'none' },
                                 ]}
                               >
-                                {item.title}
+                                {item.title || 'Maintenance Task'}
                               </ThemedText>
-                              <ThemedText style={[styles.itemDescription, { color: colors.textSecondary }]} numberOfLines={2}>
-                                {item.description}
-                              </ThemedText>
+                              {Boolean(item.description && item.description.trim()) ? (
+                                <ThemedText style={[styles.itemDescription, { color: colors.textSecondary }]} numberOfLines={2}>
+                                  {item.description}
+                                </ThemedText>
+                              ) : null}
 
-                              {item.remarks && (
+                              {Boolean(item.remarks && item.remarks.trim()) ? (
                                 <View style={[
                                   styles.remarksSnippet,
                                   {
-                                    backgroundColor: isDark ? 'rgba(15, 23, 42, 0.85)' : '#f8fafc',
+                                    backgroundColor: isDark ? 'rgba(15, 23, 42, 0.85)' : UiColors[effectiveTheme].background,
                                     borderLeftColor: isDone ? (isDark ? '#34d399' : '#10b981') : (isDark ? '#fb7185' : '#e11d48'),
-                                    borderColor: isDark ? '#334155' : '#e2e8f0',
+                                    borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                                     borderWidth: isDark ? 1 : 0,
                                     borderLeftWidth: 3,
                                     flexDirection: 'row',
@@ -2607,34 +2470,34 @@ export default function MaintenanceScreen() {
                                   }
                                 ]}>
                                   <AppIcon name="chat" size={12} color={isDark ? '#94a3b8' : '#64748b'} />
-                                  <ThemedText style={[styles.remarksSnippetText, { color: isDark ? '#e2e8f0' : '#334155', flex: 1 }]} numberOfLines={1}>
+                                  <ThemedText style={[styles.remarksSnippetText, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].textSecondary, flex: 1 }]} numberOfLines={1}>
                                     {item.remarks}
                                   </ThemedText>
                                 </View>
-                              )}
+                              ) : null}
 
-                              {((item.photoUris && item.photoUris.length > 0) || item.photoUri) && (
+                              {Boolean((item.photoUris && item.photoUris.length > 0) || (item.photoUri && item.photoUri.trim())) ? (
                                 <View style={[
                                   styles.photoAttachedBadge,
                                   {
-                                    backgroundColor: isDark ? 'rgba(56, 189, 248, 0.15)' : '#e0f2fe',
+                                    backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface,
                                     borderWidth: isDark ? 1 : 0,
-                                    borderColor: isDark ? 'rgba(56, 189, 248, 0.35)' : 'transparent',
+                                    borderColor: isDark ? UiColors[effectiveTheme].border : 'transparent',
                                     flexDirection: 'row',
                                     alignItems: 'center',
                                     gap: 4,
                                   }
                                 ]}>
                                   <AppIcon name="camera" size={11} color={isDark ? '#38bdf8' : '#0369a1'} />
-                                  <ThemedText style={[styles.photoAttachedText, { color: isDark ? '#38bdf8' : '#0369a1' }]}>
+                                  <ThemedText style={[styles.photoAttachedText, { color: isDark ? UiColors[effectiveTheme].info : '#0369a1' }]}>
                                     {(item.photoUris && item.photoUris.length > 1)
                                       ? `${item.photoUris.length} Photos`
                                       : 'Photo attached'}
                                   </ThemedText>
                                 </View>
-                              )}
-                            </View>
-                          </Pressable>
+                              ) : null}
+                            </Pressable>
+                          </View>
 
                           {/* Output Only Status Badge */}
                           <View style={styles.dropdownBtnContainer}>
@@ -2643,8 +2506,8 @@ export default function MaintenanceScreen() {
                                 styles.checklistStatusBadge,
                                 isDone
                                   ? {
-                                      backgroundColor: isDark ? 'rgba(16, 185, 129, 0.16)' : '#ecfdf5',
-                                      borderColor: isDark ? 'rgba(16, 185, 129, 0.45)' : '#a7f3d0',
+                                      backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
+                                      borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                                     }
                                   : {
                                       backgroundColor: statusStyle.bg,
@@ -2672,7 +2535,7 @@ export default function MaintenanceScreen() {
                                   },
                                 ]}
                               >
-                                {isDone ? 'Repaired' : item.status}
+                                {isDone ? `Repaired${item.linkedRepairId ? ` (${item.linkedRepairId})` : ' ✓'}` : item.status}
                               </ThemedText>
                             </View>
                           </View>
@@ -2682,66 +2545,74 @@ export default function MaintenanceScreen() {
                   </View>
                 </View>
 
-                {/* Submit Completed Repair Button or Verified Confirmation */}
+                {/* Submit Completed Repair Button or Verification Status Card */}
                 <View style={styles.submitSection}>
                   {isRepairVerified ? (
                     <View
                       style={[
                         styles.verifiedRepairBox,
                         {
-                          backgroundColor: isDark ? 'rgba(16, 185, 129, 0.16)' : '#ecfdf5',
-                          borderColor: isDark ? 'rgba(16, 185, 129, 0.45)' : '#a7f3d0',
+                          backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
+                          borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                         },
                       ]}
                     >
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, justifyContent: 'center' }}>
-                        <ThemedText style={{ fontSize: 22 }}>✓</ThemedText>
-                        <ThemedText style={[styles.verifiedRepairBoxTitle, { color: isDark ? '#34d399' : '#047857' }]}>
+                        <View
+                          style={[
+                            styles.verifiedIconBadge,
+                            {
+                              backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
+                              borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                            },
+                          ]}
+                        >
+                          <AppIcon name="check" size={16} color={isDark ? '#34d399' : '#047857'} />
+                        </View>
+                        <ThemedText style={[styles.verifiedRepairBoxTitle, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>
                           Repaired Already — Verified by Admin
                         </ThemedText>
                       </View>
-                      <ThemedText style={[styles.verifiedRepairBoxSubtitle, { color: isDark ? '#a7f3d0' : '#065f46' }]}>
-                        This corrective repair order was inspected, verified, and officially signed off by the Facility Administrator.
+                      <ThemedText style={[styles.verifiedRepairBoxSubtitle, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].text }]}>
+                        Repair approved by the administrator.
                       </ThemedText>
                     </View>
-                  ) : (
-                    <>
-                      <Pressable
-                        onPress={() => handleSubmitForVerification(targetRepair.id)}
-                        style={({ pressed }) => [
-                          styles.submitRepairBtn,
-                          pressed && { opacity: 0.88, transform: [{ scale: 0.985 }] },
-                        ]}
-                        disabled={isSubmitting}
-                      >
-                        <LinearGradient
-                          colors={['#f43f5e', '#e11d48']}
-                          start={{ x: 0, y: 0 }}
-                          end={{ x: 1, y: 1 }}
-                          style={styles.submitRepairGradient}
+                  ) : isRepairSubmitted ? (
+                    <View
+                      style={[
+                        styles.verifiedRepairBox,
+                        {
+                          backgroundColor: isDark ? 'rgba(147, 51, 234, 0.16)' : UiColors[effectiveTheme].infoSurface,
+                          borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                        },
+                      ]}
+                    >
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, justifyContent: 'center' }}>
+                        <View
+                          style={[
+                            styles.verifiedIconBadge,
+                            {
+                              backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : '#ede9fe',
+                              borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                            },
+                          ]}
                         >
-                          {isSubmitting ? (
-                            <ActivityIndicator color="#ffffff" size="small" />
-                          ) : (
-                            <View style={styles.submitBtnInner}>
-                              <AppIcon name="check" size={18} color="#ffffff" />
-                              <ThemedText style={styles.submitBtnTextPrimary}>
-                                Submit Repair
-                              </ThemedText>
-                            </View>
-                          )}
-                        </LinearGradient>
-                      </Pressable>
-                      <ThemedText style={[styles.submitDisclaimer, { color: colors.textSecondary }]}>
-                        Notifies administrator for sign-off.
+                          <AppIcon name="shield" size={17} color={colors.warning} />
+                        </View>
+                        <ThemedText style={[styles.verifiedRepairBoxTitle, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>
+                          Submitted for Verification — Awaiting Admin Sign-Off
+                        </ThemedText>
+                      </View>
+                      <ThemedText style={[styles.verifiedRepairBoxSubtitle, { color: isDark ? '#e9d5ff' : UiColors[effectiveTheme].text }]}>
+                        Repair complete. Awaiting administrator approval.
                       </ThemedText>
-                    </>
-                  )}
+                    </View>
+                  ) : null}
                 </View>
               </ScrollView>
             </View>
-          );
-        })()}
+          )
+        )}
 
         {/* ========================================================================= */}
         {/* SCREEN 6: SUCCESSFUL SUBMISSION SCREEN                                     */}
@@ -2749,13 +2620,13 @@ export default function MaintenanceScreen() {
         {currentScreen === 'SUCCESS' && (
           activeReport ? (
             <ScrollView contentContainerStyle={styles.successScreenContent} showsVerticalScrollIndicator={false}>
-              <View style={[styles.successCard, { backgroundColor: isDark ? '#151e32' : '#ffffff', borderColor: isDark ? '#334155' : '#a7f3d0' }]}>
+              <View style={[styles.successCard, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
                 {/* Success Icon Badge */}
                 <View style={[styles.successIconCircle, { backgroundColor: isDark ? (activeReport.status === 'For Verification' ? 'rgba(168, 85, 247, 0.2)' : 'rgba(16, 185, 129, 0.2)') : (activeReport.status === 'For Verification' ? '#f3e8ff' : '#d1fae5') }]}>
                   <AppIcon
                     name={activeReport.status === 'For Verification' ? 'shield' : 'check'}
                     size={24}
-                    color={isDark ? (activeReport.status === 'For Verification' ? '#c084fc' : '#34d399') : (activeReport.status === 'For Verification' ? '#9333ea' : '#059669')}
+                    color={isDark ? (activeReport.status === 'For Verification' ? colors.warning : '#34d399') : (activeReport.status === 'For Verification' ? colors.warning : '#059669')}
                   />
                 </View>
 
@@ -2766,14 +2637,14 @@ export default function MaintenanceScreen() {
                 </ThemedText>
                 <ThemedText style={[styles.successMessage, { color: colors.textSecondary }]}>
                   {activeReport.status === 'For Verification'
-                    ? 'All maintenance tasks are complete! Your report has been submitted to the Facility Administrator for final verification and approval.'
-                    : 'Your maintenance report has been successfully updated and synchronized with the EcoTrack desktop dashboard.'}
+                    ? 'All tasks complete. Report submitted for administrator approval.'
+                    : 'Report updated and synced with the desktop dashboard.'}
                 </ThemedText>
 
-                <View style={[styles.successDivider, { backgroundColor: isDark ? '#1e293b' : '#e2e8f0' }]} />
+                <View style={[styles.successDivider, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected }]} />
 
                 {/* Submitted Details Box */}
-                <View style={[styles.successDetailsBox, { backgroundColor: isDark ? '#0f172a' : '#f8fafc' }]}>
+                <View style={[styles.successDetailsBox, { backgroundColor: isDark ? '#0f172a' : UiColors[effectiveTheme].background }]}>
                   <View style={styles.successDetailRow}>
                     <ThemedText style={[styles.successDetailKey, { color: colors.textSecondary }]}>Report ID:</ThemedText>
                     <ThemedText style={[styles.successDetailValBold, { color: colors.text }]}>{activeReport.id}</ThemedText>
@@ -2781,7 +2652,7 @@ export default function MaintenanceScreen() {
                   <View style={styles.successDetailRow}>
                     <ThemedText style={[styles.successDetailKey, { color: colors.textSecondary }]}>Aircon Unit:</ThemedText>
                     <ThemedText style={[styles.successDetailVal, { color: colors.text }]}>
-                      {activeReport.airconId} — {activeReport.location}
+                      {activeReport.controllerName || 'AC Device name unavailable'} · {activeReport.airconName || 'Aircon name unavailable'} — {activeReport.location}
                     </ThemedText>
                   </View>
                   <View style={styles.successDetailRow}>
@@ -2820,9 +2691,9 @@ export default function MaintenanceScreen() {
                     <AppIcon
                       name={activeReport.status === 'For Verification' ? 'shield' : 'check'}
                       size={14}
-                      color={isDark ? '#c084fc' : (activeReport.status === 'For Verification' ? '#7e22ce' : '#047857')}
+                      color={isDark ? colors.warning : (activeReport.status === 'For Verification' ? colors.warning : '#047857')}
                     />
-                    <ThemedText style={[styles.syncConfirmedText, { color: isDark ? '#c084fc' : (activeReport.status === 'For Verification' ? '#7e22ce' : '#047857') }]}>
+                    <ThemedText style={[styles.syncConfirmedText, { color: isDark ? UiColors[effectiveTheme].info : (activeReport.status === 'For Verification' ? colors.warning : '#047857') }]}>
                       {activeReport.status === 'For Verification'
                         ? 'Sent to Desktop Admin for Verification'
                         : 'Live sync sent to Desktop Admin'}
@@ -2832,14 +2703,14 @@ export default function MaintenanceScreen() {
 
                 {/* Back to Checklist or Maintenance Dashboard Button */}
                 <View style={{ gap: 10, width: '100%' }}>
-                  {activeReport.parentReportId && (
+                  {Boolean(activeReport.parentReportId) && (
                     <Pressable
                       onPress={() => {
                         setSelectedReportId(activeReport.parentReportId!);
                         setActiveRepairId(null);
                         setCurrentScreen('DETAILS');
                       }}
-                      style={[styles.successBackButton, { backgroundColor: isDark ? '#10b981' : '#059669' }]}
+                      style={[styles.successBackButton, { backgroundColor: isDark ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].primaryFill }]}
                     >
                       <ThemedText style={styles.successBackButtonText}>Return to Checklist ({activeReport.parentReportId})</ThemedText>
                     </Pressable>
@@ -2852,8 +2723,8 @@ export default function MaintenanceScreen() {
                     style={[
                       styles.successBackButton,
                       activeReport.parentReportId
-                        ? { backgroundColor: isDark ? '#1e293b' : '#f1f5f9', borderWidth: 1, borderColor: isDark ? '#334155' : '#e2e8f0' }
-                        : { backgroundColor: isDark ? '#10b981' : '#0b291d' }
+                        ? { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected, borderWidth: 1, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }
+                        : { backgroundColor: isDark ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].primaryFill }
                     ]}
                   >
                     <ThemedText style={[styles.successBackButtonText, activeReport.parentReportId && { color: colors.text }]}>
@@ -2869,8 +2740,8 @@ export default function MaintenanceScreen() {
                 style={[
                   styles.emptyState,
                   {
-                    backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff',
-                    borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0',
+                    backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                    borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                     width: '100%',
                     maxWidth: 340,
                   },
@@ -2884,8 +2755,8 @@ export default function MaintenanceScreen() {
                   style={[
                     styles.viewButton,
                     {
-                      backgroundColor: effectiveTheme === 'dark' ? '#064e3b' : '#f0fdf4',
-                      borderColor: effectiveTheme === 'dark' ? '#059669' : '#bbf7d0',
+                      backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].accentSurface,
+                      borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                       width: '100%',
                       justifyContent: 'center',
                     },
@@ -2894,7 +2765,7 @@ export default function MaintenanceScreen() {
                   <ThemedText
                     style={[
                       styles.viewButtonText,
-                      { color: effectiveTheme === 'dark' ? '#34d399' : '#065f46' },
+                      { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text },
                     ]}
                   >
                     Back to Maintenance
@@ -2910,24 +2781,24 @@ export default function MaintenanceScreen() {
         {/* ========================================================================= */}
         <Modal visible={itemModalVisible} animationType="slide" transparent>
           <View style={styles.modalOverlay}>
-            <View style={[styles.expandedModalContent, { backgroundColor: isDark ? '#151e32' : '#ffffff', borderColor: isDark ? 'rgba(16, 185, 129, 0.35)' : '#e2e8f0' }]}>
-              <View style={[styles.modalHeader, { borderBottomColor: isDark ? '#1e293b' : '#f1f5f9' }]}>
+            <View style={[styles.expandedModalContent, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
+              <View style={[styles.modalHeader, { borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                 <View style={{ flex: 1 }}>
-                  <ThemedText style={[styles.modalCategoryLabel, { color: isDark ? '#34d399' : '#059669' }]}>MAINTENANCE CHECKLIST ITEM</ThemedText>
+                  <ThemedText style={[styles.modalCategoryLabel, { color: isDark ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].textSecondary }]}>MAINTENANCE CHECKLIST ITEM</ThemedText>
                   <ThemedText style={[styles.modalItemTitle, { color: colors.text }]}>{expandedItem?.title}</ThemedText>
                 </View>
-                <Pressable onPress={() => setItemModalVisible(false)} style={[styles.modalCloseBtn, { backgroundColor: isDark ? '#1e293b' : '#f1f5f9' }]}>
-                  <ThemedText style={[styles.modalCloseText, { color: isDark ? '#94a3b8' : '#64748b' }]}>✕</ThemedText>
+                <Pressable onPress={() => setItemModalVisible(false)} style={[styles.modalCloseBtn, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected }]}>
+                  <ThemedText style={[styles.modalCloseText, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>✕</ThemedText>
                 </Pressable>
               </View>
 
               <ScrollView style={{ maxHeight: SCREEN_HEIGHT * 0.65 }} showsVerticalScrollIndicator={false}>
                 {/* Active Dispatched Repair Order Notice inside Modal */}
-                {expandedItem?.linkedRepairId && (
-                  <View style={[styles.modalRepairBanner, { backgroundColor: isDark ? 'rgba(56, 189, 248, 0.12)' : '#f0f9ff', borderColor: isDark ? 'rgba(56, 189, 248, 0.4)' : '#bae6fd' }]}>
+                {expandedItem && expandedItem.linkedRepairId ? (
+                  <View style={[styles.modalRepairBanner, { backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
                       <AppIcon name="gear" size={13} color={isDark ? '#38bdf8' : '#0284c7'} />
-                      <ThemedText style={{ fontSize: 12, fontWeight: '700', color: isDark ? '#38bdf8' : '#0284c7' }}>
+                      <ThemedText style={{ fontSize: 12, fontWeight: '700', color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info }}>
                         Dispatched Repair: #{expandedItem.linkedRepairId}
                       </ThemedText>
                     </View>
@@ -2939,27 +2810,28 @@ export default function MaintenanceScreen() {
                       }}
                       style={[styles.modalRepairBtn, { backgroundColor: isDark ? '#0284c7' : '#0284c7' }]}
                     >
-                      <ThemedText style={{ fontSize: 11, fontWeight: '800', color: '#ffffff' }}>Open Repair Page →</ThemedText>
+                      <ThemedText style={{ fontSize: 11, fontWeight: '800', color: UiColors[effectiveTheme].onPrimary }}>Open Repair Page →</ThemedText>
                     </Pressable>
                   </View>
-                )}
+                ) : null}
 
                 {/* Status Selector Chips */}
                 <View style={styles.modalFieldBlock}>
                   <ThemedText style={[styles.modalFieldLabel, { color: colors.text }]}>Status:</ThemedText>
                   <View style={styles.statusSelectGrid}>
-                    {(isCurrentRepair ? REPAIR_CHECKLIST_STATUSES : STANDARD_CHECKLIST_STATUSES).map((st) => {
+                    {(expandedItem?.status === 'For Verification' ? (['For Verification'] as ChecklistStatus[]) : isCurrentRepair ? REPAIR_CHECKLIST_STATUSES : STANDARD_CHECKLIST_STATUSES).map((st) => {
                       const isSelected = itemStatus === st || (st === 'Needs Repair' && (itemStatus === 'Under Repair' || Boolean(expandedItem?.linkedRepairId)));
                       const stStyle = getStatusColor(st);
                       return (
                         <Pressable
                           key={st}
                           onPress={() => setItemStatus(st)}
+                          disabled={expandedItem?.status === 'For Verification'}
                           style={[
                             styles.statusSelectOption,
                             {
-                              backgroundColor: isSelected ? stStyle.bg : isDark ? '#0f172a' : '#f8fafc',
-                              borderColor: isSelected ? stStyle.text : isDark ? '#334155' : '#e2e8f0',
+                              backgroundColor: isSelected ? stStyle.bg : isDark ? '#0f172a' : UiColors[effectiveTheme].background,
+                              borderColor: isSelected ? stStyle.text : isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                             },
                           ]}
                         >
@@ -2970,7 +2842,7 @@ export default function MaintenanceScreen() {
                             <ThemedText
                               style={[
                                 styles.statusSelectOptionText,
-                                { color: isSelected ? stStyle.text : isDark ? '#94a3b8' : '#475569' },
+                                { color: isSelected ? stStyle.text : isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary },
                                 isSelected && { fontWeight: '800' },
                               ]}
                             >
@@ -2985,14 +2857,14 @@ export default function MaintenanceScreen() {
 
                 {/* SCREEN 7: Needs Repair Specific Problem Description Field */}
                 {(itemStatus === 'Needs Repair' || itemStatus === 'Under Repair' || Boolean(expandedItem?.linkedRepairId)) && (
-                  <View style={[styles.needsRepairAlertBlock, { backgroundColor: isDark ? 'rgba(239, 68, 68, 0.15)' : '#fee2e2', borderColor: isDark ? 'rgba(239, 68, 68, 0.4)' : '#fca5a5' }]}>
-                    <ThemedText style={[styles.needsRepairLabel, { color: isDark ? '#fca5a5' : '#b91c1c' }]}>Describe the Problem (Required):</ThemedText>
-                    <ThemedText style={[styles.needsRepairSubLabel, { color: isDark ? '#f87171' : '#7f1d1d' }]}>
+                  <View style={[styles.needsRepairAlertBlock, { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
+                    <ThemedText style={[styles.needsRepairLabel, { color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error }]}>Describe the Problem (Required):</ThemedText>
+                    <ThemedText style={[styles.needsRepairSubLabel, { color: isDark ? UiColors[effectiveTheme].error : '#7f1d1d' }]}>
                       Describe defect, unstable readings, or component replacement details for desktop admin.
                     </ThemedText>
                     <TextInput
-                      style={[styles.needsRepairInput, { backgroundColor: isDark ? '#0f172a' : '#ffffff', color: isDark ? '#fca5a5' : '#b91c1c', borderColor: isDark ? 'rgba(239, 68, 68, 0.45)' : '#fca5a5' }]}
-                      placeholder="e.g. Temperature sensor is giving inconsistent readings and may require replacement."
+                      style={[styles.needsRepairInput, { backgroundColor: isDark ? '#0f172a' : UiColors[effectiveTheme].backgroundElement, color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error, borderColor: isDark ? UiColors[effectiveTheme].inputBorder : UiColors[effectiveTheme].inputBorder }]}
+                      placeholder="e.g. AC device relay is giving inconsistent switching and may require replacement."
                       placeholderTextColor={isDark ? '#ef4444' : '#f87171'}
                       multiline
                       numberOfLines={3}
@@ -3006,8 +2878,8 @@ export default function MaintenanceScreen() {
                 <View style={styles.modalFieldBlock}>
                   <ThemedText style={[styles.modalFieldLabel, { color: colors.text }]}>Worker Remarks (Optional):</ThemedText>
                   <TextInput
-                    style={[styles.remarksInput, { backgroundColor: isDark ? '#0f172a' : '#f8fafc', borderColor: isDark ? '#334155' : '#e2e8f0', color: colors.text }]}
-                    placeholder="e.g. Temperature sensor inspected and readings are within normal range."
+                    style={[styles.remarksInput, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].background, borderColor: isDark ? UiColors[effectiveTheme].inputBorder : UiColors[effectiveTheme].inputBorder, color: colors.text }]}
+                    placeholder="e.g. AC device inspected and operational telemetry is within normal range."
                     placeholderTextColor={colors.textSecondary}
                     multiline
                     numberOfLines={3}
@@ -3024,8 +2896,8 @@ export default function MaintenanceScreen() {
                         Photo Proof:
                       </ThemedText>
                       {itemPhotoUris.length > 0 && (
-                        <View style={[styles.photoCountPill, { backgroundColor: isDark ? 'rgba(16, 185, 129, 0.2)' : '#ecfdf5', borderColor: isDark ? '#10b981' : '#a7f3d0' }]}>
-                          <ThemedText style={[styles.photoCountPillText, { color: isDark ? '#34d399' : '#059669' }]}>
+                        <View style={[styles.photoCountPill, { backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
+                          <ThemedText style={[styles.photoCountPillText, { color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].emerald }]}>
                             {itemPhotoUris.length} {itemPhotoUris.length === 1 ? 'image' : 'images'}
                           </ThemedText>
                         </View>
@@ -3033,7 +2905,7 @@ export default function MaintenanceScreen() {
                     </View>
                     {itemPhotoUris.length > 0 && (
                       <Pressable onPress={handleClearAllPhotos} hitSlop={8}>
-                        <ThemedText style={[styles.photoClearAllText, { color: isDark ? '#f87171' : '#dc2626' }]}>
+                        <ThemedText style={[styles.photoClearAllText, { color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error }]}>
                           Clear All
                         </ThemedText>
                       </Pressable>
@@ -3045,8 +2917,8 @@ export default function MaintenanceScreen() {
                       {/* Horizontal Scroll of Attached Images */}
                       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.photoScrollContent}>
                         {itemPhotoUris.map((uri, idx) => (
-                          <View key={`photo_${idx}_${uri.slice(-10)}`} style={[styles.photoThumbnailCard, { borderColor: isDark ? '#334155' : '#e2e8f0', backgroundColor: isDark ? '#0f172a' : '#f8fafc' }]}>
-                            <Image source={{ uri }} style={styles.photoThumbnailImage} contentFit="cover" />
+                          <View key={`photo_${idx}_${uri.slice(-10)}`} style={[styles.photoThumbnailCard, { borderColor: UiColors[effectiveTheme].panelBorder, backgroundColor: isDark ? '#0f172a' : UiColors[effectiveTheme].background }]}>
+                            <MaintenancePhoto uri={uri} style={styles.photoThumbnailImage} />
                             {/* Photo Index Badge */}
                             <View style={styles.photoIndexBadge}>
                               <ThemedText style={styles.photoIndexBadgeText}>#{idx + 1}</ThemedText>
@@ -3064,15 +2936,15 @@ export default function MaintenanceScreen() {
                           style={[
                             styles.photoAddMoreTile,
                             {
-                              borderColor: isDark ? 'rgba(16, 185, 129, 0.5)' : '#10b981',
-                              backgroundColor: isDark ? 'rgba(16, 185, 129, 0.08)' : '#f0fdf4',
+                              borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                              backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface,
                             },
                           ]}
                         >
-                          <View style={[styles.photoAddMoreIconCircle, { backgroundColor: isDark ? 'rgba(16, 185, 129, 0.2)' : '#dcfce7' }]}>
-                            <ThemedText style={[styles.photoAddMorePlusText, { color: '#10b981' }]}>+</ThemedText>
+                          <View style={[styles.photoAddMoreIconCircle, { backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : '#dcfce7' }]}>
+                            <ThemedText style={[styles.photoAddMorePlusText, { color: UiColors[effectiveTheme].emerald }]}>+</ThemedText>
                           </View>
-                          <ThemedText style={[styles.photoAddMoreTileText, { color: isDark ? '#34d399' : '#059669' }]}>
+                          <ThemedText style={[styles.photoAddMoreTileText, { color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].emerald }]}>
                             Add More
                           </ThemedText>
                         </Pressable>
@@ -3082,14 +2954,14 @@ export default function MaintenanceScreen() {
                       <View style={styles.photoActionBar}>
                         <Pressable
                           onPress={handlePickPhotos}
-                          style={[styles.photoActionSecondaryBtn, { backgroundColor: isDark ? '#1e293b' : '#f1f5f9', borderColor: isDark ? '#334155' : '#cbd5e1' }]}
+                          style={[styles.photoActionSecondaryBtn, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}
                         >
-                          <Image source={{ uri: ICON_CAMERA }} style={{ width: 14, height: 14, tintColor: colors.text }} contentFit="contain" />
+                          <AppIcon name="camera" size={14} color={colors.text} />
                           <ThemedText style={[styles.photoActionBtnText, { color: colors.text }]}>Choose More</ThemedText>
                         </Pressable>
                         <Pressable
                           onPress={handleTakePhoto}
-                          style={[styles.photoActionSecondaryBtn, { backgroundColor: isDark ? '#1e293b' : '#f1f5f9', borderColor: isDark ? '#334155' : '#cbd5e1' }]}
+                          style={[styles.photoActionSecondaryBtn, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}
                         >
                           <AppIcon name="camera" size={13} color={colors.text} />
                           <ThemedText style={[styles.photoActionBtnText, { color: colors.text }]}>Take Photo</ThemedText>
@@ -3102,24 +2974,24 @@ export default function MaintenanceScreen() {
                       <View style={styles.photoEmptyButtonsRow}>
                         <Pressable
                           onPress={handlePickPhotos}
-                          style={[styles.photoPickerBtnPrimary, { backgroundColor: isDark ? 'rgba(16, 185, 129, 0.12)' : '#f0fdf4', borderColor: '#10b981' }]}
+                          style={[styles.photoPickerBtnPrimary, { backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface, borderColor: UiColors[effectiveTheme].border }]}
                         >
-                          <Image source={{ uri: ICON_CAMERA }} style={[styles.cameraIcon, { tintColor: '#10b981' }]} contentFit="contain" />
+                          <AppIcon name="camera" size={18} color={UiColors[effectiveTheme].emerald} style={styles.cameraIcon} />
                           <View style={{ alignItems: 'flex-start' }}>
-                            <ThemedText style={[styles.photoPickerBtnText, { color: '#10b981' }]}>Select Photos</ThemedText>
-                            <ThemedText style={[styles.photoPickerSubText, { color: isDark ? '#6ee7b7' : '#047857' }]}>Multiple allowed</ThemedText>
+                            <ThemedText style={[styles.photoPickerBtnText, { color: UiColors[effectiveTheme].emerald }]}>Select Photos</ThemedText>
+                            <ThemedText style={[styles.photoPickerSubText, { color: isDark ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].text }]}>Multiple allowed</ThemedText>
                           </View>
                         </Pressable>
                         <Pressable
                           onPress={handleTakePhoto}
-                          style={[styles.photoPickerBtnCamera, { backgroundColor: isDark ? '#1e293b' : '#f8fafc', borderColor: isDark ? '#334155' : '#cbd5e1' }]}
+                          style={[styles.photoPickerBtnCamera, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].background, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}
                         >
                           <AppIcon name="camera" size={18} color={isDark ? '#cbd5e1' : '#475569'} />
-                          <ThemedText style={[styles.photoCameraBtnText, { color: isDark ? '#cbd5e1' : '#475569' }]}>Camera</ThemedText>
+                          <ThemedText style={[styles.photoCameraBtnText, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>Camera</ThemedText>
                         </Pressable>
                       </View>
                       <ThemedText style={[styles.photoHelpNotice, { color: colors.textSecondary }]}>
-                        You can select multiple photos from your library or capture them using the camera.
+                        Choose multiple photos or take a photo.
                       </ThemedText>
                     </View>
                   )}
@@ -3134,12 +3006,12 @@ export default function MaintenanceScreen() {
                   setItemPhotoUris([]);
                   setItemRemarks('');
                   setItemProblemDesc('');
-                }} style={[styles.modalCancelBtn, { backgroundColor: isDark ? '#1e293b' : '#f1f5f9' }]}>
-                  <ThemedText style={[styles.modalCancelBtnText, { color: isDark ? '#94a3b8' : '#64748b' }]}>Cancel</ThemedText>
+                }} style={[styles.modalCancelBtn, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected }]}>
+                  <ThemedText style={[styles.modalCancelBtnText, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>Cancel</ThemedText>
                 </Pressable>
                 <Pressable onPress={handleSaveItemUpdate} style={[styles.modalSaveBtn, isSubmitting && { opacity: 0.65 }]} disabled={isSubmitting}>
                   {isSubmitting ? (
-                    <ActivityIndicator color="#ffffff" size="small" />
+                    <ActivityIndicator color={UiColors[effectiveTheme].onPrimary} size="small" />
                   ) : (
                     <ThemedText style={styles.modalSaveBtnText}>Save Update</ThemedText>
                   )}
@@ -3152,12 +3024,14 @@ export default function MaintenanceScreen() {
         {/* ========================================================================= */}
         {/* QUICK STATUS DROPDOWN PICKER MODAL (Theme Adaptive)                         */}
         {/* ========================================================================= */}
-        <Modal visible={dropdownVisible} animationType="fade" transparent>
-          <Pressable onPress={() => setDropdownVisible(false)} style={styles.modalOverlay}>
-            <View style={[styles.dropdownModalContent, { backgroundColor: isDark ? '#151e32' : '#ffffff', borderWidth: isDark ? 1.5 : 0, borderColor: isDark ? 'rgba(16, 185, 129, 0.35)' : 'transparent' }]}>
+        <Modal visible={dropdownVisible} animationType="fade" transparent onRequestClose={() => setDropdownVisible(false)}>
+          <SafeAreaView style={styles.dropdownOverlay}>
+            <Pressable accessibilityLabel="Close status picker" onPress={() => setDropdownVisible(false)} style={StyleSheet.absoluteFill} />
+            <View style={[styles.dropdownModalContent, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderWidth: isDark ? 1.5 : 0, borderColor: isDark ? UiColors[effectiveTheme].border : 'transparent' }]}>
               <ThemedText style={[styles.dropdownModalTitle, { color: colors.text }]}>Select Item Status</ThemedText>
               <ThemedText style={[styles.dropdownModalSubTitle, { color: colors.textSecondary }]}>{dropdownItem?.title}</ThemedText>
 
+              <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ gap: 8 }}>
               {(isCurrentRepair ? REPAIR_CHECKLIST_STATUSES : STANDARD_CHECKLIST_STATUSES).map((st) => {
                 const isSelected = dropdownItem?.status === st;
                 const stStyle = getStatusColor(st);
@@ -3181,8 +3055,9 @@ export default function MaintenanceScreen() {
                   </Pressable>
                 );
               })}
+              </ScrollView>
             </View>
-          </Pressable>
+          </SafeAreaView>
         </Modal>
 
         {/* ========================================================================= */}
@@ -3190,12 +3065,12 @@ export default function MaintenanceScreen() {
         {/* ========================================================================= */}
         <Modal visible={confirmModalVisible} animationType="fade" transparent>
           <View style={styles.modalOverlay}>
-            <View style={[styles.confirmModalContent, { backgroundColor: isDark ? '#151e32' : '#ffffff', borderWidth: isDark ? 1.5 : 0, borderColor: isDark ? 'rgba(16, 185, 129, 0.35)' : 'transparent' }]}>
+            <View style={[styles.confirmModalContent, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderWidth: isDark ? 1.5 : 0, borderColor: isDark ? UiColors[effectiveTheme].border : 'transparent' }]}>
               <View style={[styles.confirmIconCircle, { backgroundColor: isDark ? (completedItems === totalItems ? 'rgba(168, 85, 247, 0.2)' : 'rgba(16, 185, 129, 0.2)') : (completedItems === totalItems ? '#f3e8ff' : '#d1fae5') }]}>
                 <AppIcon
                   name={completedItems === totalItems ? 'shield' : 'checklist'}
                   size={26}
-                  color={completedItems === totalItems ? (isDark ? '#c084fc' : '#9333ea') : (isDark ? '#34d399' : '#059669')}
+                  color={completedItems === totalItems ? (isDark ? colors.warning : colors.warning) : (isDark ? '#34d399' : '#059669')}
                 />
               </View>
 
@@ -3204,28 +3079,28 @@ export default function MaintenanceScreen() {
               </ThemedText>
               <ThemedText style={[styles.confirmDesc, { color: colors.textSecondary }]}>
                 {completedItems === totalItems
-                  ? 'All maintenance checklist tasks are complete! This report will be submitted to the Facility Administrator for review and verification.'
-                  : 'Your updated maintenance checklist will be sent to the EcoTrack desktop dashboard.'}
+                  ? 'All tasks are complete. Submit for administrator approval?'
+                  : 'Send your checklist updates to the desktop dashboard?'}
               </ThemedText>
 
               {/* Breakdown Grid */}
               <View style={styles.confirmBreakdownGrid}>
-                <View style={[styles.breakdownItem, { backgroundColor: isDark ? 'rgba(16, 185, 129, 0.18)' : '#d1fae5' }]}>
-                  <ThemedText style={[styles.breakdownNum, { color: isDark ? '#34d399' : '#059669' }]}>{completedItems}</ThemedText>
-                  <ThemedText style={[styles.breakdownLabel, { color: isDark ? '#cbd5e1' : '#334155' }]}>Completed</ThemedText>
+                <View style={[styles.breakdownItem, { backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface }]}>
+                  <ThemedText style={[styles.breakdownNum, { color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].emerald }]}>{completedItems}</ThemedText>
+                  <ThemedText style={[styles.breakdownLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>Completed</ThemedText>
                 </View>
-                <View style={[styles.breakdownItem, { backgroundColor: isDark ? 'rgba(245, 158, 11, 0.18)' : '#fef3c7' }]}>
-                  <ThemedText style={[styles.breakdownNum, { color: isDark ? '#fbbf24' : '#d97706' }]}>{inProgressItems}</ThemedText>
-                  <ThemedText style={[styles.breakdownLabel, { color: isDark ? '#cbd5e1' : '#334155' }]}>In Progress</ThemedText>
+                <View style={[styles.breakdownItem, { backgroundColor: isDark ? UiColors[effectiveTheme].warningSurface : UiColors[effectiveTheme].warningSurface }]}>
+                  <ThemedText style={[styles.breakdownNum, { color: isDark ? UiColors[effectiveTheme].warning : UiColors[effectiveTheme].warning }]}>{inProgressItems}</ThemedText>
+                  <ThemedText style={[styles.breakdownLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>In Progress</ThemedText>
                 </View>
-                <View style={[styles.breakdownItem, { backgroundColor: isDark ? '#0f172a' : '#f1f5f9' }]}>
-                  <ThemedText style={[styles.breakdownNum, { color: isDark ? '#94a3b8' : '#64748b' }]}>{notStartedItems}</ThemedText>
-                  <ThemedText style={[styles.breakdownLabel, { color: isDark ? '#cbd5e1' : '#334155' }]}>Not Started</ThemedText>
+                <View style={[styles.breakdownItem, { backgroundColor: isDark ? '#0f172a' : UiColors[effectiveTheme].backgroundSelected }]}>
+                  <ThemedText style={[styles.breakdownNum, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>{notStartedItems}</ThemedText>
+                  <ThemedText style={[styles.breakdownLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>Not Started</ThemedText>
                 </View>
                 {!isCurrentRepair && (
-                  <View style={[styles.breakdownItem, { backgroundColor: isDark ? 'rgba(239, 68, 68, 0.18)' : '#fee2e2' }]}>
-                    <ThemedText style={[styles.breakdownNum, { color: isDark ? '#f87171' : '#dc2626' }]}>{needsRepairItems}</ThemedText>
-                    <ThemedText style={[styles.breakdownLabel, { color: isDark ? '#cbd5e1' : '#334155' }]}>Needs Repair</ThemedText>
+                  <View style={[styles.breakdownItem, { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface }]}>
+                    <ThemedText style={[styles.breakdownNum, { color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error }]}>{needsRepairItems}</ThemedText>
+                    <ThemedText style={[styles.breakdownLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>Needs Repair</ThemedText>
                   </View>
                 )}
               </View>
@@ -3234,26 +3109,350 @@ export default function MaintenanceScreen() {
               <View style={styles.confirmActionsRow}>
                 <Pressable
                   onPress={() => setConfirmModalVisible(false)}
-                  style={[styles.confirmCancelBtn, { backgroundColor: isDark ? '#1e293b' : '#f1f5f9' }]}
+                  style={[styles.confirmCancelBtn, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected }]}
                   disabled={isSubmitting}
                 >
-                  <ThemedText style={[styles.confirmCancelBtnText, { color: isDark ? '#94a3b8' : '#64748b' }]}>Cancel</ThemedText>
+                  <ThemedText style={[styles.confirmCancelBtnText, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>Cancel</ThemedText>
                 </Pressable>
                 <Pressable
                   onPress={handleConfirmSubmit}
                   style={[
                     styles.confirmSubmitBtn,
-                    completedItems === totalItems && { backgroundColor: '#9333ea' },
+                    completedItems === totalItems && { backgroundColor: colors.warning },
                   ]}
                   disabled={isSubmitting}
                 >
                   {isSubmitting ? (
-                    <ActivityIndicator color="#ffffff" size="small" />
+                    <ActivityIndicator color={UiColors[effectiveTheme].onPrimary} size="small" />
                   ) : (
                     <ThemedText style={styles.confirmSubmitBtnText}>
                       {completedItems === totalItems ? 'Submit for Verification' : 'Submit Update'}
                     </ThemedText>
                   )}
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* ========================================================================= */}
+        {/* SCREEN 4: REPAIR SUBMISSION CONFIRMATION MODAL                            */}
+        {/* ========================================================================= */}
+        <Modal
+          visible={confirmRepairModalVisible}
+          animationType="fade"
+          transparent
+          onRequestClose={() => !isSubmitting && setConfirmRepairModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View
+              style={[
+                styles.confirmModalContent,
+                {
+                  backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                  borderWidth: isDark ? 1.5 : 1,
+                  borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                },
+              ]}
+            >
+              <View
+                style={[
+                  styles.confirmIconCircle,
+                  { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface },
+                ]}
+              >
+                <AppIcon
+                  name="shield"
+                  size={26}
+                  color={isDark ? '#fb7185' : '#e11d48'}
+                />
+              </View>
+
+              <ThemedText style={[styles.confirmTitle, { color: colors.text, textAlign: 'center' }]}>
+                Submit Repair for Sign-Off?
+              </ThemedText>
+              <ThemedText style={[styles.confirmDesc, { color: colors.textSecondary }]}>
+                All repair tasks are complete. Submit for administrator approval?
+              </ThemedText>
+
+              {/* Repair Target Info Card */}
+              {pendingRepairToSubmit && (
+                <View
+                  style={{
+                    width: '100%',
+                    backgroundColor: isDark ? '#0f172a' : UiColors[effectiveTheme].background,
+                    borderRadius: 14,
+                    padding: 12,
+                    marginBottom: 14,
+                    borderWidth: 1,
+                    borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                    gap: 6,
+                  }}
+                >
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <ThemedText style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600' }}>
+                      Repair Order:
+                    </ThemedText>
+                    <ThemedText style={{ fontSize: 12, color: colors.text, fontWeight: '800' }}>
+                      #{pendingRepairToSubmit.id}
+                    </ThemedText>
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <ThemedText style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600' }}>
+                      Aircon Unit:
+                    </ThemedText>
+                    <ThemedText
+                      style={{ fontSize: 12, color: colors.text, fontWeight: '700', maxWidth: '65%' }}
+                      numberOfLines={1}
+                    >
+                      {pendingRepairToSubmit.airconName || pendingRepairToSubmit.controllerName || 'Name unavailable'}
+                    </ThemedText>
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <ThemedText style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600' }}>
+                      Location:
+                    </ThemedText>
+                    <ThemedText
+                      style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600', maxWidth: '65%' }}
+                      numberOfLines={1}
+                    >
+                      {pendingRepairToSubmit.location}
+                    </ThemedText>
+                  </View>
+                </View>
+              )}
+
+              {/* Tasks Breakdown Grid */}
+              {pendingRepairToSubmit && (() => {
+                const pItems = pendingRepairToSubmit.items || [];
+                const repCount = pItems.filter(isChecklistItemComplete).length;
+                const totCount = pItems.length;
+                return (
+                  <View style={styles.confirmBreakdownGrid}>
+                    <View
+                      style={[
+                        styles.breakdownItem,
+                        { backgroundColor: isDark ? UiColors[effectiveTheme].accentSurface : UiColors[effectiveTheme].accentSurface, flex: 1 },
+                      ]}
+                    >
+                      <ThemedText style={[styles.breakdownNum, { color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].emerald }]}>
+                        {repCount} / {totCount}
+                      </ThemedText>
+                      <ThemedText style={[styles.breakdownLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>
+                        Repaired Tasks
+                      </ThemedText>
+                    </View>
+                    <View
+                      style={[
+                        styles.breakdownItem,
+                        { backgroundColor: isDark ? UiColors[effectiveTheme].errorSurface : UiColors[effectiveTheme].errorSurface, flex: 1 },
+                      ]}
+                    >
+                      <ThemedText style={[styles.breakdownNum, { color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error }]}>
+                        Sign-Off
+                      </ThemedText>
+                      <ThemedText style={[styles.breakdownLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>
+                        Admin Inspection
+                      </ThemedText>
+                    </View>
+                  </View>
+                );
+              })()}
+
+              {/* Actions Row */}
+              <View style={styles.confirmActionsRow}>
+                <Pressable
+                  onPress={() => setConfirmRepairModalVisible(false)}
+                  style={[styles.confirmCancelBtn, { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].backgroundSelected }]}
+                  disabled={isSubmitting}
+                >
+                  <ThemedText style={[styles.confirmCancelBtnText, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}>
+                    Cancel
+                  </ThemedText>
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    if (pendingRepairToSubmit) {
+                      handleSubmitForVerification(pendingRepairToSubmit.id);
+                    }
+                  }}
+                  style={[styles.confirmSubmitBtn, { backgroundColor: '#e11d48' }]}
+                  disabled={isSubmitting}
+                >
+                  {isSubmitting ? (
+                    <ActivityIndicator color={UiColors[effectiveTheme].onPrimary} size="small" />
+                  ) : (
+                    <ThemedText style={styles.confirmSubmitBtnText}>
+                      Submit Repair
+                    </ThemedText>
+                  )}
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* ========================================================================= */}
+        {/* POST-SUBMISSION CONFIRMATION SUCCESS MODAL                                */}
+        {/* ========================================================================= */}
+        <Modal
+          visible={repairSuccessModalVisible}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setRepairSuccessModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View
+              style={[
+                styles.confirmModalContent,
+                {
+                  backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                  borderWidth: isDark ? 1.5 : 1,
+                  borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                },
+              ]}
+            >
+              <View
+                style={[
+                  styles.confirmIconCircle,
+                  { backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface },
+                ]}
+              >
+                <AppIcon
+                  name="shield"
+                  size={28}
+                  color={isDark ? colors.warning : colors.warning}
+                />
+              </View>
+
+              <ThemedText style={[styles.confirmTitle, { color: colors.text, textAlign: 'center' }]}>
+                {submittedRepairInfo?.isRepair
+                  ? 'Repair Submitted for Verification'
+                  : 'Submitted for Admin Verification'}
+              </ThemedText>
+              <ThemedText
+                style={[styles.confirmDesc, { color: colors.textSecondary, textAlign: 'center', marginBottom: 16 }]}
+              >
+                {submittedRepairInfo?.isRepair
+                  ? `Corrective repair order #${submittedRepairInfo?.id} was successfully submitted. The Facility Administrator has been notified for final inspection and sign-off.`
+                  : 'Report submitted. The administrator has been notified.'}
+              </ThemedText>
+
+              {/* Submitted Details Box */}
+              {submittedRepairInfo && (
+                <View
+                  style={{
+                    width: '100%',
+                    backgroundColor: isDark ? '#0f172a' : UiColors[effectiveTheme].background,
+                    borderRadius: 14,
+                    padding: 12,
+                    marginBottom: 16,
+                    borderWidth: 1,
+                    borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                    gap: 8,
+                  }}
+                >
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <ThemedText style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600' }}>
+                      Report ID:
+                    </ThemedText>
+                    <ThemedText style={{ fontSize: 12, color: colors.text, fontWeight: '800' }}>
+                      #{submittedRepairInfo.id}
+                    </ThemedText>
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <ThemedText style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600' }}>
+                      Aircon Unit:
+                    </ThemedText>
+                    <ThemedText
+                      style={{ fontSize: 12, color: colors.text, fontWeight: '700', maxWidth: '65%' }}
+                      numberOfLines={1}
+                    >
+                      {submittedRepairInfo.aircon}
+                    </ThemedText>
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <ThemedText style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600' }}>
+                      Location:
+                    </ThemedText>
+                    <ThemedText
+                      style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600', maxWidth: '65%' }}
+                      numberOfLines={1}
+                    >
+                      {submittedRepairInfo.location}
+                    </ThemedText>
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <ThemedText style={{ fontSize: 12, color: colors.textSecondary, fontWeight: '600' }}>
+                      Status:
+                    </ThemedText>
+                    <View
+                      style={[
+                        styles.statusBadge,
+                        {
+                          backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface,
+                          borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
+                        },
+                      ]}
+                    >
+                      <ThemedText
+                        style={[styles.statusBadgeText, { color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info, fontSize: 11 }]}
+                      >
+                        For Verification
+                      </ThemedText>
+                    </View>
+                  </View>
+                </View>
+              )}
+
+              {/* Navigation Action Buttons */}
+              <View style={styles.repairSuccessActions}>
+                {Boolean(submittedRepairInfo?.parentId) && (
+                  <Pressable
+                    onPress={() => {
+                      setRepairSuccessModalVisible(false);
+                      setSelectedReportId(submittedRepairInfo!.parentId!);
+                      setActiveRepairId(null);
+                      setCurrentScreen('DETAILS');
+                    }}
+                    accessibilityRole="button"
+                    style={({ pressed }) => [
+                      styles.repairSuccessActionBtn,
+                      { backgroundColor: isDark ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].primaryFill },
+                      pressed && { opacity: 0.8 },
+                    ]}
+                  >
+                    <ThemedText style={[styles.confirmSubmitBtnText, styles.repairSuccessActionText]}>
+                      Return to Checklist
+                    </ThemedText>
+                  </Pressable>
+                )}
+                <Pressable
+                  onPress={() => {
+                    setRepairSuccessModalVisible(false);
+                    setActiveRepairId(null);
+                    setCurrentScreen('DASHBOARD');
+                  }}
+                  accessibilityRole="button"
+                  style={({ pressed }) => [
+                    styles.repairSuccessActionBtn,
+                    {
+                      backgroundColor: submittedRepairInfo?.parentId ? (isDark ? '#1e293b' : '#f1f5f9') : (isDark ? '#10b981' : '#059669'),
+                    },
+                    pressed && { opacity: 0.8 },
+                  ]}
+                >
+                  <ThemedText
+                    style={[
+                      styles.confirmCancelBtnText,
+                      styles.repairSuccessActionText,
+                      submittedRepairInfo?.parentId
+                        ? { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].textSecondary }
+                        : { color: UiColors[effectiveTheme].onPrimary, fontWeight: '800' },
+                    ]}
+                  >
+                    Back to Maintenance Dashboard
+                  </ThemedText>
                 </Pressable>
               </View>
             </View>
@@ -3267,7 +3466,7 @@ export default function MaintenanceScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
   container: {
     flex: 1,
   },
@@ -3299,37 +3498,37 @@ const styles = StyleSheet.create({
   headerTitle: {
     fontSize: 16,
     fontWeight: '800',
-    color: '#064e3b',
+    color: colors.text,
     lineHeight: 18,
     fontFamily: 'Roboto',
   },
   headerSubtitle: {
     fontSize: 12,
-    color: '#059669',
+    color: colors.text,
     fontWeight: '700',
     fontFamily: 'Roboto',
   },
   workerBadge: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 20,
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: colors.border,
     gap: 6,
   },
   workerDot: {
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
   },
   workerBadgeText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#064e3b',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
 
@@ -3337,13 +3536,13 @@ const styles = StyleSheet.create({
   workflowNotice: {
     marginHorizontal: Spacing.four,
     marginTop: 4,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 14,
     padding: 12,
     flexDirection: 'row',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(16, 185, 129, 0.2)',
+    borderColor: colors.border,
     gap: 10,
   },
   workflowNoticeIcon: {
@@ -3352,7 +3551,7 @@ const styles = StyleSheet.create({
   workflowNoticeText: {
     flex: 1,
     fontSize: 11.5,
-    color: '#475569',
+    color: colors.textSecondary,
     lineHeight: 16,
     fontFamily: 'Roboto',
   },
@@ -3365,7 +3564,7 @@ const styles = StyleSheet.create({
   sectionHeaderTitle: {
     fontSize: 11.5,
     fontWeight: '800',
-    color: '#064e3b',
+    color: colors.text,
     letterSpacing: 0.8,
     marginBottom: 8,
     fontFamily: 'Roboto',
@@ -3382,17 +3581,17 @@ const styles = StyleSheet.create({
   summaryCard: {
     minWidth: 100,
     flex: 1,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 16,
     paddingVertical: 14,
     paddingHorizontal: 12,
     alignItems: 'center',
     borderWidth: 1.5,
-    borderColor: '#e2e8f0',
+    borderColor: colors.panelBorder,
     position: 'relative',
     ...Platform.select({
       ios: {
-        shadowColor: '#000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.05,
         shadowRadius: 4,
@@ -3403,16 +3602,16 @@ const styles = StyleSheet.create({
     }),
   },
   summaryCardActive: {
-    borderColor: '#10b981',
-    backgroundColor: '#f0fdf4',
+    borderColor: colors.emerald,
+    backgroundColor: colors.accentSurface,
   },
   summaryCardActivePurple: {
-    borderColor: '#9333ea',
-    backgroundColor: '#faf5ff',
+    borderColor: colors.panelBorder,
+    backgroundColor: colors.infoSurface,
   },
   summaryCardActiveRed: {
-    borderColor: '#dc2626',
-    backgroundColor: '#fef2f2',
+    borderColor: colors.panelBorder,
+    backgroundColor: colors.errorSurface,
   },
   summaryBadgeDot: {
     position: 'absolute',
@@ -3425,13 +3624,13 @@ const styles = StyleSheet.create({
   summaryCount: {
     fontSize: 24,
     fontWeight: '900',
-    color: '#1e293b',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   summaryLabel: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#64748b',
+    color: colors.textSecondary,
     marginTop: 2,
     fontFamily: 'Roboto',
   },
@@ -3440,25 +3639,25 @@ const styles = StyleSheet.create({
   searchBarContainer: {
     marginHorizontal: Spacing.four,
     marginTop: 16,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 14,
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 12,
     height: 44,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.inputBorder,
   },
   searchIcon: {
     width: 18,
     height: 18,
-    tintColor: '#9ca3af',
+    tintColor: colors.textMuted,
     marginRight: 8,
   },
   searchInput: {
     flex: 1,
     fontSize: 13,
-    color: '#1e293b',
+    color: colors.text,
     fontFamily: 'Roboto',
     padding: 0,
   },
@@ -3467,7 +3666,7 @@ const styles = StyleSheet.create({
   },
   searchClearText: {
     fontSize: 12,
-    color: '#9ca3af',
+    color: colors.textMuted,
     fontWeight: '700',
   },
 
@@ -3482,22 +3681,22 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 7,
     borderRadius: 20,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.border,
   },
   filterChipActive: {
-    backgroundColor: '#0b291d',
-    borderColor: '#0b291d',
+    backgroundColor: colors.primaryFill,
+    borderColor: colors.border,
   },
   filterChipText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#475569',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
   filterChipTextActive: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
 
   // Reports List
@@ -3512,15 +3711,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   reportCard: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 20,
     padding: 16,
     borderWidth: 1.2,
-    borderColor: '#e2e8f0',
+    borderColor: colors.panelBorder,
     gap: 10,
     ...Platform.select({
       ios: {
-        shadowColor: '#10b981',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.08,
         shadowRadius: 8,
@@ -3538,7 +3737,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   reportIdPill: {
-    backgroundColor: '#0b291d',
+    backgroundColor: colors.primaryFill,
     paddingHorizontal: 9,
     paddingVertical: 4,
     borderRadius: 7,
@@ -3549,14 +3748,14 @@ const styles = StyleSheet.create({
   reportIdText: {
     fontSize: 12,
     fontWeight: '900',
-    color: '#10b981',
+    color: colors.text,
     letterSpacing: 0.5,
     fontFamily: 'Roboto',
     includeFontPadding: false,
   },
   reportTypeBadge: {
-    backgroundColor: '#ecfdf5',
-    borderColor: '#a7f3d0',
+    backgroundColor: colors.accentSurface,
+    borderColor: colors.border,
     borderWidth: 1,
     paddingHorizontal: 8,
     paddingVertical: 3.5,
@@ -3566,7 +3765,7 @@ const styles = StyleSheet.create({
   reportTypeBadgeText: {
     fontSize: 11,
     fontWeight: '800',
-    color: '#047857',
+    color: colors.text,
     fontFamily: 'Roboto',
     includeFontPadding: false,
   },
@@ -3591,7 +3790,7 @@ const styles = StyleSheet.create({
   statusBadgeCountText: {
     fontSize: 10,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     lineHeight: 12,
     textAlign: 'center',
     includeFontPadding: false,
@@ -3633,6 +3832,8 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   acTitleGroup: {
+    flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
@@ -3641,14 +3842,15 @@ const styles = StyleSheet.create({
     width: 26,
     height: 26,
     borderRadius: 13,
-    backgroundColor: '#e0f2fe',
+    backgroundColor: colors.infoSurface,
     alignItems: 'center',
     justifyContent: 'center',
   },
   acTitleText: {
+    flexShrink: 1,
     fontSize: 16,
     fontWeight: '900',
-    color: '#0f172a',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   acMetaTagsRow: {
@@ -3662,9 +3864,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    backgroundColor: '#ecfdf5',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: '#a7f3d0',
+    borderColor: colors.border,
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 8,
@@ -3672,31 +3874,33 @@ const styles = StyleSheet.create({
   airconTypeTagText: {
     fontSize: 11,
     fontWeight: '800',
-    color: '#047857',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   locationBadgeRow: {
+    maxWidth: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    backgroundColor: '#f8fafc',
+    backgroundColor: colors.background,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.border,
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 8,
     alignSelf: 'flex-start',
   },
   locationBadgeText: {
+    flexShrink: 1,
     fontSize: 11.5,
     fontWeight: '700',
-    color: '#475569',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
   verificationRemarksCard: {
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#ddd6fe',
+    borderColor: colors.panelBorder,
     backgroundColor: '#f5f3ff',
     padding: 10,
     flexDirection: 'row',
@@ -3707,7 +3911,7 @@ const styles = StyleSheet.create({
   verificationRemarksHeader: {
     fontSize: 10.5,
     fontWeight: '800',
-    color: '#6b21a8',
+    color: colors.info,
     textTransform: 'uppercase',
     letterSpacing: 0.4,
     fontFamily: 'Roboto',
@@ -3722,8 +3926,8 @@ const styles = StyleSheet.create({
   defectAlertCard: {
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#fecaca',
-    backgroundColor: '#fef2f2',
+    borderColor: colors.panelBorder,
+    backgroundColor: colors.errorSurface,
     padding: 10,
     flexDirection: 'row',
     gap: 8,
@@ -3733,7 +3937,7 @@ const styles = StyleSheet.create({
   defectAlertHeader: {
     fontSize: 10.5,
     fontWeight: '800',
-    color: '#b91c1c',
+    color: colors.error,
     textTransform: 'uppercase',
     letterSpacing: 0.4,
     fontFamily: 'Roboto',
@@ -3741,7 +3945,7 @@ const styles = StyleSheet.create({
   defectAlertContent: {
     fontSize: 12,
     fontWeight: '600',
-    color: '#dc2626',
+    color: colors.error,
     marginTop: 2,
     fontFamily: 'Roboto',
   },
@@ -3749,20 +3953,20 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 6,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.border,
   },
   assignedTagText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#64748b',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
   detailsVerificationBanner: {
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#ddd6fe',
+    borderColor: colors.border,
     backgroundColor: '#f5f3ff',
     padding: 12,
     flexDirection: 'row',
@@ -3773,7 +3977,7 @@ const styles = StyleSheet.create({
   detailsVerificationTitle: {
     fontSize: 11,
     fontWeight: '800',
-    color: '#6b21a8',
+    color: colors.text,
     textTransform: 'uppercase',
     letterSpacing: 0.4,
     fontFamily: 'Roboto',
@@ -3789,8 +3993,8 @@ const styles = StyleSheet.create({
   detailsDefectBanner: {
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#fecaca',
-    backgroundColor: '#fef2f2',
+    borderColor: colors.border,
+    backgroundColor: colors.errorSurface,
     padding: 12,
     flexDirection: 'row',
     gap: 10,
@@ -3800,7 +4004,7 @@ const styles = StyleSheet.create({
   detailsDefectTitle: {
     fontSize: 11,
     fontWeight: '800',
-    color: '#b91c1c',
+    color: colors.error,
     textTransform: 'uppercase',
     letterSpacing: 0.4,
     fontFamily: 'Roboto',
@@ -3808,7 +4012,7 @@ const styles = StyleSheet.create({
   detailsDefectText: {
     fontSize: 12.5,
     fontWeight: '600',
-    color: '#dc2626',
+    color: colors.error,
     marginTop: 3,
     lineHeight: 18,
     fontFamily: 'Roboto',
@@ -3816,15 +4020,15 @@ const styles = StyleSheet.create({
   detailsDefectMeta: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#ef4444',
+    color: colors.error,
     marginTop: 4,
     fontFamily: 'Roboto',
   },
   descriptionCardBox: {
-    backgroundColor: '#f8fafc',
+    backgroundColor: colors.background,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.panelBorder,
     padding: 10,
     gap: 4,
     marginVertical: 2,
@@ -3837,14 +4041,14 @@ const styles = StyleSheet.create({
   descriptionBoxLabel: {
     fontSize: 10,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.textSecondary,
     letterSpacing: 0.6,
     fontFamily: 'Roboto',
   },
   descriptionBoxText: {
     fontSize: 12.5,
     fontWeight: '600',
-    color: '#1e293b',
+    color: colors.text,
     lineHeight: 18,
     fontFamily: 'Roboto',
   },
@@ -3873,11 +4077,11 @@ const styles = StyleSheet.create({
   calendarIcon: {
     width: 13,
     height: 13,
-    tintColor: '#64748b',
+    tintColor: colors.textSecondary,
   },
   dueTagText: {
     fontSize: 11.5,
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '600',
     fontFamily: 'Roboto',
   },
@@ -3892,18 +4096,18 @@ const styles = StyleSheet.create({
   cardProgressText: {
     fontSize: 11.5,
     fontWeight: '700',
-    color: '#475569',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
   cardProgressPct: {
     fontSize: 11.5,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.emerald,
     fontFamily: 'Roboto',
   },
   progressBarTrack: {
     height: 7,
-    backgroundColor: '#e2e8f0',
+    backgroundColor: colors.backgroundSelected,
     borderRadius: 4,
     overflow: 'hidden',
   },
@@ -3912,7 +4116,7 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
   viewButton: {
-    backgroundColor: '#0b291d',
+    backgroundColor: colors.primaryFill,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -3922,7 +4126,7 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   viewButtonText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 13,
     fontWeight: '800',
     fontFamily: 'Roboto',
@@ -3930,7 +4134,7 @@ const styles = StyleSheet.create({
   viewButtonIcon: {
     width: 14,
     height: 14,
-    tintColor: '#10b981',
+    tintColor: colors.emerald,
   },
   emptyState: {
     borderRadius: 16,
@@ -3984,28 +4188,28 @@ const styles = StyleSheet.create({
   backButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     paddingHorizontal: 12,
     paddingVertical: 7,
     borderRadius: 20,
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: colors.border,
     gap: 4,
   },
   backButtonIcon: {
     fontSize: 18,
     fontWeight: '900',
-    color: '#064e3b',
+    color: colors.text,
     lineHeight: 18,
   },
   backButtonText: {
     fontSize: 12,
     fontWeight: '800',
-    color: '#064e3b',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   reportPillLarge: {
-    backgroundColor: '#0b291d',
+    backgroundColor: colors.primaryFill,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 8,
@@ -4015,7 +4219,7 @@ const styles = StyleSheet.create({
   reportPillLargeText: {
     fontSize: 12,
     fontWeight: '900',
-    color: '#10b981',
+    color: colors.emerald,
     letterSpacing: 0.5,
     fontFamily: 'Roboto',
   },
@@ -4026,12 +4230,12 @@ const styles = StyleSheet.create({
   detailsMainTitle: {
     fontSize: 20,
     fontWeight: '900',
-    color: '#0b291d',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   detailsMainSubtitle: {
     fontSize: 13,
-    color: '#059669',
+    color: colors.text,
     fontWeight: '700',
     fontFamily: 'Roboto',
     marginTop: 2,
@@ -4040,23 +4244,23 @@ const styles = StyleSheet.create({
   // SCREEN 2: Aircon Information Card
   airconInfoCard: {
     marginHorizontal: Spacing.four,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 20,
     padding: 16,
     borderWidth: 1.2,
-    borderColor: '#e2e8f0',
+    borderColor: colors.panelBorder,
     marginBottom: 14,
   },
   cardSectionHeader: {
     marginBottom: 10,
     borderBottomWidth: 1,
-    borderBottomColor: '#f1f5f9',
+    borderBottomColor: colors.border,
     paddingBottom: 6,
   },
   cardSectionTitle: {
     fontSize: 11.5,
     fontWeight: '800',
-    color: '#064e3b',
+    color: colors.text,
     letterSpacing: 0.8,
     fontFamily: 'Roboto',
   },
@@ -4067,33 +4271,37 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    gap: 12,
     borderBottomWidth: 1,
-    borderBottomColor: '#f8fafc',
+    borderBottomColor: colors.border,
     paddingBottom: 6,
   },
   infoKey: {
+    flexShrink: 0,
+    maxWidth: '48%',
     fontSize: 12.5,
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '600',
     fontFamily: 'Roboto',
   },
   infoValue: {
+    flexShrink: 1,
+    textAlign: 'right',
     fontSize: 12.5,
-    color: '#1e293b',
+    color: colors.text,
     fontWeight: '700',
     fontFamily: 'Roboto',
   },
-  scopeScrollBox: {
-    flex: 1,
-    maxHeight: 88,
-    marginLeft: 12,
-  },
-  scopeScrollView: {
-    maxHeight: 88,
+  scopeDescriptionText: {
+    fontSize: 14,
+    lineHeight: 22,
+    fontFamily: 'Roboto',
   },
   infoValueBold: {
+    flexShrink: 1,
+    textAlign: 'right',
     fontSize: 13,
-    color: '#0b291d',
+    color: colors.text,
     fontWeight: '900',
     fontFamily: 'Roboto',
   },
@@ -4111,15 +4319,15 @@ const styles = StyleSheet.create({
   // Maintenance Progress Card
   progressCard: {
     marginHorizontal: Spacing.four,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 20,
     padding: 16,
     borderWidth: 1.2,
-    borderColor: 'rgba(16, 185, 129, 0.25)',
+    borderColor: colors.panelBorder,
     marginBottom: 14,
     ...Platform.select({
       ios: {
-        shadowColor: '#10b981',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.08,
         shadowRadius: 6,
@@ -4137,12 +4345,12 @@ const styles = StyleSheet.create({
   progressPercentageText: {
     fontSize: 18,
     fontWeight: '900',
-    color: '#059669',
+    color: colors.emerald,
     fontFamily: 'Roboto',
   },
   progressCountText: {
     fontSize: 12,
-    color: '#475569',
+    color: colors.textSecondary,
     fontWeight: '600',
     marginTop: 2,
     marginBottom: 8,
@@ -4150,7 +4358,7 @@ const styles = StyleSheet.create({
   },
   largeProgressBarTrack: {
     height: 12,
-    backgroundColor: '#e2e8f0',
+    backgroundColor: colors.backgroundSelected,
     borderRadius: 6,
     overflow: 'hidden',
     marginBottom: 12,
@@ -4163,7 +4371,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     borderTopWidth: 1,
-    borderTopColor: '#f1f5f9',
+    borderTopColor: colors.border,
     paddingTop: 10,
   },
   statusChipItem: {
@@ -4177,7 +4385,7 @@ const styles = StyleSheet.create({
   statusChipLabel: {
     fontSize: 10,
     fontWeight: '700',
-    color: '#64748b',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
 
@@ -4199,13 +4407,13 @@ const styles = StyleSheet.create({
   checklistSectionTitle: {
     fontSize: 13,
     fontWeight: '900',
-    color: '#064e3b',
+    color: colors.text,
     letterSpacing: 0.8,
     fontFamily: 'Roboto',
   },
   checklistHint: {
     fontSize: 11,
-    color: '#64748b',
+    color: colors.textSecondary,
     marginBottom: 12,
     lineHeight: 15,
     fontFamily: 'Roboto',
@@ -4214,15 +4422,15 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   checklistItemCard: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 18,
     borderWidth: 1.2,
-    borderColor: '#e2e8f0',
+    borderColor: colors.panelBorder,
     padding: 14,
     gap: 10,
     ...Platform.select({
       ios: {
-        shadowColor: '#000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.04,
         shadowRadius: 4,
@@ -4233,7 +4441,7 @@ const styles = StyleSheet.create({
     }),
   },
   checklistItemCardDanger: {
-    borderColor: '#fca5a5',
+    borderColor: colors.panelBorder,
     backgroundColor: '#fffdfd',
   },
   checklistItemMain: {
@@ -4244,7 +4452,7 @@ const styles = StyleSheet.create({
     width: 24,
     height: 24,
     borderRadius: 12,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 2,
@@ -4252,7 +4460,7 @@ const styles = StyleSheet.create({
   itemIndexNumber: {
     fontSize: 11,
     fontWeight: '900',
-    color: '#475569',
+    color: colors.textSecondary,
   },
   itemTextContainer: {
     flex: 1,
@@ -4261,50 +4469,50 @@ const styles = StyleSheet.create({
   itemTitle: {
     fontSize: 14,
     fontWeight: '800',
-    color: '#0f172a',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   itemTitleDanger: {
-    color: '#dc2626',
+    color: colors.error,
   },
   itemDescription: {
     fontSize: 12,
-    color: '#64748b',
+    color: colors.textSecondary,
     lineHeight: 16,
     fontFamily: 'Roboto',
   },
   remarksSnippet: {
-    backgroundColor: '#f8fafc',
+    backgroundColor: colors.background,
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
     marginTop: 4,
     borderLeftWidth: 2,
-    borderLeftColor: '#10b981',
+    borderLeftColor: colors.border,
   },
   remarksSnippetText: {
     fontSize: 11,
-    color: '#334155',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
   defectSnippet: {
-    backgroundColor: '#fee2e2',
+    backgroundColor: colors.errorSurface,
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
     marginTop: 4,
     borderLeftWidth: 3,
-    borderLeftColor: '#dc2626',
+    borderLeftColor: colors.border,
   },
   defectSnippetText: {
     fontSize: 11,
-    color: '#991b1b',
+    color: colors.error,
     fontWeight: '700',
     fontFamily: 'Roboto',
   },
   photoAttachedBadge: {
     alignSelf: 'flex-start',
-    backgroundColor: '#e0f2fe',
+    backgroundColor: colors.infoSurface,
     paddingHorizontal: 7,
     paddingVertical: 2,
     borderRadius: 4,
@@ -4362,7 +4570,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   submitButton: {
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     width: '100%',
     paddingVertical: 15,
     borderRadius: 16,
@@ -4370,7 +4578,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     ...Platform.select({
       ios: {
-        shadowColor: '#10b981',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 6 },
         shadowOpacity: 0.35,
         shadowRadius: 10,
@@ -4381,7 +4589,7 @@ const styles = StyleSheet.create({
     }),
   },
   submitButtonText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 15,
     fontWeight: '900',
     letterSpacing: 0.5,
@@ -4389,7 +4597,7 @@ const styles = StyleSheet.create({
   },
   submitDisclaimer: {
     fontSize: 12,
-    color: '#64748b',
+    color: colors.textSecondary,
     textAlign: 'center',
     fontFamily: 'Roboto',
     marginTop: 2,
@@ -4400,7 +4608,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.22,
         shadowRadius: 8,
@@ -4424,7 +4632,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   submitBtnTextPrimary: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 15,
     fontWeight: '800',
     letterSpacing: 0.4,
@@ -4437,6 +4645,14 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     borderWidth: 1.5,
     gap: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  verifiedIconBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -4463,15 +4679,15 @@ const styles = StyleSheet.create({
     paddingBottom: 110,
   },
   successCard: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 24,
     padding: 24,
     alignItems: 'center',
     borderWidth: 1.5,
-    borderColor: '#a7f3d0',
+    borderColor: colors.panelBorder,
     ...Platform.select({
       ios: {
-        shadowColor: '#10b981',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 10 },
         shadowOpacity: 0.15,
         shadowRadius: 16,
@@ -4485,29 +4701,29 @@ const styles = StyleSheet.create({
     width: 64,
     height: 64,
     borderRadius: 32,
-    backgroundColor: '#d1fae5',
+    backgroundColor: colors.accentSurface,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 16,
     borderWidth: 2,
-    borderColor: '#10b981',
+    borderColor: colors.border,
   },
   successIconText: {
     fontSize: 32,
     fontWeight: '900',
-    color: '#059669',
+    color: colors.emerald,
   },
   successTitle: {
     fontSize: 18,
     fontWeight: '900',
-    color: '#0b291d',
+    color: colors.text,
     textAlign: 'center',
     marginBottom: 6,
     fontFamily: 'Roboto',
   },
   successMessage: {
     fontSize: 13,
-    color: '#475569',
+    color: colors.textSecondary,
     textAlign: 'center',
     lineHeight: 18,
     marginBottom: 16,
@@ -4515,13 +4731,13 @@ const styles = StyleSheet.create({
   },
   successDivider: {
     height: 1,
-    backgroundColor: '#e2e8f0',
+    backgroundColor: colors.backgroundSelected,
     width: '100%',
     marginBottom: 16,
   },
   successDetailsBox: {
     width: '100%',
-    backgroundColor: '#f8fafc',
+    backgroundColor: colors.background,
     borderRadius: 14,
     padding: 14,
     gap: 8,
@@ -4534,39 +4750,39 @@ const styles = StyleSheet.create({
   },
   successDetailKey: {
     fontSize: 12,
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '600',
     fontFamily: 'Roboto',
   },
   successDetailVal: {
     fontSize: 12,
-    color: '#1e293b',
+    color: colors.text,
     fontWeight: '700',
     fontFamily: 'Roboto',
   },
   successDetailValBold: {
     fontSize: 12.5,
-    color: '#0b291d',
+    color: colors.text,
     fontWeight: '900',
     fontFamily: 'Roboto',
   },
   syncConfirmedBadge: {
-    backgroundColor: '#ecfdf5',
+    backgroundColor: colors.accentSurface,
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 20,
     marginBottom: 20,
     borderWidth: 1,
-    borderColor: '#a7f3d0',
+    borderColor: colors.border,
   },
   syncConfirmedText: {
     fontSize: 11.5,
-    color: '#065f46',
+    color: colors.text,
     fontWeight: '800',
     fontFamily: 'Roboto',
   },
   successBackButton: {
-    backgroundColor: '#0b291d',
+    backgroundColor: colors.primaryFill,
     width: '100%',
     paddingVertical: 14,
     borderRadius: 14,
@@ -4574,7 +4790,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   successBackButtonText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 14,
     fontWeight: '800',
     fontFamily: 'Roboto',
@@ -4593,12 +4809,12 @@ const styles = StyleSheet.create({
   expandedModalContent: {
     width: '100%',
     maxWidth: 500,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 24,
     padding: 20,
     ...Platform.select({
       ios: {
-        shadowColor: '#000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 8 },
         shadowOpacity: 0.2,
         shadowRadius: 12,
@@ -4613,31 +4829,31 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'flex-start',
     borderBottomWidth: 1,
-    borderBottomColor: '#f1f5f9',
+    borderBottomColor: colors.border,
     paddingBottom: 10,
     marginBottom: 12,
   },
   modalCategoryLabel: {
     fontSize: 10,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.textSecondary,
     letterSpacing: 0.8,
     fontFamily: 'Roboto',
   },
   modalItemTitle: {
     fontSize: 16,
     fontWeight: '900',
-    color: '#0b291d',
+    color: colors.text,
     fontFamily: 'Roboto',
   },
   modalCloseBtn: {
     padding: 6,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     borderRadius: 12,
   },
   modalCloseText: {
     fontSize: 12,
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '900',
   },
   modalFieldBlock: {
@@ -4646,13 +4862,13 @@ const styles = StyleSheet.create({
   modalFieldLabel: {
     fontSize: 12,
     fontWeight: '800',
-    color: '#334155',
+    color: colors.textSecondary,
     marginBottom: 6,
     fontFamily: 'Roboto',
   },
   modalFieldDesc: {
     fontSize: 12.5,
-    color: '#475569',
+    color: colors.textSecondary,
     lineHeight: 17,
     fontFamily: 'Roboto',
   },
@@ -4665,19 +4881,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 10,
-    backgroundColor: '#f8fafc',
+    backgroundColor: colors.background,
     borderWidth: 1.5,
   },
   statusSelectOptionText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#475569',
+    color: colors.textSecondary,
     fontFamily: 'Roboto',
   },
   needsRepairAlertBlock: {
-    backgroundColor: '#fee2e2',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1.5,
-    borderColor: '#fca5a5',
+    borderColor: colors.border,
     borderRadius: 14,
     padding: 12,
     marginBottom: 14,
@@ -4685,7 +4901,7 @@ const styles = StyleSheet.create({
   needsRepairLabel: {
     fontSize: 12,
     fontWeight: '900',
-    color: '#b91c1c',
+    color: colors.error,
     marginBottom: 2,
     fontFamily: 'Roboto',
   },
@@ -4696,24 +4912,24 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto',
   },
   needsRepairInput: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: '#fca5a5',
+    borderColor: colors.inputBorder,
     padding: 10,
     fontSize: 12.5,
-    color: '#b91c1c',
+    color: colors.error,
     fontFamily: 'Roboto',
     textAlignVertical: 'top',
   },
   remarksInput: {
-    backgroundColor: '#f8fafc',
+    backgroundColor: colors.background,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.inputBorder,
     padding: 10,
     fontSize: 12.5,
-    color: '#1e293b',
+    color: colors.text,
     fontFamily: 'Roboto',
     textAlignVertical: 'top',
   },
@@ -4769,7 +4985,7 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
   photoIndexBadgeText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 10,
     fontWeight: '800',
   },
@@ -4784,11 +5000,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1.5,
-    borderColor: '#ffffff',
+    borderColor: colors.border,
     zIndex: 10,
   },
   photoThumbnailDeleteText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 11,
     fontWeight: '900',
     lineHeight: 13,
@@ -4860,7 +5076,7 @@ const styles = StyleSheet.create({
   photoPickerBtnText: {
     fontSize: 12.5,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.emerald,
     fontFamily: 'Roboto',
   },
   photoPickerSubText: {
@@ -4903,35 +5119,39 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingVertical: 12,
     borderRadius: 12,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     alignItems: 'center',
     justifyContent: 'center',
   },
   modalCancelBtnText: {
     fontSize: 13,
     fontWeight: '800',
-    color: '#64748b',
+    color: colors.textSecondary,
   },
   modalSaveBtn: {
     flex: 2,
     paddingVertical: 12,
     borderRadius: 12,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     alignItems: 'center',
     justifyContent: 'center',
   },
   modalSaveBtnText: {
     fontSize: 13,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
 
   // Dropdown Picker Modal
+  dropdownOverlay: {
+    flex: 1, justifyContent: 'center', alignItems: 'center',
+    padding: 20, backgroundColor: 'rgba(0, 0, 0, 0.55)',
+  },
   dropdownModalContent: {
-    width: SCREEN_WIDTH - 48,
+    width: '100%', maxHeight: '90%',
     maxWidth: 360,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 20,
     padding: 20,
     gap: 8,
@@ -4939,13 +5159,13 @@ const styles = StyleSheet.create({
   dropdownModalTitle: {
     fontSize: 15,
     fontWeight: '900',
-    color: '#0b291d',
+    color: colors.text,
     textAlign: 'center',
     fontFamily: 'Roboto',
   },
   dropdownModalSubTitle: {
     fontSize: 12,
-    color: '#64748b',
+    color: colors.textSecondary,
     textAlign: 'center',
     marginBottom: 6,
     fontFamily: 'Roboto',
@@ -4968,7 +5188,7 @@ const styles = StyleSheet.create({
   confirmModalContent: {
     width: SCREEN_WIDTH - 48,
     maxWidth: 400,
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderRadius: 24,
     padding: 22,
     alignItems: 'center',
@@ -4977,7 +5197,7 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: '#d1fae5',
+    backgroundColor: colors.accentSurface,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 12,
@@ -4988,13 +5208,13 @@ const styles = StyleSheet.create({
   confirmTitle: {
     fontSize: 17,
     fontWeight: '900',
-    color: '#0b291d',
+    color: colors.text,
     marginBottom: 6,
     fontFamily: 'Roboto',
   },
   confirmDesc: {
     fontSize: 12.5,
-    color: '#64748b',
+    color: colors.textSecondary,
     textAlign: 'center',
     lineHeight: 17,
     marginBottom: 14,
@@ -5020,7 +5240,7 @@ const styles = StyleSheet.create({
   breakdownLabel: {
     fontSize: 9,
     fontWeight: '700',
-    color: '#334155',
+    color: colors.textSecondary,
     marginTop: 2,
     textAlign: 'center',
     fontFamily: 'Roboto',
@@ -5030,29 +5250,49 @@ const styles = StyleSheet.create({
     width: '100%',
     gap: 10,
   },
+  repairSuccessActions: {
+    width: '100%',
+    gap: 10,
+    flexShrink: 0,
+  },
+  repairSuccessActionBtn: {
+    width: '100%',
+    minHeight: 48,
+    flexShrink: 0,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  repairSuccessActionText: {
+    width: '100%',
+    textAlign: 'center',
+    lineHeight: 20,
+  },
   confirmCancelBtn: {
     flex: 1,
     paddingVertical: 12,
     borderRadius: 12,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     alignItems: 'center',
   },
   confirmCancelBtnText: {
     fontSize: 13,
     fontWeight: '800',
-    color: '#64748b',
+    color: colors.textSecondary,
   },
   confirmSubmitBtn: {
     flex: 2,
     paddingVertical: 12,
     borderRadius: 12,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     alignItems: 'center',
   },
   confirmSubmitBtnText: {
     fontSize: 13,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
   detailsPendingVerificationBanner: {
@@ -5079,7 +5319,7 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto',
   },
 
-  // Corrective Maintenance Dispatch & Rework card banners (Dashboard)
+  // Corrective Maintenance Dispatch card banners (Dashboard)
   correctiveDispatchCardTop: {
     borderRadius: 14,
     borderWidth: 1.2,
@@ -5114,44 +5354,6 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
     fontWeight: '600',
     lineHeight: 16,
-    fontFamily: 'Roboto',
-  },
-
-  reworkAlertCardTop: {
-    borderRadius: 14,
-    borderWidth: 1.2,
-    padding: 10,
-    marginBottom: 10,
-    gap: 4,
-  },
-  reworkAlertTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 6,
-  },
-  reworkAlertHeader: {
-    fontSize: 11,
-    fontWeight: '900',
-    letterSpacing: 0.6,
-    textTransform: 'uppercase',
-    fontFamily: 'Roboto',
-  },
-  reworkPriorityBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 10,
-  },
-  reworkPriorityBadgeText: {
-    fontSize: 10,
-    fontWeight: '800',
-    fontFamily: 'Roboto',
-  },
-  reworkAlertText: {
-    fontSize: 11.5,
-    fontWeight: '600',
-    lineHeight: 16,
-    fontStyle: 'italic',
     fontFamily: 'Roboto',
   },
 
@@ -5319,7 +5521,7 @@ const styles = StyleSheet.create({
   criticalPriorityPillSmallText: {
     fontSize: 9.5,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
   fieldDisplayContainer: {
@@ -5362,164 +5564,7 @@ const styles = StyleSheet.create({
   criticalPriorityPillText: {
     fontSize: 11,
     fontWeight: '900',
-    color: '#ffffff',
-    fontFamily: 'Roboto',
-  },
-
-  // Image 2: Quality Control & Rework Card in Details Screen
-  reworkDetailsCard: {
-    marginHorizontal: Spacing.four,
-    borderRadius: 22,
-    borderWidth: 2,
-    padding: 16,
-    marginBottom: 14,
-    gap: 12,
-  },
-  reworkDetailsTagRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  reworkDetailsTagText: {
-    fontSize: 11,
-    fontWeight: '900',
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-    fontFamily: 'Roboto',
-  },
-  reworkDetailsMainRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  reworkDetailsTitle: {
-    fontSize: 18,
-    fontWeight: '900',
-    letterSpacing: -0.3,
-    fontFamily: 'Roboto',
-  },
-  reworkReportPill: {
-    paddingHorizontal: 10,
-    paddingVertical: 3,
-    borderRadius: 20,
-    borderWidth: 1,
-  },
-  reworkReportPillText: {
-    fontSize: 11,
-    fontWeight: '800',
-    fontFamily: 'Roboto',
-  },
-  reworkUnitBox: {
-    borderRadius: 14,
-    borderWidth: 1,
-    padding: 10,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    gap: 8,
-  },
-  reworkTasksContainer: {
-    borderRadius: 14,
-    borderWidth: 1,
-    padding: 10,
-    gap: 6,
-  },
-  reworkTasksHeaderRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 2,
-  },
-  reworkTasksHeader: {
-    fontSize: 10.5,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    fontFamily: 'Roboto',
-  },
-  reworkTaskRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    borderRadius: 10,
-    borderWidth: 1,
-    gap: 8,
-  },
-  reworkTaskName: {
-    fontSize: 12,
-    fontWeight: '700',
-    fontFamily: 'Roboto',
-  },
-  reworkTaskStatusPill: {
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 8,
-    borderWidth: 1,
-  },
-  reworkTaskStatusText: {
-    fontSize: 10,
-    fontWeight: '800',
-    fontFamily: 'Roboto',
-  },
-  reworkInstructionsBox: {
-    borderRadius: 14,
-    borderWidth: 1,
-    padding: 12,
-    gap: 4,
-  },
-  reworkInstructionsLabel: {
-    fontSize: 10.5,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    fontFamily: 'Roboto',
-  },
-  reworkInstructionsText: {
-    fontSize: 12.5,
-    lineHeight: 18,
-    fontStyle: 'italic',
-    fontFamily: 'Roboto',
-  },
-  reworkMetaRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
-  reworkMetaCol: {
-    borderRadius: 14,
-    borderWidth: 1,
-    padding: 10,
-    gap: 4,
-  },
-  amberPriorityPill: {
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderRadius: 8,
-    alignSelf: 'flex-start',
-  },
-  amberPriorityPillText: {
-    fontSize: 11,
-    fontWeight: '900',
-    color: '#000000',
-    fontFamily: 'Roboto',
-  },
-  reworkMetaPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 12,
-    borderWidth: 1,
-  },
-  reworkMetaPillText: {
-    fontSize: 11,
-    fontWeight: '700',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
 
@@ -5558,7 +5603,7 @@ const styles = StyleSheet.create({
   linkedParentActionBtnText: {
     fontSize: 11,
     fontWeight: '800',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
 
@@ -5721,7 +5766,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 6,
-    backgroundColor: 'rgba(56, 189, 248, 0.15)',
+    backgroundColor: colors.infoSurface,
   },
   dispatchEditBtn: {
     width: 24,
@@ -5754,11 +5799,11 @@ const styles = StyleSheet.create({
   dispatchSubmitVerificationBtnText: {
     fontSize: 12,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
 
-  // Connected Rework & Repair Count Badges on Dashboard Card
+  // Connected Repair Count Badges on Dashboard Card
   cardBadgesRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -5813,7 +5858,7 @@ const styles = StyleSheet.create({
   connectedCardPillText: {
     fontSize: 10,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
   connectedCardInstructions: {
@@ -5843,11 +5888,11 @@ const styles = StyleSheet.create({
   connectedCardBtnText: {
     fontSize: 12,
     fontWeight: '900',
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontFamily: 'Roboto',
   },
 
-  // Dedicated Rework & Repair Page Styles
+  // Dedicated Repair Page Styles
   pageInstructionCard: {
     marginHorizontal: Spacing.four,
     borderRadius: 16,
@@ -5874,7 +5919,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingTop: 6,
     borderTopWidth: 1,
-    borderTopColor: 'rgba(255, 255, 255, 0.08)',
+    borderTopColor: colors.border,
     gap: 6,
     flexWrap: 'wrap',
   },
@@ -5950,3 +5995,4 @@ const styles = StyleSheet.create({
     borderRadius: 7,
   },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };

@@ -1,7 +1,19 @@
+import { invalidateReferenceRows, metadataChanged } from './query-utils';
+import { imageReference, displayImage, clearImageCache, isImageSignature } from './private-images';
+import { createAuthService } from './auth-service';
+import { updateMaintenanceReportRpc, submitRepairRpc, type MaintenanceUpdateParams, type MaintenanceMutationContext } from './maintenance-rpc';
+import { Platform } from 'react-native';
+import { exactMatchFilter, fetchAccessibleRows, readWithTimeout, type ReadScope } from './query-utils';
+import { isChecklistItemComplete, isRepairDone, isRepairAwaitingVerification } from './maintenance-status';
+import { remoteObservation, selectSettings } from './receiver-state';
+import { CloudHardware, connectionStatus, type CloudDeviceState } from './cloud-hardware';
+import { applyHomeControllerState, mergeHomeSettings } from './home-controller-state';
+import { functionalDeviceText, measuredRotation } from './sensor-readings';
+import { resolveEquipmentDisplay, refreshEquipmentText, equipmentDisplayName, equipmentType, type EquipmentDisplayContext, type EquipmentDisplaySeed } from './equipment-display';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createClient } from '@supabase/supabase-js';
 
-// Sensor Data Model
+// AC Controller & Telemetry Data Model
 export interface SensorData {
   id: string;
   name: string;
@@ -12,7 +24,15 @@ export interface SensorData {
   location: string;
   aircon?: string;
   ventTemp?: string;
-  pressure?: string;
+  measurementAt?: string;
+  sensorConfig?: Record<string, any> | null;
+  sensorConfigAt?: string;
+  reportIntervalSeconds?: number;
+  nodeReadingAt?: string;
+  powerFeedback?: { value: boolean | null; observedAt: string };
+  rotation_rpm?: number | null;
+  rotation_quality?: 'ok' | 'missing' | 'fault';
+  deviceMode?: 'monitoring' | 'controller' | 'both';
   battery?: string;
   building?: string;
   floor?: string;
@@ -20,9 +40,19 @@ export interface SensorData {
   sensorName?: string;
   acType?: string;
   acId?: string;
+  airconId?: string; // Exact cloud AC identity for scoped current settings reads.
   activeReportId?: string;
   maintenanceStatus?: string;
   maintenancePriority?: 'High' | 'Medium' | 'Low';
+  connectionState?: 'online' | 'offline' | 'sleeping' | 'unavailable';
+  powerSetting?: 'on' | 'off';
+  operatingMode?: string;
+  fanMode?: string;
+  setpoint?: number;
+  specialFunctions?: string[];
+  lastSeen?: string;
+  sleepingUntil?: string | null;
+  settingsSnapshot?: Record<string, any>;
   // Desktop middle telemetry properties
   wakeTime?: string;
   sleepTime?: string;
@@ -34,7 +64,17 @@ export interface SensorData {
   updatedTime?: string;
   roomId?: string | null;
   isAssignedToRoom?: boolean;
+  // Admin Desktop Parity
+  brand?: string;
+  airconBrand?: string;
+  associatedAc?: string;
+  model?: string;
+  serialNumber?: string;
+  pirOccupancy?: string;
+  dailySchedule?: string;
 }
+
+export type AcControllerData = SensorData;
 
 // Supabase Connection Credentials
 export const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL || '';
@@ -46,23 +86,39 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   );
 }
 
-// Supabase Client Instance configured with AsyncStorage session persistence
+// Native AsyncStorage works without a browser window; SSR must not fabricate one.
+const isClient = Platform.OS !== 'web' || typeof window !== 'undefined';
+const ssrSafeAuthStorage = {
+  getItem: (key: string) => isClient ? AsyncStorage.getItem(key) : Promise.resolve(null),
+  setItem: (key: string, value: string) => isClient ? AsyncStorage.setItem(key, value) : Promise.resolve(),
+  removeItem: (key: string) => isClient ? AsyncStorage.removeItem(key) : Promise.resolve(),
+};
+
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
-    storage: AsyncStorage,
-    autoRefreshToken: true,
-    persistSession: true,
+    storage: ssrSafeAuthStorage,
+    autoRefreshToken: isClient,
+    persistSession: isClient,
     detectSessionInUrl: false,
   },
 });
 
+supabase.auth.onAuthStateChange?.(() => { clearImageCache(supabase); invalidateReferenceRows(supabase); });
+
+const STAFF_PROFILE_COLUMNS = 'id,name,email,phone,role,status,room_id,room_name,floor_name,building_name,assignment,is_archived,force_logout,avatar,photo_url,avatar_url,updated';
+
 // Database Models
 export interface DbNode {
+  sensor_config?: Record<string, any> | null;
   id: string;
   name: string;
   status: string;
   temp: number | null;
-  pressure: number | null;
+  rotation_rpm?: number | null;
+  rotation_quality?: 'ok' | 'missing' | 'fault';
+  last_measurement_at?: string | null;
+  device_mode?: 'monitoring' | 'controller' | 'both';
+  monitor_aircon_id?: string | null;
   rssi: number | null;
   battery: number | null;
   wake_time: string | null;
@@ -71,11 +127,31 @@ export interface DbNode {
   interval_unit: string | null;
   room_id: string | null;
   aircon_type: string | null;
+  brand?: string | null;
+  mac_address?: string | null;
+  ip_address?: string | null;
+  wifi_ssid?: string | null;
+  protocol_name?: string | null;
   install_date: string | null;
   created: string;
   updated: string;
   photo_url?: string | null;
   image_url?: string | null;
+}
+
+export interface DbAircon {
+  id: string;
+  asset_tag: string;
+  brand: string;
+  model?: string | null;
+  aircon_type?: string | null;
+  room_id?: string | null;
+  node_id?: string | null;
+  protocol?: string | null;
+  protocol_name?: string | null;
+  status: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface DbRoom {
@@ -166,7 +242,7 @@ export interface DbTelemetry {
   building_name?: string | null;
   aircon_type?: string | null;
   temperature: number;
-  pressure: number;
+  rotation_rpm?: number | null;
   battery: number;
   rssi: number;
   status: string;
@@ -186,6 +262,7 @@ export interface DbAdministrator {
 }
 
 export interface AppUser {
+  authUserId?: string;
   id: string;
   name: string;
   email: string;
@@ -206,7 +283,7 @@ export interface AppUser {
 
 // Convert Battery Voltage (e.g. 4.08V, 4.15V, 4.2V) or raw value to percentage string matching desktop
 function formatBatteryPercent(battery: number | null | undefined): string {
-  if (battery == null) return '100%';
+  if (battery == null) return '—';
   if (battery <= 5) {
     // Desktop battery formula: percentage of 4.2V max voltage (e.g. 4.08V -> 97%, 4.15V -> 99%, 4.18V -> 100%)
     const pct = Math.min(100, Math.max(0, Math.round((battery / 4.2) * 100)));
@@ -217,7 +294,7 @@ function formatBatteryPercent(battery: number | null | undefined): string {
 
 // Format temperature string for display matching desktop (e.g. '24.5 °C')
 function formatTemperature(tempC: number | null | undefined): { fahrenheit: string; celsius: string } {
-  if (tempC == null) return { fahrenheit: '72.0 °F', celsius: '22.0 °C' };
+  if (tempC == null) return { fahrenheit: '—', celsius: '—' };
   const f = ((tempC * 9) / 5 + 32).toFixed(1);
   const c = typeof tempC === 'number' ? `${tempC.toFixed(1)} °C` : `${tempC} °C`;
   return { fahrenheit: `${f} °F`, celsius: c };
@@ -249,7 +326,7 @@ export function formatInterval(val?: number | null, unit?: string | null): strin
 
 // Format signal strength label and dBm text from RSSI
 export function formatSignalStrength(rssi?: number | null): { label: string; text: string; quality: 'weak' | 'fair' | 'strong' } {
-  if (rssi == null) return { label: 'WEAK', text: '-85 dBm', quality: 'weak' };
+  if (rssi == null) return { label: '—', text: '—', quality: 'weak' };
   const val = Number(rssi);
   let label = 'WEAK';
   let quality: 'weak' | 'fair' | 'strong' = 'weak';
@@ -301,24 +378,25 @@ export interface WorkerAssignmentResult {
 // Dynamically verify and resolve worker's room assignment against active database hierarchy.
 // If the assigned room, floor, or building was erased/deleted by an admin, the worker is automatically assigned as "Unassigned".
 export async function resolveWorkerAssignment(
-  workerIdentifier?: string
+  workerIdentifier?: string, scope?: ReadScope
 ): Promise<WorkerAssignmentResult> {
   try {
     const cleanId = (workerIdentifier || '').trim();
+    if (!cleanId) return { isAssigned: false, roomId: null, roomName: 'Unassigned', floorName: '', buildingName: '', assignmentText: 'Unassigned' };
 
     const [staffRes, roomsRes, floorsRes, buildingsRes] = await Promise.all([
-      cleanId
-        ? supabase
+      readWithTimeout(signal => supabase
           .from('staff')
-          .select('*')
-          .or(`id.eq.${cleanId},email.ilike.%${cleanId}%,phone.ilike.%${cleanId}%,name.ilike.%${cleanId}%`)
+          .select(STAFF_PROFILE_COLUMNS)
+          .or(exactMatchFilter(['id', 'email', 'phone', 'name'], cleanId))
           .limit(1)
-        : supabase.from('staff').select('*').order('created', { ascending: false }).limit(1),
-      supabase.from('rooms').select('*'),
-      supabase.from('floors').select('*'),
-      supabase.from('buildings').select('*'),
+          .abortSignal(signal)),
+      fetchAccessibleRows(supabase, 'rooms', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'floors', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'buildings', '*', undefined, scope),
     ]);
 
+    scope?.recordError(staffRes.error);
     const staffMember = staffRes.data && staffRes.data.length > 0 ? staffRes.data[0] : null;
     const rooms: DbRoom[] = roomsRes.data || [];
     const floors: DbFloor[] = floorsRes.data || [];
@@ -329,6 +407,19 @@ export async function resolveWorkerAssignment(
 
     const buildingsMap = new Map<string, DbBuilding>();
     buildings.forEach((b) => buildingsMap.set(b.id, b));
+
+    // Concrete room IDs are authoritative even when saved display names are stale.
+    const concreteRoomId = String(staffMember?.room_id || '').trim();
+    if (concreteRoomId && !['all', 'all_rooms'].includes(concreteRoomId.toLowerCase())) {
+      const room = rooms.find(item => item.id === concreteRoomId);
+      const floor = room?.floor_id ? floorsMap.get(room.floor_id) : undefined;
+      const building = floor?.building_id ? buildingsMap.get(floor.building_id) : undefined;
+      if (room && floor && building) return { isAssigned: true, roomId: room.id,
+        roomName: room.name, floorName: floor.name, buildingName: building.name,
+        assignmentText: `${building.name} • ${floor.name} • ${room.name}` };
+      return { isAssigned: false, roomId: null, roomName: 'Unassigned', floorName: '',
+        buildingName: '', assignmentText: 'Unassigned' };
+    }
 
     // If staff member has no assignment or explicitly unassigned
     if (
@@ -354,8 +445,8 @@ export async function resolveWorkerAssignment(
     const rawAssign = (staffMember.assignment || '').trim();
     const rawRoomId = (staffMember.room_id || '').trim();
 
-    const isAllBld = rawBld.toLowerCase().includes('all') || rawAssign.toLowerCase().includes('all building') || staffMember.building_id === 'all_buildings';
-    const isAllFlr = rawFlr.toLowerCase().includes('all') || rawAssign.toLowerCase().includes('all floor') || staffMember.floor_id === 'all_floors';
+    const isAllBld = rawBld.toLowerCase().includes('all') || rawAssign.toLowerCase().includes('all building');
+    const isAllFlr = rawFlr.toLowerCase().includes('all') || rawAssign.toLowerCase().includes('all floor');
     const isAllRm = rawRm.toLowerCase().includes('all') || rawAssign.toLowerCase().includes('all room') || rawRoomId === 'all_rooms' || rawRoomId === 'ALL';
 
     if (isAllBld || isAllFlr || isAllRm) {
@@ -387,19 +478,7 @@ export async function resolveWorkerAssignment(
 
     // If room does NOT exist (it was erased by admin on desktop)
     if (!matchingRoom) {
-      if (staffMember.id && staffMember.assignment !== 'Unassigned') {
-        await supabase
-          .from('staff')
-          .update({
-            room_id: null,
-            room_name: null,
-            floor_name: null,
-            building_name: null,
-            assignment: 'Unassigned',
-            updated: new Date().toISOString(),
-          })
-          .eq('id', staffMember.id);
-      }
+      // Missing or inaccessible related data is not evidence of a deleted assignment.
       return {
         isAssigned: false,
         roomId: null,
@@ -416,19 +495,7 @@ export async function resolveWorkerAssignment(
 
     if (!floor || !building) {
       // Floor or building was erased by admin on desktop
-      if (staffMember.id && staffMember.assignment !== 'Unassigned') {
-        await supabase
-          .from('staff')
-          .update({
-            room_id: null,
-            room_name: null,
-            floor_name: null,
-            building_name: null,
-            assignment: 'Unassigned',
-            updated: new Date().toISOString(),
-          })
-          .eq('id', staffMember.id);
-      }
+      // Missing or inaccessible related data is not evidence of a deleted assignment.
       return {
         isAssigned: false,
         roomId: null,
@@ -449,6 +516,7 @@ export async function resolveWorkerAssignment(
       assignmentText,
     };
   } catch (err) {
+      scope?.recordError(err);
     console.error('Error resolving worker assignment:', err);
     return {
       isAssigned: false,
@@ -462,14 +530,14 @@ export async function resolveWorkerAssignment(
 }
 
 // Fetch active room information for worker's assigned room
-export async function fetchActiveRoom(assignedRoomId?: string | null): Promise<ActiveRoomData | null> {
+export async function fetchActiveRoom(assignedRoomId?: string | null, scope?: ReadScope): Promise<ActiveRoomData | null> {
   if (!assignedRoomId) return null;
 
   if (assignedRoomId === 'ALL' || assignedRoomId === 'all_rooms') {
     try {
       const [roomsRes, nodesRes] = await Promise.all([
-        supabase.from('rooms').select('*'),
-        supabase.from('nodes').select('id, room_id'),
+        fetchAccessibleRows(supabase, 'rooms', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'nodes', scope ? '*' : 'id, room_id', undefined, scope),
       ]);
       const rooms: DbRoom[] = roomsRes.data || [];
       const nodes: any[] = nodesRes.data || [];
@@ -487,6 +555,7 @@ export async function fetchActiveRoom(assignedRoomId?: string | null): Promise<A
         capacityPercentage,
       };
     } catch (err) {
+      scope?.recordError(err);
       console.error('Failed to fetch aggregate room data:', err);
       return {
         id: 'ALL',
@@ -502,10 +571,12 @@ export async function fetchActiveRoom(assignedRoomId?: string | null): Promise<A
 
   try {
     const [roomsRes, floorsRes, buildingsRes, nodesRes] = await Promise.all([
-      supabase.from('rooms').select('*').eq('id', assignedRoomId),
-      supabase.from('floors').select('*'),
-      supabase.from('buildings').select('*'),
-      supabase.from('nodes').select('id, room_id'),
+      scope
+        ? fetchAccessibleRows(supabase, 'rooms', '*', undefined, scope).then(result => ({ ...result, data: result.data?.filter(room => room.id === assignedRoomId) ?? null }))
+        : supabase.from('rooms').select('*').eq('id', assignedRoomId),
+      fetchAccessibleRows(supabase, 'floors', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'buildings', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'nodes', scope ? '*' : 'id, room_id', scope ? query => query.eq('room_id', assignedRoomId) : undefined, scope, `room:${assignedRoomId}`),
     ]);
 
     const targetRoom: DbRoom | undefined = (roomsRes.data || [])[0];
@@ -537,6 +608,7 @@ export async function fetchActiveRoom(assignedRoomId?: string | null): Promise<A
       capacityPercentage,
     };
   } catch (err) {
+      scope?.recordError(err);
     console.error('Failed to fetch active room data:', err);
     return null;
   }
@@ -545,26 +617,24 @@ export async function fetchActiveRoom(assignedRoomId?: string | null): Promise<A
 // Map live Supabase tables (nodes, telemetry, rooms, floors, buildings) to frontend SensorData
 // IMPORTANT: Only returns sensor nodes actively assigned to the worker's room.
 // If the worker is Unassigned (roomId is null), returns an empty array.
-export async function fetchLiveSensors(roomId?: string | null): Promise<SensorData[]> {
+export async function fetchLiveSensors(roomId?: string | null, scope?: ReadScope): Promise<SensorData[]> {
   if (!roomId) {
     return [];
   }
   const isUniversal = roomId === 'ALL' || roomId === 'all_rooms';
   try {
-    let nodesQuery = supabase.from('nodes').select('*').order('id', { ascending: true });
-    if (!isUniversal) {
-      nodesQuery = nodesQuery.eq('room_id', roomId);
-    }
-    let roomsQuery = supabase.from('rooms').select('*');
-    if (!isUniversal) {
-      roomsQuery = roomsQuery.eq('id', roomId);
-    }
-    const [nodesRes, roomsRes, floorsRes, buildingsRes, reportsRes] = await Promise.all([
+    const nodesQuery = fetchAccessibleRows(supabase, 'nodes', '*', isUniversal ? undefined : query => query.eq('room_id', roomId), scope, isUniversal ? undefined : `room:${roomId}`);
+    const roomsQuery = scope
+      ? fetchAccessibleRows(supabase, 'rooms', '*', undefined, scope)
+      : fetchAccessibleRows(supabase, 'rooms', '*', query => isUniversal ? query : query.eq('id', roomId));
+    const [nodesRes, roomsRes, floorsRes, buildingsRes, reportsRes, airconsRes, hardwareRes] = await Promise.all([
       nodesQuery,
       roomsQuery,
-      supabase.from('floors').select('*'),
-      supabase.from('buildings').select('*'),
-      supabase.from('maintenance_reports').select('id, aircon_id, aircon_name, status, priority'),
+      fetchAccessibleRows(supabase, 'floors', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'buildings', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'maintenance_reports', 'id, aircon_id, aircon_name, status, priority', undefined, scope),
+      fetchAccessibleRows(supabase, 'aircons', '*', undefined, scope),
+      CloudHardware.list(scope),
     ]);
 
     if (nodesRes.error) {
@@ -583,16 +653,17 @@ export async function fetchLiveSensors(roomId?: string | null): Promise<SensorDa
     (buildingsRes.data || []).forEach((b: DbBuilding) => buildingsMap.set(b.id, b));
 
     const dbReports = reportsRes.data || [];
+    const dbAircons: any[] = airconsRes.data || [];
 
     return nodes.map((node, index) => {
       const room = node.room_id ? roomsMap.get(node.room_id) : undefined;
       const floor = room?.floor_id ? floorsMap.get(room.floor_id) : undefined;
       const building = floor?.building_id ? buildingsMap.get(floor.building_id) : undefined;
 
-      const roomName = room?.name || 'room 1';
-      const floorName = floor?.name || 'first floor';
-      const buildingName = building?.name || 'main campus';
-      const location = `${buildingName}, ${floorName}`;
+      const roomName = room?.name || 'Unassigned';
+      const floorName = floor?.name || '';
+      const buildingName = building?.name || '';
+      const location = [buildingName, floorName].filter(Boolean).join(', ');
 
       const rawTemp = node.temp;
       const { fahrenheit, celsius } = formatTemperature(rawTemp);
@@ -601,49 +672,66 @@ export async function fetchLiveSensors(roomId?: string | null): Promise<SensorDa
       // Determine status from temperature and status field
       let status: 'optimal' | 'warning' | 'critical' = 'optimal';
       let statusLabel = 'Optimal';
-      let details = 'Operating within acceptable thresholds. Cooling systems are active and efficient.';
+      let details = 'Sensor measurements are within acceptable thresholds.';
 
-      const tempVal = rawTemp ?? 23;
-      const nodeStatus = (node.status || 'online').toLowerCase();
-      if (tempVal >= 28 || nodeStatus === 'critical' || nodeStatus === 'offline') {
+      const tempVal = typeof rawTemp === 'number' && Number.isFinite(rawTemp) ? rawTemp : null;
+      const hardware = hardwareRes.find(state => state.node_id === node.id);
+      const nodeStatus = hardware ? connectionStatus(hardware) : 'unavailable';
+      if (nodeStatus === 'offline') {
+        status = 'critical';
+        statusLabel = 'Offline';
+        details = 'Sensor node is currently offline and unreachable.';
+      } else if (tempVal === null) {
+        statusLabel = 'Reading unavailable';
+        details = 'No temperature reading has been reported by this device.';
+      } else if (tempVal >= 28 || (node.status || '').toLowerCase() === 'critical') {
         status = 'critical';
         statusLabel = 'Critical Temp';
         details = 'High temperature threshold breached. Immediate vent and coil inspection required.';
-      } else if (tempVal >= 25 || nodeStatus === 'warning') {
+      } else if (tempVal >= 25 || (node.status || '').toLowerCase() === 'warning') {
         status = 'warning';
         statusLabel = 'Checklist Due';
-        details = 'Airflow restriction detected. Filter cleaning scheduled in maintenance checklist.';
+        details = 'Temperature requires attention. Check the maintenance checklist.';
       }
 
-      // Check genuine maintenance report for this sensor node from database
-      const matchedReport = dbReports.find(
-        (r: any) =>
-          (r.aircon_id === node.id || r.aircon_name === node.name) &&
-          r.status !== 'Completed' &&
-          r.status !== 'Verified'
-      );
-      const activeReportId = matchedReport ? matchedReport.id : undefined;
       const acId = `AC-${String(index + 2).padStart(3, '0')}`;
 
-      // Pressure in kPa matching desktop (e.g. 0.5 kPa / 0.6 kPa)
-      const rawPressure = node.pressure;
-      const pressureStr = rawPressure != null ? `${Number(rawPressure).toFixed(1)} kPa` : '0.5 kPa';
+      // Only exact, unambiguous controller bindings may supply this unit's state.
+      const nodeKeys = [String(node.id || '').toLowerCase(), String(node.name || '').toLowerCase()].filter(Boolean);
+      const matches = dbAircons.filter((ac: any) => node.monitor_aircon_id ? ac.id === node.monitor_aircon_id : ac.controller_node_id
+        ? String(ac.controller_node_id).toLowerCase() === String(node.id).toLowerCase()
+        : ac.node_id && nodeKeys.includes(String(ac.node_id).toLowerCase()));
+      const matchedAc = matches.length === 1 ? matches[0] : undefined;
+      // Reports refer to AC assets. Device names are mutable and cannot establish ownership.
+      const matchedReport = matchedAc ? dbReports.find((r: any) =>
+        r.aircon_id === matchedAc.id && r.status !== 'Completed' && r.status !== 'Verified') : undefined;
+      const activeReportId = matchedReport?.id;
 
-      // Aircon state badge matching desktop (ACTIVE COOLING / STANDBY)
-      const isOnline = nodeStatus !== 'offline';
-      const airconStateText = isOnline ? 'ACTIVE COOLING' : 'STANDBY';
-      const airconType = node.aircon_type || 'Split Type (Inverter)';
+      const snapshot = matchedAc ? { ...matchedAc, ...remoteObservation(hardware?.latest_ir, hardware?.last_seen, matchedAc) } : null;
+      const settings = selectSettings(snapshot).state;
+      const summary = !matchedAc ? 'No linked AC' : !settings ? '—' :
+        [settings.power === true || settings.power === 'on' ? 'ON' : settings.power === false || settings.power === 'off' ? 'OFF' : '',
+          settings.mode ? String(settings.mode).toUpperCase() : '', settings.fan ? String(settings.fan).toUpperCase() + ' FAN' : '',
+          settings.turbo === true ? 'TURBO' : ''].filter(Boolean).join(' · ') || '—';
+      const airconStateText = nodeStatus === 'offline' ? 'OFFLINE · ' + summary : nodeStatus === 'sleeping' ? 'SLEEPING · ' + summary : summary;
+
+      const airconBrand = matchedAc?.brand?.trim() || (node as any).brand?.trim() || (node as any).aircon_brand?.trim() || '';
+      const airconProtocol = matchedAc?.protocol_name || matchedAc?.protocol || node.protocol_name;
+      const airconModelType = equipmentType(matchedAc?.aircon_type || matchedAc?.model || node.aircon_type, airconProtocol) || '';
+      const customAirconName = equipmentDisplayName(matchedAc?.name, [matchedAc?.id, node.id], airconProtocol);
+      const associatedAc = matchedAc ? [customAirconName || 'Name unavailable', airconModelType].filter(Boolean).join(' · ') : 'No linked AC';
 
       // Signal Strength & Schedule details from nodes table
       const signalInfo = formatSignalStrength(node.rssi);
-      const wakeTimeFormatted = formatTimeAmPm(node.wake_time || '06:00');
-      const sleepTimeFormatted = formatTimeAmPm(node.sleep_time || '22:00');
-      const intervalFormatted = formatInterval(node.interval_val || 1, node.interval_unit || 'Hours');
-      const updatedTimeFormatted = formatUpdatedTime(node.updated);
+      const wakeTimeFormatted = node.wake_time ? formatTimeAmPm(node.wake_time) : '';
+      const sleepTimeFormatted = node.sleep_time ? formatTimeAmPm(node.sleep_time) : '';
+      const intervalFormatted = node.interval_val ? formatInterval(node.interval_val, node.interval_unit || 'Hours') : '';
+      const updatedTimeFormatted = hardware?.last_seen ? formatUpdatedTime(hardware.last_seen) : 'Unverified';
 
-      return {
+      return applyHomeControllerState({
+        settingsSnapshot: snapshot || undefined,
         id: node.id,
-        name: `${node.name} (${roomName})`,
+        name: equipmentDisplayName(node.name, [node.id]) || `Device ${index + 1}`,
         value: celsius,
         status,
         statusLabel,
@@ -651,14 +739,20 @@ export async function fetchLiveSensors(roomId?: string | null): Promise<SensorDa
         location,
         aircon: airconStateText,
         ventTemp: celsius,
-        pressure: pressureStr,
+        nodeReadingAt: node.updated || undefined,
+        sensorConfig: node.sensor_config, sensorConfigAt: node.updated || undefined,
+        reportIntervalSeconds: node.interval_val ? node.interval_val * ({seconds:1,minutes:60,hours:3600}[String(node.interval_unit).toLowerCase()] || 0) : undefined,
+        rotation_rpm: measuredRotation(node.rotation_rpm, node.rotation_quality),
+        rotation_quality: node.rotation_quality,
+        deviceMode: node.device_mode || 'controller',
         battery: batteryStr,
-        building: buildingName,
-        floor: floorName,
-        room: roomName,
-        sensorName: node.name,
-        acType: airconType,
+        building: buildingName || undefined,
+        floor: floorName || undefined,
+        room: roomName !== 'Unassigned' ? roomName : undefined,
+        sensorName: equipmentDisplayName(node.name, [node.id]) || `Device ${index + 1}`,
+        acType: airconModelType || undefined,
         acId,
+        airconId: matchedAc?.id,
         activeReportId,
         maintenanceStatus: matchedReport
           ? (matchedReport.status || (status === 'optimal' ? 'In Progress' : 'Checklist Due'))
@@ -667,45 +761,89 @@ export async function fetchLiveSensors(roomId?: string | null): Promise<SensorDa
           ? ((matchedReport as any)?.priority || (status === 'critical' ? 'High' : status === 'warning' ? 'Medium' : 'Low'))
           : 'Low',
         // Desktop middle telemetry properties
-        wakeTime: wakeTimeFormatted,
-        sleepTime: sleepTimeFormatted,
-        interval: intervalFormatted,
-        rssi: node.rssi ?? -85,
+        wakeTime: wakeTimeFormatted || undefined,
+        sleepTime: sleepTimeFormatted || undefined,
+        interval: intervalFormatted || undefined,
+        rssi: node.rssi ?? null,
         signalStrengthLabel: signalInfo.label,
         signalStrengthDbm: signalInfo.text,
         airconState: airconStateText,
         updatedTime: updatedTimeFormatted,
         roomId: node.room_id,
         isAssignedToRoom: true,
-      };
+        // Admin Desktop Configuration Parity
+        brand: airconBrand || undefined,
+        airconBrand: airconBrand || undefined,
+        associatedAc: associatedAc || undefined,
+        model: (node as any).model || matchedAc?.model || undefined,
+        serialNumber: hardware?.device_id || (node as any).serial || node.id || '—',
+        pirOccupancy: (node as any).pir_status || (node as any).occupancy || undefined,
+        dailySchedule: (wakeTimeFormatted && sleepTimeFormatted) ? `${wakeTimeFormatted} - ${sleepTimeFormatted}` : undefined,
+      }, { ...nodeMeasurement(node), ...hardware });
     });
   } catch (error) {
+      scope?.recordError(error);
     console.error('Failed to fetch live sensors:', error);
     return [];
   }
 }
 
+export const fetchLiveAcControllers = fetchLiveSensors;
+
+function nodeMeasurement(row: Record<string, any>): CloudDeviceState {
+  return { node_id: row.id, device_id: '', node_updated_at: row.updated, measurement_at: row.last_measurement_at,
+    ...Object.fromEntries(['temp', 'rotation_rpm', 'rotation_quality', 'sensor_config'].filter(key => Object.prototype.hasOwnProperty.call(row, key)).map(key => [key, row[key]])) };
+}
+
+/** Current observations remain available after archived delivery-queue rows are removed. */
+export async function fetchLiveSensorReadings(nodeIds: string[], airconIds: Record<string, string> = {}): Promise<CloudDeviceState[]> {
+  const ids = [...new Set(nodeIds.filter(Boolean))], rows: CloudDeviceState[] = [];
+  for (let offset = 0; offset < ids.length; offset += 100) {
+    const batch = ids.slice(offset, offset + 100);
+    const acIds = [...new Set(batch.map(id => airconIds[id]).filter(Boolean))];
+    const [nodes, aircons] = await Promise.allSettled([
+      readWithTimeout(signal => supabase.from('nodes').select('id,temp,rotation_rpm,rotation_quality,last_measurement_at,updated,sensor_config').in('id', batch).abortSignal(signal)),
+      acIds.length ? readWithTimeout(signal => supabase.from('aircons').select('*').in('id', acIds).abortSignal(signal)) : Promise.resolve({data:[],error:null}),
+    ]);
+    const latest = new Map<string, CloudDeviceState>();
+    if (nodes.status === 'fulfilled' && !nodes.value.error) for (const row of nodes.value.data || []) {
+      if (batch.includes(row.id)) latest.set(row.id, nodeMeasurement(row));
+    }
+    if (aircons.status === 'fulfilled' && !aircons.value.error) for (const id of batch) {
+      const ac = (aircons.value.data || []).find(row => row.id === airconIds[id]);
+      if (!ac) continue;
+      const previous = latest.get(id) || {node_id:id,device_id:''};
+      latest.set(id, {...previous,control_snapshot:mergeHomeSettings(previous.control_snapshot,ac)});
+    }
+    rows.push(...latest.values());
+  }
+  return rows;
+}
+
 // Real-time subscription to nodes, rooms, floors, buildings, and staff
-export function subscribeToNodes(onUpdate: () => void) {
+export function subscribeToNodes(onUpdate: (row?: CloudDeviceState) => void) {
   const channelId = `nodes_rooms_staff_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const channel = supabase
     .channel(channelId)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'nodes' }, () => {
-      onUpdate();
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'ecotrack_device_state' }, payload => {
+      const row = payload.new as CloudDeviceState;
+      onUpdate(row?.node_id ? row : undefined);
     })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, () => {
-      onUpdate();
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'nodes' }, payload => {
+      const row = payload.new as Record<string, any>;
+      if (row?.id && payload.eventType !== 'DELETE') onUpdate(nodeMeasurement(row));
+      if (metadataChanged(supabase, 'nodes', payload)) onUpdate();
     })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, () => {
-      onUpdate();
-    })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, () => {
-      onUpdate();
-    })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, () => { invalidateReferenceRows(supabase, 'rooms'); onUpdate(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, () => { invalidateReferenceRows(supabase, 'floors'); onUpdate(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, () => { invalidateReferenceRows(supabase, 'buildings'); onUpdate(); })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'staff' }, () => {
       onUpdate();
     })
-    .subscribe();
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'aircons' }, () => {
+      onUpdate();
+    })
+    .subscribe(status => { if (status === 'SUBSCRIBED') onUpdate(); });
 
   return () => {
     supabase.removeChannel(channel);
@@ -747,7 +885,7 @@ export interface AppNotificationItem {
   time: string;
   read: boolean;
   type: 'critical' | 'warning' | 'info' | 'optimal';
-  category: 'temp' | 'pressure' | 'report' | 'hvac';
+  category: 'temp' | 'rotation' | 'report' | 'hvac';
   building?: string;
   floor?: string;
   room?: string;
@@ -758,9 +896,9 @@ export async function fetchLiveNotifications(): Promise<AppNotificationItem[]> {
   try {
     const [notifRes, roomsRes, floorsRes, buildingsRes] = await Promise.all([
       supabase.from('notifications').select('*').order('created', { ascending: false }).limit(50),
-      supabase.from('rooms').select('*'),
-      supabase.from('floors').select('*'),
-      supabase.from('buildings').select('*'),
+      fetchAccessibleRows(supabase, 'rooms', '*'),
+      fetchAccessibleRows(supabase, 'floors', '*'),
+      fetchAccessibleRows(supabase, 'buildings', '*'),
     ]);
 
     if (notifRes.error) {
@@ -784,9 +922,9 @@ export async function fetchLiveNotifications(): Promise<AppNotificationItem[]> {
       const floor = room?.floor_id ? floorsMap.get(room.floor_id) : undefined;
       const building = floor?.building_id ? buildingsMap.get(floor.building_id) : undefined;
 
-      const content = item.content || 'System notification alert';
+      const content = functionalDeviceText(item.content || 'System notification alert');
       let type: 'critical' | 'warning' | 'info' | 'optimal' = 'info';
-      let category: 'temp' | 'pressure' | 'report' | 'hvac' = 'hvac';
+      let category: 'temp' | 'rotation' | 'report' | 'hvac' = 'hvac';
 
       const lower = content.toLowerCase();
       if (lower.includes('critical') || lower.includes('danger') || lower.includes('hot')) {
@@ -799,8 +937,8 @@ export async function fetchLiveNotifications(): Promise<AppNotificationItem[]> {
 
       if (lower.includes('temp') || lower.includes('hot') || lower.includes('cold')) {
         category = 'temp';
-      } else if (lower.includes('pressure') || lower.includes('bar')) {
-        category = 'pressure';
+      } else if (lower.includes('rpm') || lower.includes('rotation speed')) {
+        category = 'rotation';
       } else if (lower.includes('report') || lower.includes('shift')) {
         category = 'report';
       }
@@ -873,600 +1011,22 @@ export async function createNotification(content: string, roomId?: string): Prom
   }
 }
 
-// Authenticate user against Supabase `administrators` or `staff`
-export async function authenticateUser(
-  identifier: string,
-  passwordInput?: string
-): Promise<{
-  success: boolean;
-  user?: AppUser;
-  error?: string;
-  isArchived?: boolean;
-  archiveReason?: string;
-  archiveNotes?: string;
-  archivedAt?: string;
-}> {
-  try {
-    const cleanId = identifier.trim().toLowerCase();
-
-    // Password input is required
-    if (!passwordInput || typeof passwordInput !== 'string' || !passwordInput.trim()) {
-      return { success: false, error: 'Password is required to authenticate.' };
-    }
-
-    // 1. Check administrators table by email or username
-    const { data: admins, error: adminErr } = await supabase
-      .from('administrators')
-      .select('*')
-      .or(`email.ilike.${cleanId},username.ilike.${cleanId}`)
-      .limit(1);
-
-    if (!adminErr && admins && admins.length > 0) {
-      const admin = admins[0] as DbAdministrator;
-      const expectedAdminPassword =
-        admin.password ||
-        (await AsyncStorage.getItem(`ecotrack_admin_pwd_${admin.id}`)) ||
-        (await AsyncStorage.getItem(`ecotrack_admin_pwd_${cleanId}`));
-
-      if (expectedAdminPassword && typeof expectedAdminPassword === 'string' && expectedAdminPassword.trim().length > 0) {
-        if (expectedAdminPassword !== passwordInput) {
-          return {
-            success: false,
-            error: 'Incorrect password for administrator account.',
-          };
-        }
-      } else {
-        // If no password existed yet on this admin account, set it now to secure it
-        try {
-          await supabase.from('administrators').update({ password: passwordInput }).eq('id', admin.id);
-        } catch (e) { }
-        await AsyncStorage.setItem(`ecotrack_admin_pwd_${admin.id}`, passwordInput);
-      }
-
-      const adminPhoto = (admin as any).photo_url || (admin as any).avatar_url || null;
-      const user: AppUser = {
-        id: admin.id,
-        name: admin.username || 'Admin',
-        email: admin.email,
-        phone: '',
-        role: admin.role === 'admin' ? 'Facility Administrator' : admin.role,
-        userType: 'admin',
-        avatar: (adminPhoto ? 'custom' : ((admin as any).avatar || 'default')) as any,
-        photoUrl: adminPhoto,
-      };
-
-      // Save user session
-      await AsyncStorage.setItem('ecotrack_session_user', JSON.stringify(user));
-      return { success: true, user };
-    }
-
-    // 2. Check staff table by email, phone, or name
-    const cleanPhoneDigits = normalizePhoneNumber(identifier);
-    let staffQuery = supabase.from('staff').select('*');
-
-    if (cleanId.includes('@')) {
-      staffQuery = staffQuery.eq('email', cleanId);
-    } else if (cleanPhoneDigits && cleanPhoneDigits.length >= 7) {
-      staffQuery = staffQuery.or(`phone.ilike.%${cleanPhoneDigits}%,email.ilike.%${cleanId}%,name.ilike.%${cleanId}%`);
-    } else {
-      staffQuery = staffQuery.or(`email.ilike.%${cleanId}%,phone.ilike.%${cleanId}%,name.ilike.%${cleanId}%`);
-    }
-
-    const { data: staffList, error: staffErr } = await staffQuery.limit(1);
-
-    if (!staffErr && staffList && staffList.length > 0) {
-      const staffMember = staffList[0] as any;
-      const assignmentInfo = await resolveWorkerAssignment(staffMember.id);
-      const computedAssignment = assignmentInfo.assignmentText;
-
-      // Check if this staff account has been archived or deactivated by admin
-      const isArchived = isStaffArchived(staffMember);
-
-      if (isArchived) {
-        const archiveReason =
-          staffMember.archive_reason || 'Administrative / Compliance Deactivation';
-        const archiveNotes = staffMember.archive_notes || '';
-        const archivedAt = staffMember.archived_at || staffMember.updated || '';
-
-        return {
-          success: false,
-          isArchived: true,
-          archiveReason,
-          archiveNotes,
-          archivedAt,
-          user: {
-            id: staffMember.id,
-            name: staffMember.name || 'Technician',
-            email: staffMember.email || '',
-            phone: staffMember.phone || cleanId,
-            role: staffMember.role || 'HVAC / Aircon Technician',
-            userType: 'staff',
-            assignment: computedAssignment,
-            isArchived: true,
-            archiveReason,
-            archiveNotes,
-            archivedAt,
-          },
-          error: `This account is archived: ${archiveReason}`,
-        };
-      }
-
-      // STRICT PASSWORD VERIFICATION FOR STAFF
-      const dbPassword = staffMember.password;
-      const storedStaffPwd =
-        (await AsyncStorage.getItem(`ecotrack_staff_pwd_${staffMember.id}`)) ||
-        (staffMember.email ? await AsyncStorage.getItem(`ecotrack_staff_pwd_${staffMember.email.toLowerCase()}`) : null) ||
-        (staffMember.phone ? await AsyncStorage.getItem(`ecotrack_staff_pwd_${staffMember.phone}`) : null);
-
-      const expectedStaffPassword = dbPassword || storedStaffPwd;
-
-      if (expectedStaffPassword && typeof expectedStaffPassword === 'string' && expectedStaffPassword.trim().length > 0) {
-        if (expectedStaffPassword !== passwordInput) {
-          return {
-            success: false,
-            error: 'Incorrect password. Please verify your password or use Forgot Password.',
-          };
-        }
-      } else {
-        // If this staff account was created without a password in database, save this password as their credential
-        try {
-          await supabase.from('staff').update({ password: passwordInput }).eq('id', staffMember.id);
-        } catch (e) { }
-        await AsyncStorage.setItem(`ecotrack_staff_pwd_${staffMember.id}`, passwordInput);
-        if (staffMember.email) await AsyncStorage.setItem(`ecotrack_staff_pwd_${staffMember.email.toLowerCase()}`, passwordInput);
-        if (staffMember.phone) await AsyncStorage.setItem(`ecotrack_staff_pwd_${staffMember.phone}`, passwordInput);
-      }
-
-      const staffPhoto = staffMember.photo_url || staffMember.avatar_url || null;
-      const user: AppUser = {
-        id: staffMember.id,
-        name: staffMember.name || 'Rey O. Solamillo',
-        email: staffMember.email || 'junjunsolamillo123@gmail.com',
-        phone: staffMember.phone || cleanId,
-        role: staffMember.role || 'HVAC / Aircon Technician',
-        userType: 'staff',
-        assignment: computedAssignment,
-        avatar: (staffPhoto ? 'custom' : (staffMember.avatar || 'default')) as any,
-        photoUrl: staffPhoto,
-      };
-
-      // Update staff online status and last_active
-      await supabase
-        .from('staff')
-        .update({
-          status: 'Online',
-          is_online: true,
-          last_active: new Date().toISOString(),
-          updated: new Date().toISOString(),
-        })
-        .eq('id', staffMember.id);
-
-      await AsyncStorage.setItem('ecotrack_session_user', JSON.stringify(user));
-      return { success: true, user };
-    }
-
-    // If identifier is not found in either table
-    return {
-      success: false,
-      error: 'User not found. Please verify your phone or email, or create a staff account.',
-    };
-  } catch (error: any) {
-    console.error('Authentication exception:', error);
-    return { success: false, error: error.message || 'Authentication error. Please try again.' };
-  }
+// All authentication is verified by Supabase Auth plus a server-owned profile.
+const accountAuth = createAuthService(supabase, AsyncStorage);
+export const authenticateUser = accountAuth.authenticateUser;
+export const registerStaffMember = accountAuth.registerStaffMember;
+export const verifyUserForPasswordReset = accountAuth.verifyUserForPasswordReset;
+export const requestPasswordRecovery = accountAuth.requestPasswordRecovery;
+export const resetUserPassword = accountAuth.resetUserPassword;
+export const changeUserPassword = accountAuth.changeUserPassword;
+export type VerifyUserResetResult = Awaited<ReturnType<typeof verifyUserForPasswordReset>>;
+export async function requestUserEmailChange(email: string): Promise<boolean> {
+  const { data } = await supabase.auth.getUser();
+  if (!data.user || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) return false;
+  const { error } = await supabase.auth.updateUser({ email: email.trim().toLowerCase() });
+  return !error;
 }
 
-// Register a new Staff member in Supabase
-export async function registerStaffMember(
-  fullName: string,
-  phone: string,
-  email: string,
-  password?: string
-): Promise<{ success: boolean; user?: AppUser; error?: string }> {
-  try {
-    const cleanPhone = phone.trim();
-    const cleanEmail = email.trim().toLowerCase();
-    const staffId = `staff_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const now = new Date().toISOString();
-
-    // Check if phone or email already exists in staff
-    const { data: existing } = await supabase
-      .from('staff')
-      .select('id')
-      .or(`email.ilike.${cleanEmail},phone.ilike.${cleanPhone}`)
-      .limit(1);
-
-    if (existing && existing.length > 0) {
-      return {
-        success: false,
-        error: 'A staff member with this phone or email already exists. Please login instead.',
-      };
-    }
-
-    const insertPayload: any = {
-      id: staffId,
-      name: fullName.trim(),
-      email: cleanEmail,
-      phone: cleanPhone,
-      status: 'Active',
-      last_active: now,
-      created: now,
-      updated: now,
-    };
-
-    if (password) {
-      insertPayload.password = password;
-    }
-
-    let { data, error } = await supabase
-      .from('staff')
-      .insert(insertPayload)
-      .select()
-      .single();
-
-    if (error && password) {
-      delete insertPayload.password;
-      const retry = await supabase.from('staff').insert(insertPayload).select().single();
-      error = retry.error;
-      data = retry.data;
-    }
-
-    if (error) {
-      console.warn('Error inserting staff:', error);
-      return { success: false, error: error.message };
-    }
-
-    if (password) {
-      await AsyncStorage.setItem(`ecotrack_staff_pwd_${staffId}`, password);
-      await AsyncStorage.setItem(`ecotrack_staff_pwd_${cleanEmail}`, password);
-      await AsyncStorage.setItem(`ecotrack_staff_pwd_${cleanPhone}`, password);
-    }
-
-    const user: AppUser = {
-      id: staffId,
-      name: fullName.trim(),
-      email: cleanEmail,
-      phone: cleanPhone,
-      role: 'HVAC / Aircon Technician',
-      userType: 'staff',
-      assignment: 'Unassigned',
-    };
-
-    await AsyncStorage.setItem('ecotrack_session_user', JSON.stringify(user));
-    return { success: true, user };
-  } catch (e: any) {
-    console.error('Registration exception:', e);
-    return { success: false, error: e.message || 'Registration failed.' };
-  }
-}
-
-// Helper to normalize phone numbers for flexible matching
-function normalizePhoneNumber(phone: string): string {
-  return (phone || '').replace(/[^0-9]/g, '');
-}
-
-export interface VerifyUserResetResult {
-  success: boolean;
-  user?: AppUser;
-  userType?: 'admin' | 'staff';
-  error?: string;
-  matchedName?: string;
-  matchedPhone?: string;
-}
-
-// Verify that username/name and phone number match an active user in administrators or staff
-export async function verifyUserForPasswordReset(
-  usernameOrName: string,
-  phoneNumber: string
-): Promise<VerifyUserResetResult> {
-  try {
-    const cleanUser = usernameOrName.trim().toLowerCase();
-    const cleanPhoneDigits = normalizePhoneNumber(phoneNumber);
-
-    if (!cleanUser) {
-      return { success: false, error: 'Please enter your username or full name.' };
-    }
-    if (!cleanPhoneDigits || cleanPhoneDigits.length < 7) {
-      return { success: false, error: 'Please enter a valid phone number (at least 7 digits).' };
-    }
-
-    // 1. Check administrators table
-    const { data: admins } = await supabase
-      .from('administrators')
-      .select('*')
-      .or(`username.ilike.%${cleanUser}%,email.ilike.%${cleanUser}%`);
-
-    if (admins && admins.length > 0) {
-      for (const admin of admins) {
-        const adminPhone = (admin as any).phone ? normalizePhoneNumber((admin as any).phone) : '';
-        const matchesPhone =
-          !adminPhone ||
-          adminPhone.includes(cleanPhoneDigits) ||
-          cleanPhoneDigits.includes(adminPhone) ||
-          cleanPhoneDigits.length >= 7;
-
-        if (matchesPhone) {
-          const adminPhoto = (admin as any).photo_url || (admin as any).avatar_url || null;
-          const user: AppUser = {
-            id: admin.id,
-            name: admin.username || 'Admin',
-            email: admin.email,
-            phone: (admin as any).phone || phoneNumber,
-            role: admin.role === 'admin' ? 'Facility Administrator' : admin.role,
-            userType: 'admin',
-            avatar: (adminPhoto ? 'custom' : ((admin as any).avatar || 'default')) as any,
-            photoUrl: adminPhoto,
-          };
-          return {
-            success: true,
-            user,
-            userType: 'admin',
-            matchedName: user.name,
-            matchedPhone: user.phone || phoneNumber,
-          };
-        }
-      }
-    }
-
-    // 2. Check staff table by name or email
-    const { data: staffList, error: staffErr } = await supabase
-      .from('staff')
-      .select('*')
-      .or(`name.ilike.%${cleanUser}%,email.ilike.%${cleanUser}%`);
-
-    if (!staffErr && staffList && staffList.length > 0) {
-      const matched = staffList.find((s: any) => {
-        const dbPhoneDigits = normalizePhoneNumber(s.phone || '');
-        if (!dbPhoneDigits) return false;
-        return (
-          dbPhoneDigits === cleanPhoneDigits ||
-          dbPhoneDigits.endsWith(cleanPhoneDigits) ||
-          cleanPhoneDigits.endsWith(dbPhoneDigits) ||
-          (cleanPhoneDigits.length >= 7 && dbPhoneDigits.includes(cleanPhoneDigits.slice(-7)))
-        );
-      });
-
-      if (matched) {
-        if (isStaffArchived(matched)) {
-          return {
-            success: false,
-            error: 'This account has been deactivated or archived by the administrator.',
-          };
-        }
-
-        const assignmentInfo = await resolveWorkerAssignment(matched.id);
-        const staffPhoto = matched.photo_url || matched.avatar_url || null;
-        const user: AppUser = {
-          id: matched.id,
-          name: matched.name || 'Technician',
-          email: matched.email || '',
-          phone: matched.phone || phoneNumber,
-          role: matched.role || 'HVAC / Aircon Technician',
-          userType: 'staff',
-          assignment: assignmentInfo.assignmentText,
-          avatar: (staffPhoto ? 'custom' : (matched.avatar || 'default')) as any,
-          photoUrl: staffPhoto,
-        };
-
-        return {
-          success: true,
-          user,
-          userType: 'staff',
-          matchedName: user.name,
-          matchedPhone: user.phone,
-        };
-      }
-    }
-
-    // 3. Fallback: query staff table by phone number digits
-    const { data: phoneStaffList } = await supabase
-      .from('staff')
-      .select('*')
-      .or(`phone.ilike.%${cleanPhoneDigits.slice(-7)}%`);
-
-    if (phoneStaffList && phoneStaffList.length > 0) {
-      const matchedByName = phoneStaffList.find((s: any) => {
-        const sName = (s.name || '').toLowerCase();
-        const sEmail = (s.email || '').toLowerCase();
-        return (
-          sName.includes(cleanUser) ||
-          cleanUser.includes(sName) ||
-          sEmail.includes(cleanUser) ||
-          cleanUser.split(' ').some((part) => part.length >= 3 && sName.includes(part))
-        );
-      });
-
-      if (matchedByName) {
-        if (isStaffArchived(matchedByName)) {
-          return {
-            success: false,
-            error: 'This account has been deactivated or archived by the administrator.',
-          };
-        }
-
-        const assignmentInfo = await resolveWorkerAssignment(matchedByName.id);
-        const staffPhoto = matchedByName.photo_url || matchedByName.avatar_url || null;
-        const user: AppUser = {
-          id: matchedByName.id,
-          name: matchedByName.name || 'Technician',
-          email: matchedByName.email || '',
-          phone: matchedByName.phone || phoneNumber,
-          role: matchedByName.role || 'HVAC / Aircon Technician',
-          userType: 'staff',
-          assignment: assignmentInfo.assignmentText,
-          avatar: (staffPhoto ? 'custom' : (matchedByName.avatar || 'default')) as any,
-          photoUrl: staffPhoto,
-        };
-
-        return {
-          success: true,
-          user,
-          userType: 'staff',
-          matchedName: user.name,
-          matchedPhone: user.phone,
-        };
-      }
-    }
-
-    return {
-      success: false,
-      error: 'No account found matching this username and phone number. Please check your details.',
-    };
-  } catch (error: any) {
-    console.error('verifyUserForPasswordReset exception:', error);
-    return { success: false, error: error.message || 'Verification failed. Please try again.' };
-  }
-}
-
-// Reset account password in Supabase for admin or staff
-export async function resetUserPassword(
-  userId: string,
-  userType: 'admin' | 'staff',
-  newPassword: string
-): Promise<{ success: boolean; error?: string }> {
-  try {
-    if (!newPassword || newPassword.trim().length < 4) {
-      return { success: false, error: 'Password must be at least 4 characters long.' };
-    }
-
-    const now = new Date().toISOString();
-
-    if (userType === 'admin') {
-      const { error } = await supabase
-        .from('administrators')
-        .update({
-          password: newPassword,
-          updated: now,
-        })
-        .eq('id', userId);
-
-      if (error) {
-        console.warn('Error resetting admin password:', error);
-        return { success: false, error: error.message };
-      }
-      return { success: true };
-    } else {
-      // Update staff table
-      const { error } = await supabase
-        .from('staff')
-        .update({
-          password: newPassword,
-          updated: now,
-        })
-        .eq('id', userId);
-
-      if (error) {
-        // Fallback: If 'password' column doesn't exist yet in Supabase staff table, update timestamp
-        await supabase
-          .from('staff')
-          .update({
-            updated: now,
-          })
-          .eq('id', userId);
-      }
-      return { success: true };
-    }
-  } catch (e: any) {
-    console.error('resetUserPassword exception:', e);
-    return { success: false, error: e.message || 'Failed to update password.' };
-  }
-}
-
-// Change account password after verifying old password
-export async function changeUserPassword(
-  userId: string,
-  userType: 'admin' | 'staff',
-  oldPasswordInput: string,
-  newPasswordInput: string,
-  userEmail?: string,
-  userPhone?: string
-): Promise<{ success: boolean; error?: string }> {
-  try {
-    const cleanOld = oldPasswordInput ? oldPasswordInput.trim() : '';
-    const cleanNew = newPasswordInput ? newPasswordInput.trim() : '';
-
-    if (!cleanOld) {
-      return { success: false, error: 'Current password is required.' };
-    }
-    if (!cleanNew || cleanNew.length < 4) {
-      return { success: false, error: 'New password must be at least 4 characters long.' };
-    }
-    if (cleanOld === cleanNew) {
-      return { success: false, error: 'New password must be different from current password.' };
-    }
-
-    let expectedPassword: string | null = null;
-
-    if (userType === 'admin') {
-      const { data: admin } = await supabase
-        .from('administrators')
-        .select('*')
-        .eq('id', userId)
-        .maybeSingle();
-
-      expectedPassword =
-        admin?.password ||
-        (await AsyncStorage.getItem(`ecotrack_admin_pwd_${userId}`)) ||
-        (userEmail ? await AsyncStorage.getItem(`ecotrack_admin_pwd_${userEmail.toLowerCase()}`) : null);
-
-      if (expectedPassword && typeof expectedPassword === 'string' && expectedPassword.trim().length > 0) {
-        if (expectedPassword !== cleanOld) {
-          return { success: false, error: 'Incorrect current password.' };
-        }
-      }
-
-      const resetRes = await resetUserPassword(userId, 'admin', cleanNew);
-      if (!resetRes.success) {
-        return resetRes;
-      }
-
-      await AsyncStorage.setItem(`ecotrack_admin_pwd_${userId}`, cleanNew);
-      if (userEmail) {
-        await AsyncStorage.setItem(`ecotrack_admin_pwd_${userEmail.toLowerCase()}`, cleanNew);
-      }
-
-      return { success: true };
-    } else {
-      const { data: staffMember } = await supabase
-        .from('staff')
-        .select('*')
-        .eq('id', userId)
-        .maybeSingle();
-
-      expectedPassword =
-        staffMember?.password ||
-        (await AsyncStorage.getItem(`ecotrack_staff_pwd_${userId}`)) ||
-        (staffMember?.email ? await AsyncStorage.getItem(`ecotrack_staff_pwd_${staffMember.email.toLowerCase()}`) : null) ||
-        (userEmail ? await AsyncStorage.getItem(`ecotrack_staff_pwd_${userEmail.toLowerCase()}`) : null) ||
-        (staffMember?.phone ? await AsyncStorage.getItem(`ecotrack_staff_pwd_${staffMember.phone}`) : null) ||
-        (userPhone ? await AsyncStorage.getItem(`ecotrack_staff_pwd_${userPhone}`) : null);
-
-      if (expectedPassword && typeof expectedPassword === 'string' && expectedPassword.trim().length > 0) {
-        if (expectedPassword !== cleanOld) {
-          return { success: false, error: 'Incorrect current password.' };
-        }
-      }
-
-      const resetRes = await resetUserPassword(userId, 'staff', cleanNew);
-      if (!resetRes.success) {
-        return resetRes;
-      }
-
-      await AsyncStorage.setItem(`ecotrack_staff_pwd_${userId}`, cleanNew);
-      if (staffMember?.email) await AsyncStorage.setItem(`ecotrack_staff_pwd_${staffMember.email.toLowerCase()}`, cleanNew);
-      if (userEmail) await AsyncStorage.setItem(`ecotrack_staff_pwd_${userEmail.toLowerCase()}`, cleanNew);
-      if (staffMember?.phone) await AsyncStorage.setItem(`ecotrack_staff_pwd_${staffMember.phone}`, cleanNew);
-      if (userPhone) await AsyncStorage.setItem(`ecotrack_staff_pwd_${userPhone}`, cleanNew);
-
-      return { success: true };
-    }
-  } catch (e: any) {
-    console.error('changeUserPassword exception:', e);
-    return { success: false, error: e.message || 'Failed to change password. Please try again.' };
-  }
-}
-
-// Helper methods for Remember Me preference and credentials
 export async function getRememberedCredentials(): Promise<{ identifier: string; rememberMe: boolean } | null> {
   try {
     const raw = await AsyncStorage.getItem('ecotrack_remembered_creds');
@@ -1498,7 +1058,10 @@ export async function clearRememberedCredentials(): Promise<void> {
 
 // Robust pure-JS base64 to Uint8Array converter (compatible with Hermes and all JS engines)
 function base64ToUint8Array(base64: string): Uint8Array {
-  const base64Data = base64.includes(',') ? base64.split(',')[1] : base64;
+  const base64Data = (base64.includes(',') ? base64.split(',')[1] : base64).replace(/\s/g, '');
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(base64Data)) {
+    throw new Error('Invalid base64 image data.');
+  }
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   const lookup = new Uint8Array(256);
   for (let i = 0; i < chars.length; i++) {
@@ -1529,87 +1092,50 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
-// Upload image to Supabase Storage bucket permanently or return data URL fallback
+// Only return a durable URL after a successful upload.
 export async function uploadImageToSupabase(
-  uriOrBase64: string,
-  bucketName: string = 'avatars',
-  fileNamePrefix: string = 'img'
+  uriOrBase64: string, bucketName: string = 'avatars', fileNamePrefix: string = 'img'
 ): Promise<string> {
   if (!uriOrBase64) return '';
-
-  // If already a remote URL, keep it
-  if (uriOrBase64.startsWith('http://') || uriOrBase64.startsWith('https://')) {
-    return uriOrBase64;
+  if (/^(https?:\/\/|storage:\/\/)/i.test(uriOrBase64)) {
+    const signed = await resolveImageUrl(uriOrBase64);
+    if (!signed) throw new Error('Image is unavailable. Please select it again.');
+    return signed;
   }
-
-  try {
-    const timestamp = Date.now();
-    const cleanPrefix = fileNamePrefix.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const filePath = `${cleanPrefix}_${timestamp}.jpg`;
-
-    // Handle base64 Data URLs
-    if (uriOrBase64.startsWith('data:image')) {
-      const bytes = base64ToUint8Array(uriOrBase64);
-      if (bytes.length > 0) {
-        const { error: uploadError } = await supabase.storage
-          .from(bucketName)
-          .upload(filePath, bytes, {
-            contentType: 'image/jpeg',
-            upsert: true,
-          });
-
-        if (!uploadError) {
-          const { data } = supabase.storage.from(bucketName).getPublicUrl(filePath);
-          if (data?.publicUrl) {
-            return data.publicUrl;
-          }
-        } else if (uploadError.message?.includes('Bucket not found') && bucketName !== 'photos') {
-          // Try fallback to 'photos' bucket
-          const { error: fallbackErr } = await supabase.storage
-            .from('photos')
-            .upload(filePath, bytes, { contentType: 'image/jpeg', upsert: true });
-          if (!fallbackErr) {
-            const { data } = supabase.storage.from('photos').getPublicUrl(filePath);
-            if (data?.publicUrl) return data.publicUrl;
-          }
-        }
-      }
-    } else if (uriOrBase64.startsWith('file://') || uriOrBase64.startsWith('ph://') || uriOrBase64.startsWith('blob:')) {
-      // Handle file URIs directly
-      try {
-        const response = await fetch(uriOrBase64);
-        const blob = await response.blob();
-        const { error: uploadError } = await supabase.storage
-          .from(bucketName)
-          .upload(filePath, blob, {
-            contentType: blob.type || 'image/jpeg',
-            upsert: true,
-          });
-
-        if (!uploadError) {
-          const { data } = supabase.storage.from(bucketName).getPublicUrl(filePath);
-          if (data?.publicUrl) {
-            return data.publicUrl;
-          }
-        } else if (uploadError.message?.includes('Bucket not found') && bucketName !== 'photos') {
-          const { error: fallbackErr } = await supabase.storage
-            .from('photos')
-            .upload(filePath, blob, { contentType: blob.type || 'image/jpeg', upsert: true });
-          if (!fallbackErr) {
-            const { data } = supabase.storage.from('photos').getPublicUrl(filePath);
-            if (data?.publicUrl) return data.publicUrl;
-          }
-        }
-      } catch (_blobErr) {
-        // Fallback to URI
-      }
-    }
-  } catch (_err) {
-    // Fallback to URI
+  if (!['avatars', 'photos', 'maintenance-photos'].includes(bucketName)) throw new Error('Unsupported image bucket.');
+  const { data: identity, error: identityError } = await supabase.auth.getUser();
+  if (identityError || !identity.user) throw new Error('Sign in before uploading an image.');
+  let bytes: Uint8Array;
+  let mime: string;
+  const dataMatch = uriOrBase64.match(/^data:(image\/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=\s]+)$/);
+  if (dataMatch) {
+    mime = dataMatch[1];
+    bytes = base64ToUint8Array(dataMatch[2]);
+  } else {
+    if (!/^(file:|content:|blob:)/.test(uriOrBase64)) throw new Error('Unsupported image format. Select a JPEG, PNG, WebP or GIF image.');
+    const response = await fetch(uriOrBase64);
+    if (!response.ok) throw new Error('Unable to read the selected image.');
+    const blob = await response.blob();
+    mime = blob.type;
+    bytes = new Uint8Array(await new Response(blob).arrayBuffer());
   }
-
-  // Guaranteed fallback: return the URI / data URL so image is stored directly and viewable across devices
-  return uriOrBase64;
+  const extensions: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+  // Native file/content URIs may omit MIME metadata. Keep signature validation
+  // authoritative rather than trusting a filename or assuming every photo is JPEG.
+  if (!mime || mime === 'application/octet-stream') {
+    mime = Object.keys(extensions).find(type => isImageSignature(bytes, type)) || '';
+  }
+  if (!extensions[mime] || !bytes.length) throw new Error('Unsupported or empty image.');
+  const maxBytes = (bucketName === 'avatars' ? 10 : 20) * 1024 * 1024;
+  if (bytes.length > maxBytes) throw new Error('Image exceeds the storage size limit.');
+  if (!isImageSignature(bytes, mime)) throw new Error('Image content does not match its file type.');
+  const prefix = fileNamePrefix.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+  const filePath = identity.user.id + '/' + prefix + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10) + '.' + extensions[mime];
+  const { error } = await supabase.storage.from(bucketName).upload(filePath, bytes.buffer as ArrayBuffer, { contentType: mime, upsert: false });
+  if (error) throw new Error('Image upload failed. Please try again.');
+  const signed = await resolveImageUrl(`storage://${bucketName}/${filePath}`);
+  if (!signed) throw new Error('Uploaded image is unavailable.');
+  return signed;
 }
 
 // Update Staff profile in Supabase & Local Session
@@ -1624,77 +1150,30 @@ export async function updateStaffProfile(
   assignment?: string
 ): Promise<boolean> {
   try {
-    // 1. Immediately update AsyncStorage session
-    const raw = await AsyncStorage.getItem('ecotrack_session_user');
-    if (raw) {
-      try {
-        const currentUser = JSON.parse(raw);
-        const updatedUser: AppUser = {
-          ...currentUser,
-          name,
-          phone,
-          ...(email ? { email } : {}),
-          ...(role ? { role } : {}),
-          ...(avatar ? { avatar } : {}),
-          ...(photoUrl !== undefined ? { photoUrl } : {}),
-          ...(assignment ? { assignment } : {}),
-        };
-        await AsyncStorage.setItem('ecotrack_session_user', JSON.stringify(updatedUser));
-      } catch (e) {
-        // safe fallback
-      }
-    }
-
-    // 2. Update Supabase staff table
-    const payload: any = {
-      name,
-      phone,
-      ...(email ? { email } : {}),
-      updated: new Date().toISOString(),
-    };
-
-    if (avatar) payload.avatar = avatar;
-    if (photoUrl !== undefined) {
-      payload.photo_url = photoUrl;
-      payload.avatar_url = photoUrl;
-    }
-
-    const { error } = await supabase
-      .from('staff')
-      .update(payload)
-      .eq('id', userId);
-
-    if (error) {
-      // If error might be due to non-existent extra columns, retry with core fields
-      const { error: retryError } = await supabase
-        .from('staff')
-        .update({
-          name,
-          phone,
-          ...(email ? { email } : {}),
-          updated: new Date().toISOString(),
-        })
-        .eq('id', userId);
-
-      if (retryError) {
-        console.warn('Failed to update staff profile in Supabase:', retryError);
-        return false;
-      }
-    }
+    if (!userId || !name.trim() || !phone.trim()) return false;
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) return false;
+    const currentUser = await accountAuth.getSavedSession();
+    if (!currentUser || currentUser.id !== userId) return false;
+    // Email changes go through verified Auth email confirmation separately.
+    const { data, error } = await supabase.rpc('ecotrack_update_profile', {
+      p_name: name.trim(), p_phone: phone.trim(),
+      p_avatar: avatar || currentUser.avatar || 'default',
+      p_photo_url: imageReference(photoUrl === undefined ? currentUser.photoUrl : photoUrl, SUPABASE_URL),
+    });
+    if (error || !data || data.authUserId !== currentUser.authUserId) return false;
+    await AsyncStorage.setItem('ecotrack_session_user', JSON.stringify(data));
     return true;
-  } catch (e) {
-    console.error('Update profile exception:', e);
+  } catch {
     return false;
   }
 }
 
-// Fetch live locations (Building • Floor • Room) from Supabase
 export async function fetchLiveLocations(): Promise<string[]> {
   try {
     const [roomsRes, floorsRes, buildingsRes] = await Promise.all([
-      supabase.from('rooms').select('*'),
-      supabase.from('floors').select('*'),
-      supabase.from('buildings').select('*'),
+      fetchAccessibleRows(supabase, 'rooms', '*'),
+      fetchAccessibleRows(supabase, 'floors', '*'),
+      fetchAccessibleRows(supabase, 'buildings', '*'),
     ]);
 
     const buildingsMap = new Map<string, DbBuilding>();
@@ -1708,197 +1187,44 @@ export async function fetchLiveLocations(): Promise<string[]> {
       const locations = rooms.map((room) => {
         const floor = room.floor_id ? floorsMap.get(room.floor_id) : undefined;
         const building = floor?.building_id ? buildingsMap.get(floor.building_id) : undefined;
-        const bName = building?.name || 'Main Campus Building';
-        const fName = floor?.name || '2nd Floor - IT Wing';
-        const rName = room.name || 'Server Room A';
-        return `${bName} • ${fName} • ${rName}`;
-      });
+        const bName = building?.name || '';
+        const fName = floor?.name || '';
+        const rName = room.name || '';
+        return [bName, fName, rName].filter(Boolean).join(' • ');
+      }).filter(Boolean);
       return Array.from(new Set(locations));
     }
   } catch (e) {
     // safe fallback
   }
 
-  return [
-    'Main Campus Building • 2nd Floor - IT Wing • Server Room A',
-    'Main Campus Building • 2nd Floor - IT Wing • Laboratory A',
-    'Main Campus Building • 1st Floor - Admin Wing • Control Room',
-    'Main Campus Building • 3rd Floor - Executive • Server Room B',
-    'Annex Facility • Ground Floor • Substation Unit',
-  ];
+  return [];
 }
 
 // Restore saved user session from AsyncStorage or real staff from Supabase
 // IMPORTANT: Does NOT auto-login if no active session was previously saved.
-export async function getSavedSession(): Promise<AppUser | null> {
-  try {
-    const raw = await AsyncStorage.getItem('ecotrack_session_user');
-    if (!raw) {
-      // User is not logged in. Do NOT auto-login to an account. Show Login screen!
-      return null;
-    }
-
-    let localUser: AppUser | null = null;
-    try {
-      localUser = JSON.parse(raw);
-    } catch {
-      return null;
-    }
-
-    if (!localUser || !localUser.id) {
-      return null;
-    }
-
-    // Verify and sync live info from staff table in Supabase
-    const { data: staffList } = await supabase
-      .from('staff')
-      .select('*')
-      .eq('id', localUser.id)
-      .limit(1);
-
-    const staffMember = staffList && staffList.length > 0 ? staffList[0] : null;
-
-    if (staffMember) {
-      const assignmentInfo = await resolveWorkerAssignment(staffMember.id);
-      const computedAssignment = assignmentInfo.assignmentText;
-
-      // Check if user was archived while app was closed
-      const isArchived = isStaffArchived(staffMember);
-
-      if (isArchived) {
-        const archiveReason =
-          staffMember.archive_reason || 'Administrative / Compliance Deactivation';
-        const archiveNotes = staffMember.archive_notes || '';
-        const archivedAt = staffMember.archived_at || staffMember.updated || '';
-
-        const archivedUser: AppUser = {
-          id: staffMember.id,
-          name: staffMember.name || localUser.name || 'Rey O. Solamillo',
-          email: staffMember.email || localUser.email || 'junjunsolamillo123@gmail.com',
-          phone: staffMember.phone || localUser.phone || '09853308630',
-          role: localUser.role || staffMember.role || 'HVAC / Aircon Technician',
-          userType: 'staff',
-          assignment: computedAssignment,
-          isArchived: true,
-          archiveReason,
-          archiveNotes,
-          archivedAt,
-        };
-        return archivedUser;
-      }
-
-      const resolvedPhoto = staffMember.photo_url || staffMember.avatar_url || localUser.photoUrl || null;
-      const liveUser: AppUser = {
-        id: staffMember.id,
-        name: staffMember.name || localUser.name || 'Rey O. Solamillo',
-        email: staffMember.email || localUser.email || 'junjunsolamillo123@gmail.com',
-        phone: staffMember.phone || localUser.phone || '09853308630',
-        role: localUser.role || staffMember.role || 'HVAC / Aircon Technician',
-        userType: 'staff',
-        assignment: computedAssignment,
-        avatar: (resolvedPhoto ? 'custom' : (localUser.avatar || (staffMember.avatar as any) || 'default')) as any,
-        photoUrl: resolvedPhoto,
-        isArchived: false,
-      };
-
-      // Set user status to Online in Supabase
-      await supabase
-        .from('staff')
-        .update({
-          status: 'Online',
-          is_online: true,
-          last_active: new Date().toISOString(),
-          updated: new Date().toISOString(),
-        })
-        .eq('id', staffMember.id);
-
-      await AsyncStorage.setItem('ecotrack_session_user', JSON.stringify(liveUser));
-      return liveUser;
-    }
-
-    // If local user is admin
-    if (localUser.userType === 'admin') {
-      return localUser;
-    }
-
-    // If staff member no longer exists in Supabase, clear session
-    await AsyncStorage.removeItem('ecotrack_session_user');
-    return null;
-  } catch (e) {
-    return null;
-  }
+export const resolveImageUrl = (value: string | null | undefined, refresh = false) => displayImage(supabase, value, SUPABASE_URL, refresh);
+export async function getSavedSession(options: { throwOnUnavailable?: boolean } = {}): Promise<AppUser | null> {
+  const user = await accountAuth.getSavedSession(options);
+  return user ? { ...user, photoUrl: await resolveImageUrl(user.photoUrl) } : null;
 }
 
 // Clear user session and set user status to Offline in Supabase
-export async function clearSession(userId?: string): Promise<void> {
+export async function clearSession(_userId?: string): Promise<void> {
   try {
-    let targetId = userId;
-    if (!targetId) {
-      const raw = await AsyncStorage.getItem('ecotrack_session_user');
-      if (raw) {
-        try {
-          const parsed = JSON.parse(raw);
-          targetId = parsed.id;
-        } catch { }
-      }
-    }
-
-    if (targetId) {
-      await supabase
-        .from('staff')
-        .update({
-          status: 'Offline',
-          is_online: false,
-          last_active: new Date().toISOString(),
-          updated: new Date().toISOString(),
-        })
-        .eq('id', targetId);
-    }
-
-    await AsyncStorage.removeItem('ecotrack_session_user');
-    await supabase.auth.signOut();
-  } catch (e) {
-    // Safe fallback
-  }
+    const token = await AsyncStorage.getItem('ecotrack_expo_push_token');
+    if (token) await supabase.rpc('ecotrack_unregister_push_token', { p_token: token });
+    await AsyncStorage.removeItem('ecotrack_expo_push_token');
+  } catch {}
+  await AsyncStorage.removeItem('ecotrack_session_user');
+  try { const keys=await AsyncStorage.getAllKeys(); await AsyncStorage.multiRemove(keys.filter(key=>/^ecotrack_(staff|admin)_pwd_/.test(key))); } catch {}
+  try { await supabase.rpc('ecotrack_set_presence', { p_online: false }); } catch {}
+  await supabase.auth.signOut({ scope: 'local' });
 }
 
 // Explicitly update staff member online/offline status in Supabase
-export async function updateStaffOnlineStatus(
-  workerIdOrEmail: string,
-  isOnline: boolean
-): Promise<void> {
-  try {
-    if (!workerIdOrEmail) return;
-    const clean = workerIdOrEmail.trim();
-
-    // If attempting to set online, verify they are not archived first
-    if (isOnline) {
-      const { data: staffList } = await supabase
-        .from('staff')
-        .select('*')
-        .or(`id.eq.${clean},email.ilike.%${clean}%,phone.ilike.%${clean}%`)
-        .limit(1);
-
-      if (staffList && staffList.length > 0 && isStaffArchived(staffList[0])) {
-        // Staff is archived, do NOT set status to Online!
-        return;
-      }
-    }
-
-    const status = isOnline ? 'Online' : 'Offline';
-
-    await supabase
-      .from('staff')
-      .update({
-        status,
-        is_online: isOnline,
-        last_active: new Date().toISOString(),
-        updated: new Date().toISOString(),
-      })
-      .or(`id.eq.${clean},email.ilike.%${clean}%,phone.ilike.%${clean}%`);
-  } catch (err) {
-    console.warn('Failed to update staff online status:', err);
-  }
+export async function updateStaffOnlineStatus(_workerIdOrEmail: string, isOnline: boolean): Promise<void> {
+  await supabase.rpc('ecotrack_set_presence', { p_online: isOnline });
 }
 
 // Live Aircon Units for explore.tsx
@@ -1918,10 +1244,10 @@ export interface LiveAirconUnit {
 export async function fetchLiveAircons(): Promise<LiveAirconUnit[]> {
   try {
     const [nodesRes, roomsRes, floorsRes, reportsRes] = await Promise.all([
-      supabase.from('nodes').select('*').order('id', { ascending: true }),
-      supabase.from('rooms').select('*'),
-      supabase.from('floors').select('*'),
-      supabase.from('maintenance_reports').select('id, aircon_id, aircon_name, status'),
+      fetchAccessibleRows(supabase, 'nodes', '*'),
+      fetchAccessibleRows(supabase, 'rooms', '*'),
+      fetchAccessibleRows(supabase, 'floors', '*'),
+      fetchAccessibleRows(supabase, 'maintenance_reports', 'id, aircon_id, aircon_name, status'),
     ]);
 
     if (nodesRes.error || !nodesRes.data) return [];
@@ -1966,12 +1292,12 @@ export async function fetchLiveAircons(): Promise<LiveAirconUnit[]> {
         id: `AC-${String(idx + 1).padStart(3, '0')}`,
         name: `${roomName} Unit (${node.name})`,
         location,
-        type: node.aircon_type || 'Split-Type Air Conditioner',
+        type: node.aircon_type || '—',
         status,
         temp: formattedTemp,
-        setTemp: '22.0°C',
+        setTemp: '—',
         power: powerState,
-        lastService: node.install_date || 'Standard Schedule',
+        lastService: node.install_date || '—',
         activeReportId,
       };
     });
@@ -1986,7 +1312,7 @@ export interface LiveMaintenanceItem {
   id: string;
   title: string;
   description: string;
-  status: 'Not Started' | 'In Progress' | 'Completed' | 'Needs Repair' | 'Under Repair';
+  status: 'Not Started' | 'In Progress' | 'Completed' | 'Needs Repair' | 'Under Repair' | 'For Verification';
   remarks?: string;
   problemDescription?: string;
   photoUri?: string | null;
@@ -2000,10 +1326,14 @@ export interface LiveMaintenanceItem {
 }
 
 export interface LiveMaintenanceReport {
+  updatedAt?: string | null;
   id: string;
   airconId: string;
   airconName?: string;
   airconType?: string;
+  controllerId?: string;
+  controllerName?: string;
+  protocolName?: string;
   roomId?: string;
   location: string;
   title: string;
@@ -2014,7 +1344,7 @@ export interface LiveMaintenanceReport {
   priority: 'Critical' | 'High' | 'Medium' | 'Low';
   dueDate: string;
   createdDate?: string;
-  status: 'Pending' | 'In Progress' | 'Completed' | 'Needs Repair' | 'For Verification';
+  status: 'Pending' | 'In Progress' | 'Completed' | 'Needs Repair' | 'Under Repair' | 'For Verification';
   lastUpdated?: string;
   items: LiveMaintenanceItem[];
   issue?: {
@@ -2028,12 +1358,48 @@ export interface LiveMaintenanceReport {
   timeline?: any[];
   parentReportId?: string | null;
   linkedRepairId?: string | null;
-  reworkInstructions?: string | null;
   isRepaired?: boolean;
   isVerified?: boolean;
+  allChildRepairsDone?: boolean;
+}
+
+// Equipment labels supplement an authorized report/event. A denied or unavailable
+// lookup must not hide its checklist or recipient notification state.
+async function optionalEquipmentRows(table: string, filter?: (query: any) => any): Promise<any[]> {
+  try {
+    const result = await readWithTimeout(() => fetchAccessibleRows(supabase, table, '*', filter), 3500);
+    return result.error ? [] : result.data || [];
+  } catch { return []; }
+}
+
+export async function resolveNotificationEquipment<T extends EquipmentDisplaySeed & { relatedReportId?: string; title?: string; message?: string }>(items: T[]): Promise<T[]> {
+  if (!items.some(item => item.airconId || item.airconName || item.relatedReportId)) return items;
+  const reportIds = [...new Set(items.map(item => item.relatedReportId).filter((id): id is string => Boolean(id)))];
+  const [aircons, nodes, rooms, floors, buildings, reports] = await Promise.all([
+    optionalEquipmentRows('aircons'), optionalEquipmentRows('nodes'), optionalEquipmentRows('rooms'),
+    optionalEquipmentRows('floors'), optionalEquipmentRows('buildings'),
+    reportIds.length ? optionalEquipmentRows('maintenance_reports', query => query.in('id', reportIds)) : Promise.resolve([]),
+  ]);
+  const context: EquipmentDisplayContext = { aircons, nodes, rooms, floors, buildings };
+  return items.map(item => {
+    const report = reports.find(row => row.id === item.relatedReportId);
+    const previous = { ...item,
+      airconId: item.airconId || report?.aircon_id,
+      airconName: item.airconName || report?.aircon_name,
+      airconType: item.airconType || report?.aircon_type,
+      roomId: item.roomId || report?.room_id,
+      location: item.location || report?.room_name,
+    };
+    const equipment = resolveEquipmentDisplay(previous, context);
+    return { ...item, ...equipment,
+      ...('title' in item ? { title: refreshEquipmentText(item.title, previous, equipment) } : {}),
+      ...('message' in item ? { message: refreshEquipmentText(item.message, previous, equipment) } : {}),
+    };
+  });
 }
 
 const VALID_MAINTENANCE_ITEM_STATUSES = new Set([
+  'For Verification',
   'Not Started',
   'In Progress',
   'Completed',
@@ -2050,10 +1416,14 @@ export function validateLiveMaintenanceItems(items: LiveMaintenanceItem[]): stri
     return 'This maintenance report has no checklist items to update.';
   }
 
+  const ids = new Set<string>();
   for (const item of items) {
     if (!item?.id || !item?.title || !VALID_MAINTENANCE_ITEM_STATUSES.has(item.status)) {
       return 'Each checklist item must have a valid status before it can be submitted.';
     }
+    if (ids.has(String(item.id))) return 'Checklist item IDs must be unique.';
+    ids.add(String(item.id));
+    if (item.photoUris?.some(uri => !/^(https?:\/\/|storage:\/\/)/i.test(uri)) || (item.photoUri && !/^(https?:\/\/|storage:\/\/)/i.test(item.photoUri))) return 'Upload checklist photos before saving the report.';
     if (item.status === 'Needs Repair' && !(item.problemDescription || item.remarks || '').trim()) {
       return `Add a problem description or note for "${item.title}" before marking it Needs Repair.`;
     }
@@ -2062,15 +1432,17 @@ export function validateLiveMaintenanceItems(items: LiveMaintenanceItem[]): stri
   return null;
 }
 
-export async function fetchLiveMaintenanceReports(workerName?: string): Promise<LiveMaintenanceReport[]> {
+export async function fetchLiveMaintenanceReports(workerName?: string, scope?: ReadScope): Promise<LiveMaintenanceReport[]> {
   try {
-    const [reportsRes, notifsRes, roomsRes, floorsRes, buildingsRes] = await Promise.all([
-      supabase.from('maintenance_reports').select('*').order('created', { ascending: false }),
-      supabase.from('mobile_notifications').select('*').order('created_at', { ascending: false }),
-      supabase.from('rooms').select('*'),
-      supabase.from('floors').select('*'),
-      supabase.from('buildings').select('*'),
+    const [reportsRes, roomsRes, floorsRes, buildingsRes, aircons, nodes] = await Promise.all([
+      fetchAccessibleRows(supabase, 'maintenance_reports', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'rooms', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'floors', '*', undefined, scope),
+      fetchAccessibleRows(supabase, 'buildings', '*', undefined, scope),
+      optionalEquipmentRows('aircons'),
+      optionalEquipmentRows('nodes'),
     ]);
+    const equipmentContext: EquipmentDisplayContext = { aircons, nodes, rooms: roomsRes.data || [], floors: floorsRes.data || [], buildings: buildingsRes.data || [] };
 
     const roomsMap = new Map<string, DbRoom>();
     (roomsRes.data || []).forEach((rm: DbRoom) => roomsMap.set(rm.id, rm));
@@ -2091,9 +1463,25 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
 
     const reportsMap = new Map<string, LiveMaintenanceReport>();
 
+    let rawReportsData = reportsRes.data;
+    if (!rawReportsData || !Array.isArray(rawReportsData) || rawReportsData.length === 0) {
+      try {
+        const { data: directReports } = await supabase
+          .from('maintenance_reports')
+          .select('*')
+          .order('created', { ascending: false });
+        if (directReports && Array.isArray(directReports) && directReports.length > 0) {
+          rawReportsData = directReports;
+        }
+      } catch (err) {
+      scope?.recordError(err);
+        console.warn('Direct maintenance reports fallback failed:', err);
+      }
+    }
+
     // 1. Process genuine database rows from Supabase maintenance_reports table
-    if (reportsRes.data && Array.isArray(reportsRes.data)) {
-      reportsRes.data.forEach((r: any) => {
+    if (rawReportsData && Array.isArray(rawReportsData)) {
+      rawReportsData.forEach((r: any) => {
         // Only map tasks that actually exist in the database — NO hardcoded fallbacks.
         const rawTasks = Array.isArray(r.tasks) ? r.tasks : [];
         let items: LiveMaintenanceItem[] = [];
@@ -2125,9 +1513,11 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
               t.repair_id ||
               null;
 
-            let resolvedItemStatus: 'Not Started' | 'In Progress' | 'Completed' | 'Needs Repair' | 'Under Repair' = 'Not Started';
+            let resolvedItemStatus: LiveMaintenanceItem['status'] = 'Not Started';
             if (statusLower === 'completed') {
               resolvedItemStatus = 'Completed';
+            } else if (statusLower === 'for verification' || statusLower === 'for_verification') {
+              resolvedItemStatus = 'For Verification';
             } else if (statusLower === 'in progress' || statusLower === 'in_progress') {
               resolvedItemStatus = 'In Progress';
             } else if (statusLower === 'under repair' || statusLower === 'under_repair' || (itemLinkedRepairId && statusLower !== 'completed')) {
@@ -2169,27 +1559,8 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
           })
           : r.created_date || undefined;
 
-        const loc = r.room_name || resolveLocation(r.room_id);
-
-        // Detect rework instructions from timeline, tasks, or dedicated field
-        let extractedReworkInstructions: string | null = r.rework_instructions || r.reworkInstructions || null;
-        if (!extractedReworkInstructions && Array.isArray(r.timeline)) {
-          const reworkEntry = r.timeline.find(
-            (tl: any) => typeof tl?.title === 'string' && (tl.title.includes('Supervisor requested rework') || tl.title.includes('rework:'))
-          );
-          if (reworkEntry) {
-            const match = reworkEntry.title.match(/Supervisor requested rework:\s*"(.*?)"/i);
-            extractedReworkInstructions = match ? match[1] : reworkEntry.title;
-          }
-        }
-        if (!extractedReworkInstructions && Array.isArray(r.tasks)) {
-          const reworkTask = r.tasks.find(
-            (t: any) => typeof t?.notes === 'string' && (t.notes.includes('Defect detected during inspection') || t.notes.includes('re-inspect'))
-          );
-          if (reworkTask) {
-            extractedReworkInstructions = reworkTask.notes;
-          }
-        }
+        const equipment = resolveEquipmentDisplay({ airconId: r.aircon_id, airconName: r.aircon_name,
+          airconType: r.aircon_type, roomId: r.room_id, location: r.room_name || resolveLocation(r.room_id) }, equipmentContext);
 
         // Detect linked repair or parent report strictly from explicit database properties
         const extractedParentReportId: string | null =
@@ -2207,24 +1578,22 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
           null;
 
         // Check if report has been verified by Admin
-        const rawAdminVerified =
-          r.status === 'Verified' ||
-          (Array.isArray(r.timeline) &&
-            r.timeline.some(
-              (tl: any) => typeof tl?.title === 'string' && tl.title.toLowerCase().includes('verified and approved by admin')
-            ));
+        // Historical approval text must not approve a subsequently reopened report.
+        const rawAdminVerified = r.status === 'Verified' || r.status === 'Completed';
 
         const hasTasks = items.length > 0;
-        const allTasksDone = hasTasks && items.every((it) => it.status === 'Completed' || it.repaired || it.isRepaired);
+        const allTasksDone = hasTasks && items.every(isChecklistItemComplete);
         const anyNeedsRepair = items.some((it) => it.status === 'Needs Repair' || it.status === 'Under Repair');
         const anyActive = items.some((it) => it.status === 'In Progress' || it.status === 'Completed' || it.status === 'Needs Repair' || it.status === 'Under Repair');
 
         // Completion & Verification Invariant:
         // A report CANNOT become Completed or Verified while its own required tasks are unfinished!
-        let normalizedStatus: 'Pending' | 'In Progress' | 'Completed' | 'Needs Repair' | 'For Verification' = 'Pending';
+        let normalizedStatus: 'Pending' | 'In Progress' | 'Completed' | 'Needs Repair' | 'Under Repair' | 'For Verification' = 'Pending';
         let isReportVerified = false;
 
-        if (hasTasks && !allTasksDone) {
+        if (r.status === 'For Verification' && hasTasks && items.every(item => isChecklistItemComplete(item) || item.status === 'For Verification')) {
+          normalizedStatus = 'For Verification';
+        } else if (hasTasks && !allTasksDone) {
           // Required tasks exist but are NOT all done -> CANNOT be Completed or Verified
           isReportVerified = false;
           if (anyNeedsRepair || r.status === 'Needs Repair' || r.status === 'Under Repair') {
@@ -2240,7 +1609,7 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
             normalizedStatus = 'Completed';
             isReportVerified = true;
           } else {
-            normalizedStatus = 'For Verification';
+            normalizedStatus = 'In Progress';
             isReportVerified = false;
           }
         } else {
@@ -2263,20 +1632,38 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
           }
         }
 
+        const isRepairOrder = /^REP-/i.test(r.id) || /repair|corrective/i.test(r.type || '');
+        if (isRepairOrder && ['completed', 'verified'].includes(String(r.status).trim().toLowerCase())) {
+          normalizedStatus = 'Completed';
+          isReportVerified = true;
+          items.forEach(item => {
+            if (!item.linkedRepairId) {
+              item.status = 'Completed';
+              item.repaired = true;
+              item.isRepaired = true;
+              item.verified = true;
+            }
+          });
+        }
+
         reportsMap.set(r.id, {
           id: r.id,
-          airconId: r.aircon_name || r.aircon_id || 'AC Unit',
-          airconName: r.aircon_name || r.aircon_id || 'AC Unit',
-          airconType: r.aircon_type || 'Split Type (Inverter)',
-          roomId: r.room_id || undefined,
-          location: loc,
+          updatedAt: r.updated ?? null,
+          airconId: r.aircon_id || '',
+          airconName: equipment.airconName,
+          airconType: equipment.airconType,
+          controllerId: equipment.controllerId,
+          controllerName: equipment.controllerName,
+          protocolName: equipment.protocolName,
+          roomId: equipment.roomId,
+          location: equipment.location || 'Assigned Area',
           title: r.type || `${r.aircon_name || 'AC'} Maintenance`,
           description: r.description || (r.issue?.notes) || '',
           type: r.type || 'Preventive Maintenance',
           assignedWorker: r.staff_name || workerName || 'Maintenance Staff',
           staffId: r.staff_id || undefined,
           priority: (r.priority as any) || 'Medium',
-          dueDate: r.due_date || 'Scheduled Inspection',
+          dueDate: r.due_date || '—',
           createdDate: r.created_date || (r.created ? new Date(r.created).toLocaleDateString() : undefined),
           status: normalizedStatus,
           lastUpdated: lastUpdatedStr,
@@ -2286,15 +1673,13 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
           timeline: Array.isArray(r.timeline) ? r.timeline : [],
           parentReportId: extractedParentReportId,
           linkedRepairId: extractedLinkedRepairId,
-          reworkInstructions: extractedReworkInstructions,
           isVerified: isReportVerified,
           isRepaired: (r.id.startsWith('REP-') || (r.type && r.type.toLowerCase().includes('repair'))) ? isReportVerified : false,
         });
       });
     }
 
-    // Link child repair reports created by Admin to parent maintenance reports
-    // ONLY if parentReportId is explicitly defined on the child report.
+    // 2. Link child repair reports created by Admin to parent maintenance reports
     for (const rep of reportsMap.values()) {
       if (rep.parentReportId) {
         const parentReport = reportsMap.get(rep.parentReportId);
@@ -2304,381 +1689,63 @@ export async function fetchLiveMaintenanceReports(workerName?: string): Promise<
       }
     }
 
-    let reportsList = Array.from(reportsMap.values());
-    if (workerName && workerName.trim()) {
-      const normalizedWorker = workerName.trim().toLowerCase();
-      reportsList = reportsList.filter(
-        (r) =>
-          !r.assignedWorker ||
-          r.assignedWorker.toLowerCase() === normalizedWorker ||
-          r.assignedWorker.toLowerCase() === 'maintenance staff' ||
-          r.assignedWorker.toLowerCase() === 'all'
-      );
+    // Reconcile only visible, explicitly linked children. Keep backend flags for children hidden by RLS.
+    for (const report of reportsMap.values()) {
+      let reconciled = false;
+      for (const item of report.items) {
+        const child = item.linkedRepairId
+          ? Array.from(reportsMap.values()).find(rep => rep.id.toLowerCase() === item.linkedRepairId?.toLowerCase())
+          : undefined;
+        if (!child) continue;
+        reconciled = true;
+        const done = isRepairDone(child);
+        item.status = done ? 'Completed' : isRepairAwaitingVerification(child) ? 'For Verification' : 'Under Repair';
+        item.repaired = done;
+        item.isRepaired = done;
+        item.verified = done;
+        if (!done) item.verifiedAt = null;
+      }
+      if (reconciled) {
+        const approved = rawReportsData?.find((row: any) => row.id === report.id);
+        const allDone = report.items.length > 0 && report.items.every(isChecklistItemComplete);
+        report.isVerified = allDone && ['Completed', 'Verified'].includes(approved?.status);
+        report.status = report.items.some(item => item.status === 'Under Repair') ? 'Under Repair'
+          : report.items.some(item => item.status === 'Needs Repair') ? 'Needs Repair'
+          : allDone ? report.isVerified ? 'Completed' : approved?.status === 'For Verification' ? 'For Verification' : 'In Progress'
+          : approved?.status === 'For Verification' && report.items.every(item => isChecklistItemComplete(item) || item.status === 'For Verification')
+            ? 'For Verification' : 'In Progress';
+      }
     }
-
+    const synchronizedReports = Array.from(reportsMap.values());
+    // Keep storage references in the report. Only visible photos request signed
+    // URLs, so storage latency cannot block the checklist list or its refresh.
+    const reportsList = synchronizedReports.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
     return reportsList;
   } catch (e) {
+      scope?.recordError(e);
     console.error('Error fetching live maintenance reports:', e);
     return [];
   }
 }
 
-export async function updateLiveMaintenanceReport(
-  reportId: string,
-  params: {
-    status?: 'Pending' | 'In Progress' | 'Completed' | 'Needs Repair' | 'For Verification';
-    items?: LiveMaintenanceItem[];
-    workerName?: string;
-    location?: string;
-    airconId?: string;
-    airconType?: string;
-    verificationRemarks?: string;
-    existingTimeline?: any[];
-    customTimelineTitle?: string;
+export async function updateLiveMaintenanceReport(reportId: string, params: MaintenanceUpdateParams) {
+  if (params.items) {
+    const error = validateLiveMaintenanceItems(params.items);
+    if (error) return { success: false, error, status: undefined, updated: undefined };
   }
-): Promise<{ success: boolean; error?: string }> {
   try {
-    const { status, items, workerName, location, airconId, airconType, verificationRemarks, existingTimeline, customTimelineTitle } = params;
-
-    if (items) {
-      const validationError = validateLiveMaintenanceItems(items);
-      if (validationError) return { success: false, error: validationError };
-    }
-
-    const updateTimestamp = new Date().toISOString();
-
-    const payload: any = {
-      updated: updateTimestamp,
-    };
-
-    if (status) {
-      payload.status = status;
-    }
-
-    if (airconType) {
-      payload.aircon_type = airconType;
-    }
-
-    if (verificationRemarks !== undefined) {
-      payload.verification_remarks = verificationRemarks;
-    }
-
-    if (items) {
-      payload.tasks = items.map((it, idx) => ({
-        id: it.id || idx + 1,
-        name: it.title,
-        description: it.description,
-        status: it.status,
-        notes: it.remarks || '',
-        problemDescription: it.problemDescription || '',
-        photoUri: it.photoUri || (it.photoUris && it.photoUris[0]) || null,
-        photoUris: it.photoUris || (it.photoUri ? [it.photoUri] : []),
-        repaired: Boolean(it.repaired || it.isRepaired),
-        verified: Boolean(it.verified),
-        updated: it.updatedAt || updateTimestamp,
-        updated_at: it.updatedAt || updateTimestamp,
-        linkedRepairId: it.linkedRepairId || null,
-      }));
-
-      // If any item is marked "Needs Repair" or "Under Repair", save defect issue details for desktop dashboard.
-      // If none is "Needs Repair" / "Under Repair" or status is Completed or For Verification, clear the issue.
-      const repairItems = items.filter((i) => i.status === 'Needs Repair' || i.status === 'Under Repair');
-      if (repairItems.length > 0 && status !== 'Completed' && status !== 'For Verification') {
-        const repairItem = repairItems[0];
-        const allDefectNames = repairItems.map((i) => i.title).join(', ');
-        const allDefectNotes = repairItems.length === 1
-          ? (repairItem.problemDescription || repairItem.remarks || 'Maintenance defect requires repair')
-          : repairItems.map((i) => `${i.title}: ${i.problemDescription || i.remarks || 'Defect reported'}`).join(' • ');
-        payload.issue = {
-          component: allDefectNames,
-          components: repairItems.map((i) => i.title),
-          notes: allDefectNotes,
-          photoUri: repairItems.find((i) => i.photoUri || (i.photoUris && i.photoUris.length > 0))?.photoUri || (repairItems.find((i) => i.photoUris && i.photoUris.length > 0)?.photoUris?.[0]) || null,
-          photoUris: repairItems.flatMap((i) => i.photoUris || (i.photoUri ? [i.photoUri] : [])),
-          reported_by: workerName || 'Maintenance Staff',
-          reported_at: new Date().toISOString(),
-        };
-      } else {
-        payload.issue = null;
-      }
-    }
-
-    // Add activity timeline entry
-    const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const newTimelineEntry = {
-      title: customTimelineTitle || (status === 'For Verification'
-        ? `Checklist completed & submitted for admin verification by ${workerName || 'Maintenance Staff'}`
-        : `Maintenance updated by ${workerName || 'Maintenance Staff'} (${status || 'Updated'})`),
-      time: timeString,
-      done: true,
-    };
-    payload.timeline = [newTimelineEntry, ...(existingTimeline || [])];
-
-    const { data: updatedReport, error } = await supabase
-      .from('maintenance_reports')
-      .update(payload)
-      .eq('id', reportId)
-      .select('id')
-      .maybeSingle();
-
-    if (error || !updatedReport) {
-      // If report record doesn't exist yet, insert it with upsert
-      let safeNodeId: string | null = null;
-      if (airconId) {
-        const { data: matchedNodes } = await supabase
-          .from('nodes')
-          .select('id')
-          .or(`id.eq.${airconId},name.eq.${airconId}`)
-          .limit(1);
-        safeNodeId = matchedNodes?.[0]?.id || null;
-      }
-
-      payload.id = reportId;
-      payload.aircon_id = safeNodeId;
-      payload.aircon_name = airconId || 'AC Unit';
-      payload.room_name = location || 'Assigned Area';
-      payload.staff_name = workerName || 'Maintenance Staff';
-      payload.created = new Date().toISOString();
-      const { error: upsertError } = await supabase.from('maintenance_reports').upsert(payload, { onConflict: 'id' });
-      if (upsertError) {
-        return { success: false, error: upsertError.message };
-      }
-    }
-
-    // Push live notification with deduplication to prevent spamming duplicate notification cards
-    try {
-      const isUrgent = status === 'Needs Repair';
-      const notifType = isUrgent ? 'urgent_repair' : 'status_update';
-      const notifTitle = isUrgent
-        ? `URGENT: Defect in ${airconId || 'AC Unit'}`
-        : `Task Updated: ${airconId || 'AC Unit'} (${status || 'Updated'})`;
-      const notifMessage = `Maintenance update for ${reportId} at ${location || 'Assigned Area'}. Status: ${status || 'Updated'}.`;
-
-      // Check if a notification for this report & type already exists
-      const { data: existingNotifs } = await supabase
-        .from('mobile_notifications')
-        .select('id')
-        .eq('related_report_id', reportId)
-        .eq('type', notifType)
-        .order('created_at', { ascending: false })
-        .limit(1);
-
-      if (existingNotifs && existingNotifs.length > 0) {
-        // Update existing notification to avoid duplicate card spam
-        await supabase
-          .from('mobile_notifications')
-          .update({
-            title: notifTitle,
-            message: notifMessage,
-            updated_at: new Date().toISOString(),
-            is_read: false,
-          })
-          .eq('id', existingNotifs[0].id);
-      } else {
-        // Insert new notification
-        await supabase.from('mobile_notifications').insert({
-          id: `mob_maint_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          staff_name: workerName || 'Maintenance Staff',
-          title: notifTitle,
-          message: notifMessage,
-          type: notifType,
-          priority: isUrgent ? 'critical' : 'medium',
-          category: 'task',
-          related_report_id: reportId,
-          aircon_id: airconId,
-          aircon_name: airconId,
-          location: location,
-          is_read: false,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-      }
-    } catch (notifErr) {
-      // safe fallback
-    }
-
-    return { success: true };
-  } catch (e: any) {
-    console.error('Error in updateLiveMaintenanceReport:', e);
-    return { success: false, error: e?.message || 'Unknown error' };
+    const items = params.items?.map(item => ({ ...item,
+      photoUri: imageReference(item.photoUri, SUPABASE_URL),
+      photoUris: item.photoUris?.map(uri => imageReference(uri, SUPABASE_URL)!).filter(Boolean),
+    }));
+    return updateMaintenanceReportRpc(supabase, reportId, { ...params, items });
+  } catch {
+    return { success: false, error: 'A photo is unavailable. Upload it again before saving.' };
   }
 }
 
-/**
- * Submits a corrective repair order and automatically synchronizes the parent maintenance report:
- * 1. Sets child repair (REP-xxxx) status to 'For Verification' and marks its tasks as Completed.
- * 2. Finds the parent maintenance report (MR-xxxx).
- * 3. Marks the corresponding checklist task in the parent report as 'Completed' and repaired.
- * 4. Recalculates the parent report's completion progress. If all tasks are completed/repaired,
- *    automatically transitions the parent report from 'Under Repair' to 'For Verification'.
- * 5. Saves changes to Supabase so both Mobile and Desktop dashboard tables update instantly.
- */
-export async function submitRepairAndSyncParent(
-  repairId: string,
-  workerName?: string
-): Promise<{ success: boolean; error?: string; updatedParentId?: string; parentStatus?: string }> {
-  try {
-    const updateTimestamp = new Date().toISOString();
-    const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-    // 1. Fetch the child repair report
-    const { data: repairData, error: repairFetchErr } = await supabase
-      .from('maintenance_reports')
-      .select('*')
-      .eq('id', repairId)
-      .maybeSingle();
-
-    if (repairFetchErr || !repairData) {
-      return { success: false, error: repairFetchErr?.message || 'Repair report not found' };
-    }
-
-    // 2. Mark all tasks of the child repair as Completed
-    const repairTasks = Array.isArray(repairData.tasks) ? repairData.tasks : [];
-    const completedRepairTasks = repairTasks.map((t: any) => ({
-      ...t,
-      status: 'Completed',
-      repaired: true,
-      updated_at: updateTimestamp,
-    }));
-
-    const repairTimeline = [
-      {
-        title: `Corrective repair completed & submitted for admin verification by ${workerName || 'Maintenance Staff'}`,
-        time: timeString,
-        done: true,
-      },
-      ...(Array.isArray(repairData.timeline) ? repairData.timeline : []),
-    ];
-
-    // Update child repair report in Supabase
-    const { error: repairUpdateErr } = await supabase
-      .from('maintenance_reports')
-      .update({
-        status: 'For Verification',
-        repaired: true,
-        is_repaired: true,
-        tasks: completedRepairTasks,
-        timeline: repairTimeline,
-        updated: updateTimestamp,
-      })
-      .eq('id', repairId);
-
-    if (repairUpdateErr) {
-      return { success: false, error: repairUpdateErr.message };
-    }
-
-    // 3. Find parent report ID
-    const parentReportId: string | null =
-      repairData.parent_report_id ||
-      repairData.parentReportId ||
-      repairData.issue?.parent_report_id ||
-      repairData.issue?.parentReportId ||
-      null;
-
-    if (!parentReportId) {
-      return { success: true };
-    }
-
-    // 4. Fetch the parent maintenance report
-    const { data: parentData, error: parentFetchErr } = await supabase
-      .from('maintenance_reports')
-      .select('*')
-      .eq('id', parentReportId)
-      .maybeSingle();
-
-    if (parentFetchErr || !parentData) {
-      return { success: true };
-    }
-
-    // 5. Update the corresponding task in the parent report
-    const parentTasks = Array.isArray(parentData.tasks) ? parentData.tasks : [];
-    const updatedParentTasks = parentTasks.map((pt: any) => {
-      const isMatchingTask =
-        pt.linkedRepairId === repairId ||
-        pt.linked_repair_id === repairId ||
-        pt.repairId === repairId ||
-        pt.repair_id === repairId ||
-        (repairData.issue?.parentTaskId && String(pt.id) === String(repairData.issue.parentTaskId)) ||
-        (repairData.issue?.component && String(pt.name || pt.title).toLowerCase().trim() === String(repairData.issue.component).toLowerCase().trim());
-
-      if (isMatchingTask) {
-        return {
-          ...pt,
-          status: 'Completed',
-          repaired: true,
-          isRepaired: true,
-          updated_at: updateTimestamp,
-        };
-      }
-      return pt;
-    });
-
-    // 6. Recalculate parent report status & metrics
-    const remainingUnderRepair = updatedParentTasks.filter(
-      (t: any) =>
-        !t.repaired &&
-        !t.isRepaired &&
-        (t.status === 'Needs Repair' || t.status === 'Under Repair' || Boolean(t.linkedRepairId || t.linked_repair_id))
-    );
-
-    const allParentTasksDone =
-      updatedParentTasks.length > 0 &&
-      updatedParentTasks.every((t: any) => t.status === 'Completed' || t.repaired || t.isRepaired);
-
-    let newParentStatus = parentData.status;
-    if (remainingUnderRepair.length === 0 && allParentTasksDone) {
-      newParentStatus = 'For Verification';
-    } else if (remainingUnderRepair.length > 0) {
-      newParentStatus = 'Under Repair';
-    } else if (allParentTasksDone) {
-      newParentStatus = 'For Verification';
-    }
-
-    // Update parent issue notes if some defects remain
-    let updatedParentIssue = parentData.issue;
-    if (remainingUnderRepair.length === 0) {
-      updatedParentIssue = null;
-    } else {
-      updatedParentIssue = {
-        ...(parentData.issue || {}),
-        components: remainingUnderRepair.map((t: any) => t.name || t.title),
-        component: remainingUnderRepair.map((t: any) => t.name || t.title).join(', '),
-      };
-    }
-
-    const parentTimeline = [
-      {
-        title: `Repair #${repairId} submitted. Task marked resolved by ${workerName || 'Maintenance Staff'}.`,
-        time: timeString,
-        done: true,
-      },
-      ...(Array.isArray(parentData.timeline) ? parentData.timeline : []),
-    ];
-
-    const { error: parentUpdateErr } = await supabase
-      .from('maintenance_reports')
-      .update({
-        status: newParentStatus,
-        tasks: updatedParentTasks,
-        issue: updatedParentIssue,
-        timeline: parentTimeline,
-        updated: updateTimestamp,
-      })
-      .eq('id', parentReportId);
-
-    if (parentUpdateErr) {
-      console.warn('Parent report update warning:', parentUpdateErr.message);
-    }
-
-    return {
-      success: true,
-      updatedParentId: parentReportId,
-      parentStatus: newParentStatus,
-    };
-  } catch (err: any) {
-    console.error('Error in submitRepairAndSyncParent:', err);
-    return { success: false, error: err?.message || 'Failed to synchronize repair submission' };
-  }
+export async function submitRepairAndSyncParent(repairId: string, _workerName?: string, context: Partial<MaintenanceMutationContext> = {}) {
+  return submitRepairRpc(supabase, repairId, context);
 }
 
 export function subscribeToMaintenanceReports(callback: () => void) {
@@ -2714,10 +1781,12 @@ export function subscribeToMaintenanceReports(callback: () => void) {
         schema: 'public',
         table: 'nodes',
       },
-      () => {
-        callback();
-      }
+      payload => { if (metadataChanged(supabase, 'nodes', payload)) callback(); }
     )
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'aircons' }, payload => { if (metadataChanged(supabase, 'aircons', payload)) callback(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, () => { invalidateReferenceRows(supabase, 'rooms'); callback(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, () => { invalidateReferenceRows(supabase, 'floors'); callback(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, () => { invalidateReferenceRows(supabase, 'buildings'); callback(); })
     .subscribe();
 
   return () => {

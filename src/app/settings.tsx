@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import { Colors as UiColors, type AppColors, Spacing } from '@/constants/theme';
+import React, { useState } from 'react';
 import {
   StyleSheet,
   View,
@@ -9,9 +10,10 @@ import {
   Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
 import { ThemedText } from '@/components/themed-text';
-import { Spacing } from '@/constants/theme';
+
 import { useAuth } from '@/context/auth-context';
 import { useSettings, SystemSettings } from '@/context/settings-context';
 import { FloatingBottomNavbar } from '@/components/floating-navbar';
@@ -28,72 +30,54 @@ export default function SettingsScreen() {
     resetDefaults,
     clearLocalCache,
   } = useSettings();
+  const styles = themedStyles[effectiveTheme];
 
   const isDark = effectiveTheme === 'dark';
 
-  const [selectedTheme, setSelectedTheme] = useState<'light' | 'dark' | 'system'>(settings.theme);
-  const [tempUnit, setTempUnit] = useState<'C' | 'F'>(settings.tempUnit);
-  const [autoSyncEnabled, setAutoSyncEnabled] = useState(settings.autoSyncEnabled);
-  const [syncFrequency, setSyncFrequency] = useState<5 | 15 | 30>(settings.syncFrequency);
-  const [criticalAlertsEnabled, setCriticalAlertsEnabled] = useState(settings.criticalAlertsEnabled);
-  const [maintenanceRemindersEnabled, setMaintenanceRemindersEnabled] = useState(
-    settings.maintenanceRemindersEnabled
-  );
-  const [hapticFeedbackEnabled, setHapticFeedbackEnabled] = useState(
-    settings.hapticFeedbackEnabled
-  );
+  const {
+    theme: selectedTheme,
+    tempUnit,
+    autoSyncEnabled,
+    syncFrequency,
+    criticalAlertsEnabled,
+    maintenanceRemindersEnabled,
+    hapticFeedbackEnabled,
+  } = settings;
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [cacheCleared, setCacheCleared] = useState(false);
 
-  useEffect(() => {
-    setSelectedTheme(settings.theme);
-    setTempUnit(settings.tempUnit);
-    setAutoSyncEnabled(settings.autoSyncEnabled);
-    setSyncFrequency(settings.syncFrequency);
-    setCriticalAlertsEnabled(settings.criticalAlertsEnabled);
-    setMaintenanceRemindersEnabled(settings.maintenanceRemindersEnabled);
-    setHapticFeedbackEnabled(settings.hapticFeedbackEnabled);
-  }, [settings]);
-
   // Handle instant theme change
   const handleThemeChange = (newTheme: 'light' | 'dark' | 'system') => {
-    setSelectedTheme(newTheme);
     updateSetting('theme', newTheme);
   };
 
   // Handle instant temp unit change
   const handleTempUnitChange = (newUnit: 'C' | 'F') => {
-    setTempUnit(newUnit);
     updateSetting('tempUnit', newUnit);
   };
 
   // Handle instant sync frequency change
   const handleSyncFrequencyChange = (newFreq: 5 | 15 | 30) => {
-    setSyncFrequency(newFreq);
     updateSetting('syncFrequency', newFreq);
   };
 
   // Handle instant auto sync toggle
   const handleAutoSyncToggle = (val: boolean) => {
-    setAutoSyncEnabled(val);
     updateSetting('autoSyncEnabled', val);
   };
 
   // Handle instant critical alerts toggle
   const handleCriticalAlertsToggle = (val: boolean) => {
-    setCriticalAlertsEnabled(val);
     updateSetting('criticalAlertsEnabled', val);
   };
 
   // Handle instant maintenance reminders toggle
   const handleMaintenanceRemindersToggle = (val: boolean) => {
-    setMaintenanceRemindersEnabled(val);
     updateSetting('maintenanceRemindersEnabled', val);
   };
 
   // Handle instant haptic feedback toggle
   const handleHapticFeedbackToggle = (val: boolean) => {
-    setHapticFeedbackEnabled(val);
     updateSetting('hapticFeedbackEnabled', val);
   };
 
@@ -133,86 +117,79 @@ export default function SettingsScreen() {
 
   const handleReset = async () => {
     await resetDefaults();
-    setSelectedTheme('system');
-    setTempUnit('C');
-    setAutoSyncEnabled(true);
-    setSyncFrequency(15);
-    setCriticalAlertsEnabled(true);
-    setMaintenanceRemindersEnabled(true);
-    setHapticFeedbackEnabled(true);
   };
 
   return (
-    <SafeAreaView
-      style={[
-        styles.safeArea,
-        { backgroundColor: isDark ? '#0a0f1d' : '#f8fafc' },
-      ]}
-      edges={['top']}
+    <LinearGradient
+      colors={[UiColors[effectiveTheme].background, UiColors[effectiveTheme].background]}
+      style={[styles.container, { backgroundColor: colors.background }]}
+      start={{ x: 0, y: 0 }}
+      end={{ x: 0, y: 0.4 }}
     >
-      {/* Top Header */}
-      <View
-        style={[
-          styles.headerContainer,
-          {
-            backgroundColor: isDark ? '#0f172a' : '#ffffff',
-            borderBottomColor: isDark ? '#1e293b' : '#e2e8f0',
-          },
-        ]}
-      >
-        <Pressable
-          onPress={() => router.back()}
-          style={({ pressed }) => [styles.backButton, pressed && { opacity: 0.6 }]}
-          hitSlop={12}
-        >
-          <ThemedText
-            style={[styles.backArrow, { color: isDark ? '#ffffff' : '#064e3b' }]}
-          >
-            ←
-          </ThemedText>
-        </Pressable>
-        <View style={styles.headerTitles}>
-          <ThemedText
-            style={[styles.pageTitle, { color: isDark ? '#ffffff' : '#064e3b' }]}
-          >
-            System Settings
-          </ThemedText>
-          <ThemedText
-            style={[
-              styles.pageSubtitle,
-              { color: isDark ? '#94a3b8' : '#6b7280' },
-            ]}
-          >
-            Preferences & Configuration
-          </ThemedText>
-        </View>
-      </View>
-
-      <ScrollView
-        style={styles.scrollBody}
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator={false}
-      >
-        {/* 1. Display & Measurement */}
+      <SafeAreaView style={styles.safeArea} edges={['top']}>
+        {/* Top Header */}
         <View
           style={[
-            styles.cardSection,
+            styles.headerContainer,
             {
-              backgroundColor: isDark ? '#151e32' : '#ffffff',
-              borderColor: isDark ? '#334155' : '#e2e8f0',
+              backgroundColor: isDark ? '#0f172a' : UiColors[effectiveTheme].backgroundElement,
+              borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
             },
           ]}
         >
-          <ThemedText
-            style={[styles.sectionHeading, { color: isDark ? '#34d399' : '#059669' }]}
+          <Pressable
+            onPress={() => router.back()}
+            style={({ pressed }) => [styles.backButton, pressed && { opacity: 0.6 }]}
+            hitSlop={12}
           >
-            Display & Measurement
-          </ThemedText>
+            <ThemedText
+              style={[styles.backArrow, { color: isDark ? UiColors[effectiveTheme].onPrimary : UiColors[effectiveTheme].text }]}
+            >
+              ←
+            </ThemedText>
+          </Pressable>
+          <View style={styles.headerTitles}>
+            <ThemedText
+              style={[styles.pageTitle, { color: isDark ? UiColors[effectiveTheme].onPrimary : UiColors[effectiveTheme].text }]}
+            >
+              System Settings
+            </ThemedText>
+            <ThemedText
+              style={[
+                styles.pageSubtitle,
+                { color: isDark ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].textSecondary },
+              ]}
+            >
+              Preferences & Configuration
+            </ThemedText>
+          </View>
+        </View>
+
+        <ScrollView
+          style={styles.scrollBody}
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+        >
+          {/* 1. Display & Measurement */}
+          <View
+            style={[
+              styles.cardSection,
+              {
+                backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                borderColor: UiColors[effectiveTheme].panelBorder,
+              },
+            ]}
+          >
+            <ThemedText
+              style={[styles.sectionHeading, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
+            >
+              Display & Measurement
+            </ThemedText>
 
           {/* Theme Selector */}
           <View style={styles.inputGroup}>
             <ThemedText
-              style={[styles.inputLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+              style={[styles.inputLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
             >
               App Display Theme
             </ThemedText>
@@ -237,10 +214,10 @@ export default function SettingsScreen() {
                         styles.segmentedBtnText,
                         {
                           color: isActive
-                            ? '#ffffff'
+                            ? UiColors[effectiveTheme].onPrimary
                             : isDark
-                            ? '#cbd5e1'
-                            : '#475569',
+                            ? UiColors[effectiveTheme].textMuted
+                            : UiColors[effectiveTheme].textSecondary,
                         },
                       ]}
                     >
@@ -255,7 +232,7 @@ export default function SettingsScreen() {
           {/* Temperature Unit */}
           <View style={[styles.inputGroup, { marginTop: 16 }]}>
             <ThemedText
-              style={[styles.inputLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+              style={[styles.inputLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
             >
               Temperature Unit
             </ThemedText>
@@ -280,10 +257,10 @@ export default function SettingsScreen() {
                         styles.segmentedBtnText,
                         {
                           color: isActive
-                            ? '#ffffff'
+                            ? UiColors[effectiveTheme].onPrimary
                             : isDark
-                            ? '#cbd5e1'
-                            : '#475569',
+                            ? UiColors[effectiveTheme].textMuted
+                            : UiColors[effectiveTheme].textSecondary,
                         },
                       ]}
                     >
@@ -301,13 +278,13 @@ export default function SettingsScreen() {
           style={[
             styles.cardSection,
             {
-              backgroundColor: isDark ? '#151e32' : '#ffffff',
-              borderColor: isDark ? '#334155' : '#e2e8f0',
+              backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+              borderColor: UiColors[effectiveTheme].panelBorder,
             },
           ]}
         >
           <ThemedText
-            style={[styles.sectionHeading, { color: isDark ? '#34d399' : '#059669' }]}
+            style={[styles.sectionHeading, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
           >
             Telemetry & Live Sync
           </ThemedText>
@@ -315,19 +292,19 @@ export default function SettingsScreen() {
           <View
             style={[
               styles.toggleRow,
-              { borderBottomColor: isDark ? '#1e293b' : '#f1f5f9' },
+              { borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
             ]}
           >
             <View style={{ flex: 1, paddingRight: 10 }}>
               <ThemedText
-                style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+                style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
               >
                 Live Telemetry Auto-Sync
               </ThemedText>
               <ThemedText
                 style={[
                   styles.toggleSubtext,
-                  { color: isDark ? '#94a3b8' : '#64748b' },
+                  { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary },
                 ]}
               >
                 Real-time PostgreSQL background streaming
@@ -343,7 +320,7 @@ export default function SettingsScreen() {
 
           <View style={[styles.inputGroup, { marginTop: 16 }]}>
             <ThemedText
-              style={[styles.inputLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+              style={[styles.inputLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
             >
               Sync Polling Rate
             </ThemedText>
@@ -368,10 +345,10 @@ export default function SettingsScreen() {
                         styles.segmentedBtnText,
                         {
                           color: isActive
-                            ? '#ffffff'
+                            ? UiColors[effectiveTheme].onPrimary
                             : isDark
-                            ? '#cbd5e1'
-                            : '#475569',
+                            ? UiColors[effectiveTheme].textMuted
+                            : UiColors[effectiveTheme].textSecondary,
                         },
                       ]}
                     >
@@ -389,13 +366,13 @@ export default function SettingsScreen() {
           style={[
             styles.cardSection,
             {
-              backgroundColor: isDark ? '#151e32' : '#ffffff',
-              borderColor: isDark ? '#334155' : '#e2e8f0',
+              backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+              borderColor: UiColors[effectiveTheme].panelBorder,
             },
           ]}
         >
           <ThemedText
-            style={[styles.sectionHeading, { color: isDark ? '#34d399' : '#059669' }]}
+            style={[styles.sectionHeading, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
           >
             Alerts & Notifications
           </ThemedText>
@@ -403,19 +380,19 @@ export default function SettingsScreen() {
           <View
             style={[
               styles.toggleRow,
-              { borderBottomColor: isDark ? '#1e293b' : '#f1f5f9' },
+              { borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
             ]}
           >
             <View style={{ flex: 1, paddingRight: 10 }}>
               <ThemedText
-                style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+                style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
               >
                 Critical Temp Thresholds
               </ThemedText>
               <ThemedText
                 style={[
                   styles.toggleSubtext,
-                  { color: isDark ? '#94a3b8' : '#64748b' },
+                  { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary },
                 ]}
               >
                 Alert banner when room temperatures exceed 28°C
@@ -432,19 +409,19 @@ export default function SettingsScreen() {
           <View
             style={[
               styles.toggleRow,
-              { borderBottomColor: isDark ? '#1e293b' : '#f1f5f9' },
+              { borderBottomColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border },
             ]}
           >
             <View style={{ flex: 1, paddingRight: 10 }}>
               <ThemedText
-                style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+                style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
               >
                 Maintenance Reminders
               </ThemedText>
               <ThemedText
                 style={[
                   styles.toggleSubtext,
-                  { color: isDark ? '#94a3b8' : '#64748b' },
+                  { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary },
                 ]}
               >
                 Notices for filter inspection and scheduled checklists
@@ -461,14 +438,14 @@ export default function SettingsScreen() {
           <View style={[styles.toggleRow, { borderBottomWidth: 0 }]}>
             <View style={{ flex: 1, paddingRight: 10 }}>
               <ThemedText
-                style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+                style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
               >
                 Haptic Feedback
               </ThemedText>
               <ThemedText
                 style={[
                   styles.toggleSubtext,
-                  { color: isDark ? '#94a3b8' : '#64748b' },
+                  { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary },
                 ]}
               >
                 Physical device vibration on urgent alarms and taps
@@ -488,13 +465,13 @@ export default function SettingsScreen() {
           style={[
             styles.cardSection,
             {
-              backgroundColor: isDark ? '#151e32' : '#ffffff',
-              borderColor: isDark ? '#334155' : '#e2e8f0',
+              backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+              borderColor: UiColors[effectiveTheme].panelBorder,
             },
           ]}
         >
           <ThemedText
-            style={[styles.sectionHeading, { color: isDark ? '#34d399' : '#059669' }]}
+            style={[styles.sectionHeading, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
           >
             Offline Storage & Cache
           </ThemedText>
@@ -524,7 +501,7 @@ export default function SettingsScreen() {
                   : 'Clears offline telemetry buffers and cached reports'}
               </ThemedText>
             </View>
-            <AppIcon name="trash" size={20} color="#ef4444" />
+            <AppIcon name="trash" size={20} color={UiColors[effectiveTheme].error} />
           </Pressable>
         </View>
 
@@ -533,13 +510,13 @@ export default function SettingsScreen() {
           style={[
             styles.cardSection,
             {
-              backgroundColor: isDark ? '#151e32' : '#ffffff',
-              borderColor: isDark ? '#334155' : '#e2e8f0',
+              backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+              borderColor: UiColors[effectiveTheme].panelBorder,
             },
           ]}
         >
           <ThemedText
-            style={[styles.sectionHeading, { color: isDark ? '#34d399' : '#059669' }]}
+            style={[styles.sectionHeading, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
           >
             System Diagnostics
           </ThemedText>
@@ -548,14 +525,14 @@ export default function SettingsScreen() {
             style={[
               styles.diagnosticsBox,
               {
-                backgroundColor: isDark ? '#0a0f1d' : '#f8fafc',
-                borderColor: isDark ? '#334155' : '#e2e8f0',
+                backgroundColor: isDark ? UiColors[effectiveTheme].background : UiColors[effectiveTheme].background,
+                borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
               },
             ]}
           >
             <View style={styles.diagRow}>
               <ThemedText
-                style={[styles.diagLabel, { color: isDark ? '#94a3b8' : '#64748b' }]}
+                style={[styles.diagLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}
               >
                 Server Status
               </ThemedText>
@@ -565,11 +542,11 @@ export default function SettingsScreen() {
                     width: 8,
                     height: 8,
                     borderRadius: 4,
-                    backgroundColor: '#10b981',
+                    backgroundColor: UiColors[effectiveTheme].primaryFill,
                   }}
                 />
                 <ThemedText
-                  style={[styles.diagValue, { color: isDark ? '#34d399' : '#059669' }]}
+                  style={[styles.diagValue, { color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].emerald }]}
                 >
                   Cloud Live Sync
                 </ThemedText>
@@ -577,24 +554,24 @@ export default function SettingsScreen() {
             </View>
             <View style={styles.diagRow}>
               <ThemedText
-                style={[styles.diagLabel, { color: isDark ? '#94a3b8' : '#64748b' }]}
+                style={[styles.diagLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}
               >
                 App Version
               </ThemedText>
               <ThemedText
-                style={[styles.diagValue, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+                style={[styles.diagValue, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
               >
                 v1.2.0 • EcoTrack Mobile
               </ThemedText>
             </View>
             <View style={styles.diagRow}>
               <ThemedText
-                style={[styles.diagLabel, { color: isDark ? '#94a3b8' : '#64748b' }]}
+                style={[styles.diagLabel, { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary }]}
               >
                 Technician ID
               </ThemedText>
               <ThemedText
-                style={[styles.diagValue, { color: isDark ? '#f1f5f9' : '#1e293b' }]}
+                style={[styles.diagValue, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}
               >
                 {userId || 'stf_dc3099cc58504e5'}
               </ThemedText>
@@ -607,7 +584,7 @@ export default function SettingsScreen() {
           <ThemedText
             style={[
               styles.resetBtnText,
-              { color: isDark ? '#94a3b8' : '#64748b' },
+              { color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary },
             ]}
           >
             Reset to Factory Defaults
@@ -624,7 +601,7 @@ export default function SettingsScreen() {
         >
           {saveSuccess ? (
             <View style={styles.successRow}>
-              <ThemedText style={{ color: '#ffffff', fontSize: 16, fontWeight: '900' }}>
+              <ThemedText style={{ color: UiColors[effectiveTheme].onPrimary, fontSize: 16, fontWeight: '900' }}>
                 ✓
               </ThemedText>
               <ThemedText style={styles.saveButtonText}>SAVED SUCCESSFULLY</ThemedText>
@@ -639,11 +616,15 @@ export default function SettingsScreen() {
 
       {/* Persistent Floating Bottom Navigation */}
       <FloatingBottomNavbar currentPage={'profile' as any} />
-    </SafeAreaView>
+      </SafeAreaView>
+    </LinearGradient>
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
+  container: {
+    flex: 1,
+  },
   safeArea: {
     flex: 1,
   },
@@ -686,7 +667,7 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     padding: Spacing.four,
     borderWidth: 1,
-    shadowColor: '#000000',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.05,
     shadowRadius: 8,
@@ -725,16 +706,16 @@ const styles = StyleSheet.create({
     }),
   },
   segmentedBtnActive: {
-    backgroundColor: '#10b981',
-    borderColor: '#10b981',
+    backgroundColor: colors.primaryFill,
+    borderColor: colors.emerald,
   },
   segmentedBtnInactiveLight: {
-    backgroundColor: '#f1f5f9',
-    borderColor: '#e2e8f0',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   segmentedBtnInactiveDark: {
-    backgroundColor: '#0a0f1d',
-    borderColor: '#334155',
+    backgroundColor: colors.background,
+    borderColor: colors.border,
   },
   segmentedBtnText: {
     fontSize: 12,
@@ -762,9 +743,9 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     padding: 14,
     borderRadius: 14,
-    backgroundColor: '#fef2f2',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: '#fecaca',
+    borderColor: colors.border,
     ...Platform.select({
       web: {
         cursor: 'pointer',
@@ -772,25 +753,25 @@ const styles = StyleSheet.create({
     }),
   },
   cacheBtnDark: {
-    backgroundColor: 'rgba(239, 68, 68, 0.12)',
-    borderColor: 'rgba(239, 68, 68, 0.35)',
+    backgroundColor: colors.errorSurface,
+    borderColor: colors.border,
   },
   cacheBtnText: {
     fontSize: 13.5,
     fontWeight: '800',
-    color: '#b91c1c',
+    color: colors.error,
   },
   cacheBtnTextDark: {
-    color: '#f87171',
+    color: colors.error,
   },
   cacheBtnSubtext: {
     fontSize: 11.5,
-    color: '#991b1b',
+    color: colors.error,
     marginTop: 2,
     lineHeight: 16,
   },
   cacheBtnSubtextDark: {
-    color: '#fca5a5',
+    color: colors.error,
   },
   diagnosticsBox: {
     borderRadius: 14,
@@ -823,12 +804,12 @@ const styles = StyleSheet.create({
     textDecorationLine: 'underline',
   },
   saveButton: {
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     borderRadius: 14,
     paddingVertical: 15,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#10b981',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.25,
     shadowRadius: 8,
@@ -840,7 +821,7 @@ const styles = StyleSheet.create({
     }),
   },
   saveButtonText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 13.5,
     fontWeight: '800',
     letterSpacing: 0.8,
@@ -851,3 +832,4 @@ const styles = StyleSheet.create({
     gap: 8,
   },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };

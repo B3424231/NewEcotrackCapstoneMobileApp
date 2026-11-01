@@ -6,17 +6,16 @@ import { ThemedText } from './themed-text';
 import { 
   ICON_HOME,
   ICON_MAINTENANCE, 
-  ICON_DEVICES
+  ICON_DEVICES,
+  getColoredSvgUri,
 } from '@/constants/custom-icons';
 
 const ICON_NOTIFICATION = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmZmZmIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTE4IDhBNiA2IDAgMCAwIDYgOGMwIDctMyA5LTMgOWgxOHMtMy0yLTMtOSIvPjxwYXRoIGQ9Ik0xMy43MyAyMWEyIDIgMCAwIDEtMy40NiAwIi8+PC9zdmc+';
 const ICON_PROFILE = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmZmZmIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTIwIDIxdi0yYTQgNCAwIDAgMC00LTRIOGE0IDQgMCAwIDAtNCA0djIiLz48Y2lyY2xlIGN4PSIxMiIgY3k9IjciIHI9IjQiLz48L3N2Zz4=';
 
 import { useAuth } from '@/context/auth-context';
-import { 
-  fetchLiveMobileNotifications, 
-  subscribeToMobileNotifications 
-} from '@/services/mobile-notifications';
+import { useSettings } from '@/context/settings-context';
+import { useMobileNotifications } from '@/hooks/use-mobile-notifications';
 import { 
   fetchLiveMaintenanceReports, 
   subscribeToMaintenanceReports 
@@ -26,7 +25,7 @@ const AVATAR_DEFAULT = require('@/assets/images/avatar_default.png');
 const AVATAR_MALE = require('@/assets/images/avatar_male.png');
 const AVATAR_FEMALE = require('@/assets/images/avatar_female.png');
 
-export type TabPageType = 'sensor-location' | 'maintenance' | 'devices' | 'aircons' | 'notifications' | 'profile';
+export type TabPageType = 'home' | 'sensor-location' | 'maintenance' | 'devices' | 'aircons' | 'notifications' | 'profile';
 
 interface TabItem {
   id: TabPageType;
@@ -44,27 +43,30 @@ interface FloatingBottomNavbarProps {
 }
 
 export function FloatingBottomNavbar({ currentPage }: FloatingBottomNavbarProps) {
-  const { userAvatar, userCustomPhotoUri, userName } = useAuth();
-  const [maintenanceBadgeCount, setMaintenanceBadgeCount] = useState<number>(0);
-  const [alertsBadgeCount, setAlertsBadgeCount] = useState<number>(0);
+  const { userAvatar, userCustomPhotoUri, userName, userId, userType, isAuthenticated } = useAuth();
+  const { effectiveTheme } = useSettings();
+  const isDark = effectiveTheme === 'dark';
+  const accountKey = isAuthenticated && userId ? `${userType}:${userId}` : undefined;
+  const [maintenanceBadge, setMaintenanceBadge] = useState<{ accountKey?: string; count: number }>({ count: 0 });
+  const maintenanceBadgeCount = maintenanceBadge.accountKey === accountKey ? maintenanceBadge.count : 0;
+  const { items: notifications } = useMobileNotifications(accountKey);
+  const alertsBadgeCount = notifications.filter(note => !note.isRead).length;
 
   useEffect(() => {
     let isMounted = true;
+    let requestId = 0;
+    if (!accountKey) return;
 
     const loadBadgeCounts = async () => {
+      const request = ++requestId;
       try {
-        const [notifs, reports] = await Promise.all([
-          fetchLiveMobileNotifications(userName),
-          fetchLiveMaintenanceReports(userName),
-        ]);
+        const reports = await fetchLiveMaintenanceReports(userName);
 
-        if (isMounted) {
-          const unreadAlerts = notifs.filter((n) => !n.isRead).length;
+        if (isMounted && request === requestId) {
           const inProgress = reports.filter((r) => r.status === 'In Progress').length;
           const activeMaintenance = inProgress > 0 ? inProgress : reports.filter((r) => r.status === 'Pending').length;
 
-          setAlertsBadgeCount(unreadAlerts);
-          setMaintenanceBadgeCount(activeMaintenance);
+          setMaintenanceBadge({ accountKey, count: activeMaintenance });
         }
       } catch (e) {
         // Safe fallback
@@ -73,20 +75,15 @@ export function FloatingBottomNavbar({ currentPage }: FloatingBottomNavbarProps)
 
     loadBadgeCounts();
 
-    const unsubNotifs = subscribeToMobileNotifications(() => {
-      loadBadgeCounts();
-    });
-
     const unsubMaint = subscribeToMaintenanceReports(() => {
       loadBadgeCounts();
     });
 
     return () => {
       isMounted = false;
-      unsubNotifs();
       unsubMaint();
     };
-  }, [userName]);
+  }, [userName, accountKey]);
 
   const getAvatarSource = () => {
     if (userCustomPhotoUri) return { uri: userCustomPhotoUri };
@@ -131,34 +128,61 @@ export function FloatingBottomNavbar({ currentPage }: FloatingBottomNavbarProps)
 
   return (
     <View style={styles.navbarContainer as any}>
-      <View style={styles.navbarInner as any}>
+      <View
+        accessibilityRole="tablist"
+        accessibilityLabel="Main navigation"
+        style={[
+          styles.navbarInner as any,
+          isDark && {
+            backgroundColor: '#121826',
+            borderColor: 'rgba(255, 255, 255, 0.12)',
+          },
+        ]}
+      >
         {tabs.map((tab) => {
-          const isActive = currentPage === tab.id;
+          const isActive =
+            currentPage === tab.id ||
+            ((tab.id === 'sensor-location' || tab.id === 'home') &&
+              (currentPage === 'home' || currentPage === 'sensor-location')) ||
+            (tab.id === 'devices' && currentPage === 'aircons');
           const isProfileTab = tab.id === 'profile';
           const isCenterTab = tab.isCenter;
 
           if (isCenterTab) {
+            const centerIconColor = isActive ? '#ffffff' : (isDark ? 'rgba(255, 255, 255, 0.7)' : '#cbd5e1');
+            const centerIconUri = getColoredSvgUri(tab.icon, centerIconColor);
+
             return (
               <View key={tab.id} style={styles.centerTabWrapper as any}>
                 <Pressable
                   onPress={() => handlePress(tab.route)}
                   style={({ pressed }) => [
                     styles.centerButton as any,
+                    isDark && {
+                      backgroundColor: '#1e293b',
+                      borderColor: 'rgba(255, 255, 255, 0.2)',
+                    },
                     isActive && (styles.centerButtonActive as any),
                     pressed && (styles.centerButtonPressed as any),
                   ]}
-                  accessibilityRole="button"
-                  accessibilityLabel="Device Management"
+                  accessible
+                  accessibilityRole="tab"
+                  accessibilityLabel={tab.label}
+                  accessibilityState={{ selected: isActive }}
+                  aria-selected={isActive}
                 >
                   <View style={[styles.centerButtonInner as any, isActive && (styles.centerButtonInnerActive as any)]}>
                     <Image
-                      source={{ uri: tab.icon }}
+                      source={{ uri: centerIconUri }}
                       style={[styles.centerIcon as any, isActive && (styles.centerIconActive as any)]}
+                      tintColor={centerIconColor}
                       contentFit="contain"
                     />
                   </View>
                 </Pressable>
                 <ThemedText
+                  accessible={false}
+                  importantForAccessibility="no"
                   style={[
                     styles.centerTabLabel as any,
                     isActive ? (styles.tabLabelActive as any) : (styles.tabLabelInactive as any),
@@ -171,12 +195,21 @@ export function FloatingBottomNavbar({ currentPage }: FloatingBottomNavbarProps)
             );
           }
 
+          const tabColor = isActive ? '#34d399' : '#cbd5e1';
+          const coloredIconUri = getColoredSvgUri(tab.icon, tabColor);
+
           return (
             <Pressable
               key={tab.id}
+              accessible
+              accessibilityRole="tab"
+              accessibilityLabel={tab.label}
+              accessibilityState={{ selected: isActive }}
+                  aria-selected={isActive}
               onPress={() => handlePress(tab.route)}
               style={({ pressed }) => [
                 styles.tabButton as any,
+                (tab.id === 'maintenance' || tab.id === 'notifications') && styles.longLabelTab,
                 pressed && (styles.tabButtonPressed as any),
               ]}
             >
@@ -196,11 +229,12 @@ export function FloatingBottomNavbar({ currentPage }: FloatingBottomNavbarProps)
                   </View>
                 ) : (
                   <Image
-                    source={{ uri: tab.icon }}
+                    source={{ uri: coloredIconUri }}
                     style={[
                       styles.tabIcon as any,
                       isActive ? (styles.tabIconActive as any) : (styles.tabIconInactive as any),
                     ]}
+                    tintColor={tabColor}
                     contentFit="contain"
                   />
                 )}
@@ -229,7 +263,7 @@ export function FloatingBottomNavbar({ currentPage }: FloatingBottomNavbarProps)
                   styles.tabLabel as any,
                   isActive ? (styles.tabLabelActive as any) : (styles.tabLabelInactive as any),
                 ]}
-                numberOfLines={1}
+                numberOfLines={2}
               >
                 {tab.label}
               </ThemedText>
@@ -252,7 +286,7 @@ const styles = StyleSheet.create({
   },
   navbarInner: {
     flexDirection: 'row',
-    backgroundColor: '#0b291d', // Solid deep forest green
+    backgroundColor: '#121826', // Solid deep forest green
     borderRadius: 28,
     paddingVertical: 8,
     paddingHorizontal: 6,
@@ -261,7 +295,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-around',
     alignItems: 'center',
     borderWidth: 1.2,
-    borderColor: 'rgba(16, 185, 129, 0.28)',
+    borderColor: '#334155',
     ...Platform.select({
       ios: {
         shadowColor: '#000000',
@@ -276,11 +310,14 @@ const styles = StyleSheet.create({
   },
   tabButton: {
     flex: 1,
-    height: 48,
+    minHeight: 48,
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 2,
     gap: 3,
+  },
+  longLabelTab: {
+    flex: 1.5,
   },
   tabButtonPressed: {
     transform: [{ scale: 0.92 }],
@@ -298,12 +335,12 @@ const styles = StyleSheet.create({
     height: 22,
   },
   tabIconActive: {
-    tintColor: '#10b981', // Glowing brand emerald
+    tintColor: '#34d399', // Glowing brand emerald
     ...Platform.select({
       ios: {
         shadowColor: '#10b981',
         shadowOffset: { width: 0, height: 0 },
-        shadowOpacity: 0.9,
+        shadowOpacity: 0,
         shadowRadius: 6,
       },
       android: {
@@ -312,23 +349,25 @@ const styles = StyleSheet.create({
     }),
   },
   tabIconInactive: {
-    tintColor: 'rgba(255, 255, 255, 0.45)',
+    tintColor: '#cbd5e1',
   },
   tabLabel: {
     fontSize: 9.5,
+    lineHeight: 12,
+    maxWidth: '100%',
     fontWeight: '700',
     letterSpacing: 0.2,
     textAlign: 'center',
   },
   tabLabelActive: {
-    color: '#10b981',
+    color: '#34d399',
     fontWeight: '900',
     textShadowColor: 'rgba(16, 185, 129, 0.75)',
     textShadowOffset: { width: 0, height: 0 },
-    textShadowRadius: 8,
+    textShadowRadius: 0,
   },
   tabLabelInactive: {
-    color: 'rgba(255, 255, 255, 0.45)',
+    color: '#cbd5e1',
     fontWeight: '600',
   },
 
@@ -344,7 +383,7 @@ const styles = StyleSheet.create({
     width: 48,
     height: 48,
     borderRadius: 24,
-    backgroundColor: '#0b291d',
+    backgroundColor: '#121826',
     borderWidth: 2.5,
     borderColor: 'rgba(255, 255, 255, 0.35)',
     alignItems: 'center',
@@ -356,7 +395,7 @@ const styles = StyleSheet.create({
       ios: {
         shadowColor: '#10b981',
         shadowOffset: { width: 0, height: 0 },
-        shadowOpacity: 0.9,
+        shadowOpacity: 0,
         shadowRadius: 10,
       },
       android: {
@@ -373,7 +412,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   centerButtonInnerActive: {
-    backgroundColor: '#10b981',
+    backgroundColor: '#047857',
   },
   centerButtonPressed: {
     transform: [{ scale: 0.92 }],
@@ -431,7 +470,7 @@ const styles = StyleSheet.create({
       ios: {
         shadowColor: '#10b981',
         shadowOffset: { width: 0, height: 0 },
-        shadowOpacity: 0.95,
+        shadowOpacity: 0,
         shadowRadius: 8,
       },
       android: {

@@ -1,7 +1,8 @@
-import React from 'react';
-import { View, StyleProp, ViewStyle } from 'react-native';
+import React, { useMemo } from 'react';
+import { View, StyleProp, ViewStyle, Platform } from 'react-native';
 import { SymbolView, SFSymbol } from 'expo-symbols';
 import { Image } from 'expo-image';
+import { useTheme } from '@/hooks/use-theme';
 import {
   ICON_USER,
   ICON_GEAR,
@@ -25,6 +26,21 @@ import {
   ICON_ALERT_TRIANGLE,
   ICON_CHECK_CIRCLE,
   ICON_TEMPERATURE,
+  ICON_AIRCONSTATE,
+  ICON_BATTERY,
+  ICON_BLUETOOTH,
+  ICON_WIFI,
+  ICON_CHEVRON_RIGHT,
+  ICON_CHEVRON_DOWN,
+  ICON_EDIT,
+  ICON_EYE,
+  ICON_EYE_OFF,
+  ICON_MORE_VERTICAL,
+  ICON_PLUS,
+  ICON_DEVICES,
+  ICON_HOME,
+  ICON_PHONE,
+  getColoredSvgUri,
 } from '@/constants/custom-icons';
 
 export type AppIconName =
@@ -49,7 +65,22 @@ export type AppIconName =
   | 'camera'
   | 'search'
   | 'filter'
-  | 'thermometer';
+  | 'thermometer'
+  | 'snowflake'
+  | 'aircon'
+  | 'battery'
+  | 'bluetooth'
+  | 'wifi'
+  | 'chevron-right'
+  | 'chevron-down'
+  | 'edit'
+  | 'eye'
+  | 'eye-off'
+  | 'more-vertical'
+  | 'plus'
+  | 'devices'
+  | 'home'
+  | 'phone';
 
 export interface AppIconProps {
   name: AppIconName;
@@ -81,26 +112,63 @@ const ICON_MAP: Record<AppIconName, { sf: SFSymbol; svg: string }> = {
   search: { sf: 'magnifyingglass', svg: ICON_SEARCH },
   filter: { sf: 'line.3.horizontal.decrease', svg: ICON_FILTER },
   thermometer: { sf: 'thermometer.medium', svg: ICON_TEMPERATURE },
+  snowflake: { sf: 'snowflake', svg: ICON_AIRCONSTATE },
+  aircon: { sf: 'snowflake', svg: ICON_AIRCONSTATE },
+  battery: { sf: 'battery.100', svg: ICON_BATTERY },
+  bluetooth: { sf: 'antenna.radiowaves.left.and.right', svg: ICON_BLUETOOTH },
+  wifi: { sf: 'wifi', svg: ICON_WIFI },
+  'chevron-right': { sf: 'chevron.right', svg: ICON_CHEVRON_RIGHT },
+  'chevron-down': { sf: 'chevron.down', svg: ICON_CHEVRON_DOWN },
+  edit: { sf: 'pencil', svg: ICON_EDIT },
+  eye: { sf: 'eye', svg: ICON_EYE },
+  'eye-off': { sf: 'eye.slash', svg: ICON_EYE_OFF },
+  'more-vertical': { sf: 'ellipsis', svg: ICON_MORE_VERTICAL },
+  plus: { sf: 'plus', svg: ICON_PLUS },
+  devices: { sf: 'cpu', svg: ICON_DEVICES },
+  home: { sf: 'house.fill', svg: ICON_HOME },
+  phone: { sf: 'phone.fill', svg: ICON_PHONE },
 };
 
-export function AppIcon({ name, size = 16, color = '#64748b', style }: AppIconProps) {
+export function AppIcon({ name, size = 16, color: requestedColor, style }: AppIconProps) {
+  const theme = useTheme();
+  const color = requestedColor ?? theme.textSecondary;
   const icon = ICON_MAP[name];
+  const coloredUri = useMemo(() => {
+    return icon ? getColoredSvgUri(icon.svg, color) : '';
+  }, [icon?.svg, color]);
+
+  const imageStyle = useMemo(
+    () => ({
+      width: size,
+      height: size,
+    }),
+    [size]
+  );
+
   if (!icon) return null;
 
   return (
     <View style={[{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }, style]}>
-      <SymbolView
-        name={icon.sf}
-        tintColor={color}
-        size={size}
-        fallback={
-          <Image
-            source={{ uri: icon.svg }}
-            style={{ width: size, height: size, tintColor: color }}
-            contentFit="contain"
-          />
-        }
-      />
+      {Platform.OS === 'ios' ? (
+        <SymbolView
+          name={icon.sf}
+          tintColor={color}
+          size={size}
+          fallback={
+            <Image
+              source={{ uri: coloredUri }}
+              style={imageStyle}
+              contentFit="contain"
+            />
+          }
+        />
+      ) : (
+        <Image
+          source={{ uri: coloredUri }}
+          style={imageStyle}
+          contentFit="contain"
+        />
+      )}
     </View>
   );
 }

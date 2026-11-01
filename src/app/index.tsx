@@ -1,4 +1,13 @@
-import { useState, useRef, useEffect } from 'react';
+import { AppState } from 'react-native';
+import { Colors as UiColors, type AppColors, Colors, GlassStyles, Spacing } from '@/constants/theme';
+import { useState, useRef, useEffect, useCallback, type SetStateAction } from 'react';
+import { useSessionPageSnapshot } from '@/hooks/use-session-page-snapshot';
+import { createReadScope } from '@/services/query-utils';
+import { applyHomeControllerState, mergeHomeControllerFetch } from '@/services/home-controller-state';
+import { CloudHardware, type CloudDeviceState } from '@/services/cloud-hardware';
+import { createRefreshCoordinator, type RefreshCoordinator } from '@/services/refresh-coordinator';
+import { DataListSkeleton } from '@/components/data-list-skeleton';
+
 import {
   StyleSheet,
   View,
@@ -9,7 +18,6 @@ import {
   Animated,
   Dimensions,
   RefreshControl,
-  ActivityIndicator,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -18,11 +26,12 @@ import { Image } from 'expo-image';
 import { router } from 'expo-router';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Colors, GlassStyles, Spacing } from '@/constants/theme';
+
 import { useAuth } from '@/context/auth-context';
 import { useSettings } from '@/context/settings-context';
 import {
-  fetchLiveSensors,
+  fetchLiveAcControllers,
+  fetchLiveSensorReadings,
   subscribeToNodes,
   fetchActiveRoom,
   ActiveRoomData,
@@ -31,8 +40,8 @@ import {
 } from '@/services/supabase';
 
 // Import newly organized dashboard subcomponents
-import { SensorCard, SensorData } from '@/components/sensor-card';
-import { SensorDetailSheet } from '@/components/sensor-detail-sheet';
+import { AcControllerCard, AcControllerData } from '@/components/sensor-card';
+import { AcControllerDetailSheet } from '@/components/sensor-detail-sheet';
 import { FloatingBottomNavbar } from '@/components/floating-navbar';
 import { LocationIcon } from '@/components/location-icon';
 import { AppIcon } from '@/components/app-icon';
@@ -47,81 +56,104 @@ const AVATAR_MALE = require('@/assets/images/avatar_male.png');
 const AVATAR_FEMALE = require('@/assets/images/avatar_female.png');
 
 export default function HomeScreen() {
-  const { logout, userName, userRole, userPhone, userEmail, userAssignment, setUserAssignment, userAvatar, userCustomPhotoUri } = useAuth();
+  const { logout, userId, userName, userRole, userPhone, userEmail, userAssignment, setUserAssignment, userAvatar, userCustomPhotoUri } = useAuth();
   const { effectiveTheme, colors, settings, triggerHaptic } = useSettings();
+  const styles = themedStyles[effectiveTheme];
   const theme = effectiveTheme;
 
-  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const [pulseAnim] = useState(() => new Animated.Value(1));
 
-  // Supabase live sensors and room assignment state
-  const [sensors, setSensors] = useState<SensorData[]>([]);
-  const [activeRoom, setActiveRoom] = useState<ActiveRoomData | null>(null);
-  const [assignmentInfo, setAssignmentInfo] = useState<WorkerAssignmentResult | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Supabase live AC controllers and room assignment state
+  const fetchUser = userId || userEmail || userPhone || userName;
+  const { data, loading, error: fetchError, setData, commit, startLoading, fail, isCurrent: isSessionCurrent } =
+    useSessionPageSnapshot<{ controllers: AcControllerData[]; activeRoom: ActiveRoomData | null; assignmentInfo: WorkerAssignmentResult | null }>(
+      fetchUser ? `home:${fetchUser}` : undefined, () => ({ controllers: [], activeRoom: null, assignmentInfo: null }));
+  const { activeRoom, assignmentInfo } = data;
+  const controllers = data.controllers.map(item => applyHomeControllerState(item));
+  const visibleControllers = useRef(controllers);
+  useEffect(() => { visibleControllers.current = controllers; }, [controllers]);
+  const lastInventoryRead = useRef(0);
+  const setControllers = useCallback((value: SetStateAction<AcControllerData[]>) => setData(previous => ({ ...previous,
+    controllers: typeof value === 'function' ? value(previous.controllers) : value,
+  })), [setData]);
   const [refreshing, setRefreshing] = useState(false);
+  const refreshRef = useRef<RefreshCoordinator | null>(null);
 
-  const loadSensors = async (showLoadingSpinner = false) => {
-    if (showLoadingSpinner) setLoading(true);
+  const fetchControllers = useCallback(async (isCurrent: () => boolean) => {
+    if (!isSessionCurrent()) return;
+    startLoading();
+    const scope = createReadScope();
     try {
-      // 1. Resolve worker assignment against active rooms/floors/buildings hierarchy
-      const resolved = await resolveWorkerAssignment(userEmail || userPhone || userName);
-      setAssignmentInfo(resolved);
-
-      // Keep AuthContext in sync with live database status
-      if (resolved.assignmentText !== userAssignment) {
-        setUserAssignment(resolved.assignmentText);
-      }
-
-      if (!resolved.isAssigned || !resolved.roomId) {
-        // Worker is Unassigned (or room/floor was erased) -> 0 sensors displayed
-        setSensors([]);
-        setActiveRoom(null);
-      } else {
-        // Worker only sees sensors based on their assigned room
-        const [sensorData, roomData] = await Promise.all([
-          fetchLiveSensors(resolved.roomId),
-          fetchActiveRoom(resolved.roomId),
-        ]);
-        setSensors(sensorData || []);
-        setActiveRoom(roomData);
-      }
+      const resolved = await resolveWorkerAssignment(userId || userEmail || userPhone || userName, scope);
+      scope.assertSuccessful();
+      const [controllerData, roomData] = resolved.isAssigned && resolved.roomId
+        ? await Promise.all([fetchLiveAcControllers(resolved.roomId, scope), fetchActiveRoom(resolved.roomId, scope)])
+        : [[], null];
+      scope.assertSuccessful();
+      if (!isCurrent() || !isSessionCurrent()) return;
+      lastInventoryRead.current = Date.now();
+      setUserAssignment(resolved.assignmentText);
+      commit(current => ({ controllers: mergeHomeControllerFetch(controllerData || [], current.controllers), activeRoom: roomData, assignmentInfo: resolved }));
     } catch (err) {
-      console.error('Error fetching sensors:', err);
+      console.error('Error fetching AC controllers:', err);
+      if (isCurrent() && isSessionCurrent()) fail('Unable to refresh AC devices. Pull down to try again.');
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (isCurrent() && isSessionCurrent()) setRefreshing(false);
     }
-  };
+  }, [userId, userEmail, userPhone, userName, setUserAssignment, commit, startLoading, fail, isSessionCurrent]);
 
   useEffect(() => {
-    loadSensors(true);
-
-    if (!settings.autoSyncEnabled) {
-      return;
-    }
-
-    const unsubscribe = subscribeToNodes(() => {
-      loadSensors(false);
+    const refresh = createRefreshCoordinator(fetchControllers, 150, AppState);
+    refreshRef.current = refresh;
+    void refresh.refresh();
+    let readingHardware = false, disposed = false;
+    const unsubscribe = subscribeToNodes((row?: CloudDeviceState) => {
+      if (disposed || !isSessionCurrent()) return;
+      if (!refresh.isActive()) { refresh.schedule(); return; }
+      if (row) setControllers(current => current.map(item => applyHomeControllerState(item, row)));
+      else refresh.schedule();
     });
-
-    const intervalMs = settings.syncFrequency * 1000;
+    const heartbeatTimer = setInterval(() => { if (refresh.isActive()) setControllers(current => current.map(item => applyHomeControllerState(item))); }, 15000);
     const intervalId = setInterval(() => {
-      loadSensors(false);
-    }, intervalMs);
-
+      if (!refresh.isActive()) { refresh.schedule(); return; }
+      if (settings.autoSyncEnabled && Date.now() - lastInventoryRead.current >= 60000) void refresh.refresh();
+      if (readingHardware) return;
+      const visible = visibleControllers.current;
+      const newest = Math.max(...visible.map(item => Date.parse(item.lastSeen || '')).filter(Number.isFinite));
+      const since = Number.isFinite(newest) ? new Date(newest - 60000).toISOString() : undefined;
+      readingHardware = true;
+      const ids = visible.map(item => item.id);
+      const airconIds = Object.fromEntries(visible.filter(item => item.airconId).map(item => [item.id, item.airconId!]));
+      void Promise.allSettled([CloudHardware.listUpdates(ids, since), fetchLiveSensorReadings(ids, airconIds)]).then(results => {
+        if (disposed || !refresh.isActive() || !isSessionCurrent()) return;
+        setControllers(current => current.map(item => {
+          let next = item;
+          for (const [index, result] of results.entries()) if (result.status === 'fulfilled') {
+            if (index === 1 && item.airconId !== airconIds[item.id]) continue;
+            const row = result.value.find(state => state.node_id === item.id);
+            if (row) next = applyHomeControllerState(next, row);
+          }
+          return applyHomeControllerState(next);
+        }));
+      }).catch(() => { /* Retain the last values and their original ages. */ }).finally(() => { readingHardware = false; });
+    }, 2000);
     return () => {
+      disposed = true;
+      refresh.dispose();
+      if (refreshRef.current === refresh) refreshRef.current = null;
       unsubscribe();
-      clearInterval(intervalId);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (intervalId) clearInterval(intervalId);
     };
-  }, [settings.autoSyncEnabled, settings.syncFrequency]);
+  }, [fetchControllers, settings.autoSyncEnabled, setControllers, isSessionCurrent]);
 
   const onRefresh = () => {
     setRefreshing(true);
-    loadSensors(false);
+    void refreshRef.current?.refresh();
   };
 
   useEffect(() => {
-    Animated.loop(
+    const animation = Animated.loop(
       Animated.sequence([
         Animated.timing(pulseAnim, {
           toValue: 1.4,
@@ -134,8 +166,10 @@ export default function HomeScreen() {
           useNativeDriver: true,
         }),
       ])
-    ).start();
-  }, []);
+    );
+    animation.start();
+    return () => animation.stop();
+  }, [pulseAnim]);
 
   const getAvatarSource = (avatar: string, uri: string | null) => {
     if (avatar === 'custom' && uri) {
@@ -147,12 +181,14 @@ export default function HomeScreen() {
   };
 
   // States
-  const [selectedSensor, setSelectedSensor] = useState<SensorData | null>(null);
+  const [selectedControllerId, setSelectedControllerId] = useState<string | null>(null);
+  const selectedController = controllers.find(item => item.id === selectedControllerId) || null;
   const [bottomSheetVisible, setBottomSheetVisible] = useState(false);
-  const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
+  const detailsVisible = bottomSheetVisible && selectedController !== null;
+  const [slideAnim] = useState(() => new Animated.Value(SCREEN_HEIGHT));
 
-  const openDetails = (sensor: SensorData) => {
-    setSelectedSensor(sensor);
+  const openDetails = (item: AcControllerData) => {
+    setSelectedControllerId(item.id);
     setBottomSheetVisible(true);
     Animated.spring(slideAnim, {
       toValue: 0,
@@ -170,13 +206,13 @@ export default function HomeScreen() {
       useNativeDriver: true,
     }).start(() => {
       setBottomSheetVisible(false);
-      setSelectedSensor(null);
+      setSelectedControllerId(null);
     });
   };
 
   return (
     <LinearGradient 
-      colors={effectiveTheme === 'dark' ? ['#0f172a', '#0a0f1d'] : ['#d1fae5', '#ffffff']} 
+      colors={[UiColors[effectiveTheme].background, UiColors[effectiveTheme].background]} 
       style={[styles.container, { backgroundColor: colors.background }]} 
       start={{ x: 0, y: 0 }} 
       end={{ x: 0, y: 0.35 }}
@@ -219,12 +255,11 @@ export default function HomeScreen() {
 
           <View style={styles.contentBody}>
             {/* User Profile Info Card */}
-            {/* User Profile Info Card */}
             <View style={[
               styles.userProfileCard, 
               { 
-                backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff',
-                borderColor: effectiveTheme === 'dark' ? '#1e293b' : '#d1fae5',
+                backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                borderColor: UiColors[effectiveTheme].panelBorder,
               }
             ]}>
               {/* Card Top Section: Avatar & Main Details */}
@@ -243,19 +278,19 @@ export default function HomeScreen() {
                 
                 <View style={styles.userProfileCardDetails}>
                   <ThemedText style={[styles.userProfileCardName, { color: colors.text }]}>
-                    {userName || 'Rey O. Solamillo'}
+                    {userName || 'Staff Member'}
                   </ThemedText>
                   
                   {/* Role Badge Container */}
                   <View style={[
                     styles.roleBadge,
                     {
-                      backgroundColor: effectiveTheme === 'dark' ? '#064e3b' : '#ecfdf5',
-                      borderColor: effectiveTheme === 'dark' ? '#059669' : '#a7f3d0',
+                      backgroundColor: colors.accentSurface,
+                      borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                     }
                   ]}>
-                    <ThemedText style={[styles.roleBadgeText, { color: effectiveTheme === 'dark' ? '#34d399' : '#047857' }]}>
-                      {userRole || 'HVAC / Aircon Technician'}
+                    <ThemedText style={[styles.roleBadgeText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text }]}>
+                      {userRole || 'Staff'}
                     </ThemedText>
                   </View>
                   
@@ -263,90 +298,75 @@ export default function HomeScreen() {
                   <View style={styles.phoneRow}>
                     <ThemedText style={[styles.phoneLabel, { color: colors.textSecondary }]}>Phone:</ThemedText>
                     <ThemedText style={[styles.userProfileCardPhone, { color: colors.text }]}>
-                      {userPhone || '09853308630'}
+                      {userPhone || '—'}
                     </ThemedText>
                   </View>
                 </View>
               </View>
 
               {/* Card Bottom Section: Verified badge row */}
-              <View style={[styles.cardBottomRow, { borderTopColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+              <View style={[styles.cardBottomRow, { borderTopColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                 <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 6, flex: 1 }}>
-                  <LocationIcon size={14} color="#10b981" style={{ marginTop: 2, flexShrink: 0 }} />
+                  <LocationIcon size={14} color={UiColors[effectiveTheme].emerald} style={{ marginTop: 2, flexShrink: 0 }} />
                   <ThemedText
-                    style={[styles.cardBottomText, { color: effectiveTheme === 'dark' ? '#34d399' : '#059669', flex: 1 }]}
+                    style={[styles.cardBottomText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].textSecondary : UiColors[effectiveTheme].textSecondary, flex: 1 }]}
                     numberOfLines={2}
                   >
-                    Active Duty • {userAssignment || 'Unassigned'}
+                    {loading && !assignmentInfo ? 'Checking assignment...' : `Active Duty • ${userAssignment || 'Unassigned'}`}
                   </ThemedText>
                 </View>
               </View>
             </View>
 
-
-
-            {/* Room Location & Telemetry Context Bar (Mirroring Desktop Middle Panel) */}
-            {activeRoom ? (
+            {/* Room Location Context Bar */}
+            {loading && !activeRoom ? <DataListSkeleton label="Checking room assignment..." count={1} compact /> : fetchError && !activeRoom ? null : activeRoom ? (
               <View style={[
                 styles.roomContextCard,
                 {
-                  backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff',
-                  borderColor: effectiveTheme === 'dark' ? '#1e293b' : '#a7f3d0',
+                  backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                  borderColor: UiColors[effectiveTheme].panelBorder,
                 }
               ]}>
                 <View style={styles.roomContextTop}>
                   <View style={styles.roomIconTitleGroup}>
-                    <View style={[styles.roomIconCircle, { backgroundColor: effectiveTheme === 'dark' ? '#064e3b' : 'rgba(5, 150, 105, 0.12)' }]}>
-                      <LocationIcon size={16} color="#10b981" />
+                    <View style={[styles.roomIconCircle, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].accentSurface }]}>
+                      <LocationIcon size={16} color={UiColors[effectiveTheme].emerald} />
                     </View>
                     <View style={styles.roomTextContainer}>
                       <ThemedText style={[styles.roomTitleText, { color: colors.text }]} numberOfLines={1}>
                         {activeRoom.name}
                       </ThemedText>
-                      <ThemedText style={[styles.roomSubtitleText, { color: colors.emerald }]} numberOfLines={2}>
+                      <ThemedText style={[styles.roomSubtitleText, { color: colors.textSecondary }]} numberOfLines={2}>
                         {activeRoom.buildingName} • {activeRoom.floorName}
                       </ThemedText>
                     </View>
                   </View>
 
-                  {/* Capacity Pill mirroring desktop 1/10 nodes (10%) */}
-                  <View style={[styles.roomCapacityBadge, { backgroundColor: effectiveTheme === 'dark' ? '#064e3b' : '#f0fdf4', borderColor: effectiveTheme === 'dark' ? '#059669' : '#bbf7d0' }]}>
-                    <ThemedText style={[styles.roomCapacityText, { color: effectiveTheme === 'dark' ? '#34d399' : '#065f46' }]}>
-                      {sensors.length}/{activeRoom.nodeLimit} nodes
-                    </ThemedText>
-                    <ThemedText style={[styles.roomCapacityPercent, { color: colors.emerald }]}>
-                      {activeRoom.capacityPercentage}%
+                  {/* Device Count Badge */}
+                  <View style={[styles.roomCapacityBadge, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].accentSurface, borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
+                    <ThemedText style={[styles.roomCapacityText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text }]}>
+                      {controllers.length} {controllers.length === 1 ? 'device' : 'devices'}
                     </ThemedText>
                   </View>
-                </View>
-
-                {/* Progress Bar mirroring Desktop left panel progress bar */}
-                <View style={styles.progressBarBackground}>
-                  <View 
-                    style={[
-                      styles.progressBarFill, 
-                      { width: `${Math.min(100, Math.max(8, activeRoom.capacityPercentage))}%` }
-                    ]} 
-                  />
                 </View>
               </View>
             ) : (
               <View style={[
                 styles.unassignedCard,
                 {
-                  backgroundColor: effectiveTheme === 'dark' ? '#1c1917' : '#fffbeb',
-                  borderColor: effectiveTheme === 'dark' ? '#78350f' : '#fde68a',
+                  backgroundColor: effectiveTheme === 'dark' ? '#1c1917' : UiColors[effectiveTheme].warningSurface,
+                  borderColor: UiColors[effectiveTheme].panelBorder,
                 }
               ]}>
                 <View style={styles.unassignedCardTop}>
                   <View style={styles.unassignedIconCircle}>
-                    <LocationIcon size={16} color="#9ca3af" />
+                    <LocationIcon size={16} color={UiColors[effectiveTheme].textMuted} />
                   </View>
                   <View style={{ flex: 1 }}>
-                    <ThemedText style={[styles.unassignedTitleText, { color: effectiveTheme === 'dark' ? '#fde68a' : '#92400e' }]}>
+                    <ThemedText style={[styles.unassignedTitleText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].warning : UiColors[effectiveTheme].warning }]}>
                       Unassigned
                     </ThemedText>
-                    <ThemedText style={[styles.unassignedSubtitleText, { color: effectiveTheme === 'dark' ? '#d97706' : '#b45309' }]}>
+                    <ThemedText style={[styles.unassignedSubtitleText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].warning : UiColors[effectiveTheme].warning }]}>
                       No active room assignment
                     </ThemedText>
                   </View>
@@ -354,95 +374,90 @@ export default function HomeScreen() {
                     <ThemedText style={styles.unassignedPillText}>STANDBY</ThemedText>
                   </View>
                 </View>
-                <ThemedText style={[styles.unassignedDescText, { color: effectiveTheme === 'dark' ? '#fcd34d' : '#92400e' }]}>
-                  If your assigned room or building floor was erased on the desktop dashboard, you are assigned as Unassigned. Please contact your administrator.
+                <ThemedText style={[styles.unassignedDescText, { color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].warning : UiColors[effectiveTheme].warning }]}>
+                  Your assigned location is no longer available. Contact your administrator.
                 </ThemedText>
               </View>
             )}
 
-            {/* Assigned Room Sensors Section Header */}
+            {/* Assigned Room AC Controller Devices Section Header */}
             <View style={styles.sectionHeaderContainer}>
               <View style={styles.sectionTitleRow}>
                 <ThemedText type="smallBold" style={[styles.sectionTitle, { color: colors.text }]}>
-                  {activeRoom ? `ASSIGNED ROOM SENSORS (${sensors.length})` : 'ASSIGNED ROOM SENSORS (0)'}
+                  {loading && !activeRoom ? 'Assigned AC Device' : activeRoom ? `Assigned AC Device (${controllers.length})` : 'Assigned AC Device (0)'}
                 </ThemedText>
                 <View style={[
                   styles.liveSyncPill,
                   {
-                    backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#ffffff',
-                    borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0',
+                    backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
+                    borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                   },
-                  !settings.autoSyncEnabled && { backgroundColor: '#f1f5f9', borderColor: '#cbd5e1' },
+                  !settings.autoSyncEnabled && { backgroundColor: UiColors[effectiveTheme].backgroundSelected, borderColor: UiColors[effectiveTheme].border },
                 ]}>
                   <View style={[
                     styles.livePulseDot,
-                    !settings.autoSyncEnabled && { backgroundColor: '#94a3b8' },
+                    (!settings.autoSyncEnabled || !controllers.some(item => item.connectionState === 'online')) && { backgroundColor: '#94a3b8' },
                   ]} />
                 </View>
               </View>
-              <View style={[styles.thinDivider, { backgroundColor: effectiveTheme === 'dark' ? '#334155' : '#a7f3d0' }]} />
+              <View style={[styles.thinDivider, { backgroundColor: effectiveTheme === 'dark' ? 'rgba(255, 255, 255, 0.08)' : UiColors[effectiveTheme].accentSurface }]} />
             </View>
             
-            <View style={styles.sensorGrid}>
-              {loading && sensors.length === 0 ? (
-                <View style={{ paddingVertical: 40, alignItems: 'center', justifyContent: 'center' }}>
-                  <ActivityIndicator size="large" color="#059669" />
-                  <ThemedText style={{ marginTop: 12, fontSize: 13, color: '#6b7280', fontWeight: '600' }}>
-                    Syncing room sensor nodes...
-                  </ThemedText>
-                </View>
-              ) : !activeRoom ? (
+            {fetchError && <ThemedText style={{ color: colors.textSecondary, marginBottom: 12 }}>{fetchError}</ThemedText>}
+            <View style={styles.deviceGrid}>
+              {loading && controllers.length === 0 ? (
+                <DataListSkeleton label="Loading AC devices..." />
+              ) : fetchError && !activeRoom ? null : !activeRoom ? (
                 <View style={{ paddingVertical: 40, alignItems: 'center', justifyContent: 'center' }}>
                   <LocationIcon size={36} color={colors.textSecondary} />
                   <ThemedText style={{ marginTop: 12, fontSize: 15, color: colors.text, fontWeight: '800' }}>
-                    No Assigned Room Sensors
+                    No Assigned AC Device
                   </ThemedText>
                   <ThemedText style={{ marginTop: 6, fontSize: 12.5, color: colors.textSecondary, textAlign: 'center', paddingHorizontal: 30, lineHeight: 18 }}>
-                    You are currently unassigned. Once assigned to an active room by an administrator, your room's sensors will appear here automatically.
+                      Ask your administrator to assign a room. Its AC devices will appear here.
                   </ThemedText>
                 </View>
-              ) : sensors.length === 0 ? (
+              ) : controllers.length === 0 ? (
                 <View style={{ paddingVertical: 40, alignItems: 'center', justifyContent: 'center' }}>
                   <AppIcon name="bolt" size={36} color={colors.emerald} />
                   <ThemedText style={{ marginTop: 12, fontSize: 14, color: colors.text, fontWeight: '800' }}>
-                    No sensors assigned to {activeRoom.name}.
+                    No AC devices assigned to {activeRoom.name}.
                   </ThemedText>
                   <ThemedText style={{ marginTop: 6, fontSize: 12, color: colors.textSecondary, textAlign: 'center', paddingHorizontal: 30, lineHeight: 18 }}>
-                    Sensors placed into this room in the desktop Telemetry dashboard will appear here live.
+                    AC devices placed into this room will appear here live.
                   </ThemedText>
                 </View>
               ) : (
-                sensors.map((sensor) => (
-                  <SensorCard
-                    key={sensor.id}
-                    sensor={sensor}
-                    onPress={() => openDetails(sensor)}
+                controllers.map((controller) => (
+                  <AcControllerCard
+                    key={controller.id}
+                    controller={controller}
+                    onPress={() => openDetails(controller)}
                   />
                 ))
               )}
             </View>
-
 
           </View>
         </ScrollView>
       </SafeAreaView>
 
       {/* Slide-up Bottom Sheet Modal */}
-      <SensorDetailSheet
-        visible={bottomSheetVisible}
-        sensor={selectedSensor}
+      <AcControllerDetailSheet
+        key={userId + ":" + (selectedController?.id || "none")}
+        visible={detailsVisible}
+        controller={selectedController}
         onClose={closeDetails}
         slideAnim={slideAnim}
+        onReferenceSaved={(id, config) => { if (isSessionCurrent()) setControllers(current => current.map(item => item.id === id ? { ...item, sensorConfig: config, sensorConfigAt: config.airflow_reference.saved_at } : item)); }}
       />
 
-
-
-      {!bottomSheetVisible && <FloatingBottomNavbar currentPage="sensor-location" />}
+      {!detailsVisible && <FloatingBottomNavbar currentPage="home" />}
     </LinearGradient>
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
   container: {
     flex: 1,
   },
@@ -471,7 +486,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '800',
     lineHeight: 18,
-    color: '#064e3b',
+    color: colors.text,
   },
   hamburgerTriggerButton: {
     width: 40,
@@ -483,7 +498,7 @@ const styles = StyleSheet.create({
     position: 'relative',
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.1,
         shadowRadius: 4,
@@ -504,24 +519,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1.5,
-    borderColor: '#ffffff',
+    borderColor: colors.border,
     zIndex: 10,
   },
   hamburgerBadgeText: {
     fontSize: 8.5,
     fontWeight: '800',
-    color: '#ffffff',
+    color: colors.onPrimary,
     lineHeight: 11,
   },
   lightTriggerButton: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderWidth: 1,
     borderColor: Colors.light.border,
   },
   headerHamburgerLine: {
     width: 18,
     height: 2,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     borderRadius: 1,
   },
   scrollContent: {
@@ -538,27 +553,27 @@ const styles = StyleSheet.create({
     gap: Spacing.one,
   },
   welcomeText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 18,
     fontWeight: '800',
   },
   welcomeSub: {
-    color: '#a7f3d0',
+    color: colors.textMuted,
     fontSize: 13,
     lineHeight: 18,
   },
   // Room Location Context Card (Mirroring Desktop Middle Panel)
   roomContextCard: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderWidth: 1.5,
-    borderColor: '#a7f3d0',
+    borderColor: colors.panelBorder,
     borderRadius: 18,
     padding: 14,
     marginTop: Spacing.three,
     marginBottom: Spacing.one,
     ...Platform.select({
       ios: {
-        shadowColor: '#059669',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 3 },
         shadowOpacity: 0.07,
         shadowRadius: 8,
@@ -592,7 +607,7 @@ const styles = StyleSheet.create({
     width: 38,
     height: 38,
     borderRadius: 12,
-    backgroundColor: 'rgba(5, 150, 105, 0.12)',
+    backgroundColor: colors.accentSurface,
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
@@ -600,52 +615,36 @@ const styles = StyleSheet.create({
   roomTitleText: {
     fontSize: 16,
     fontWeight: '900',
-    color: '#064e3b',
+    color: colors.text,
     letterSpacing: 0.2,
   },
   roomSubtitleText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#059669',
+    color: colors.text,
     marginTop: 2,
     lineHeight: 15,
   },
   roomCapacityBadge: {
     flexShrink: 0,
-    alignItems: 'flex-end',
-    backgroundColor: '#f0fdf4',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: '#bbf7d0',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
+    borderColor: colors.border,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
     borderRadius: 10,
-    minWidth: 70,
   },
   roomCapacityText: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '800',
-    color: '#065f46',
-  },
-  roomCapacityPercent: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: '#059669',
-  },
-  progressBarBackground: {
-    height: 6,
-    backgroundColor: '#e5e7eb',
-    borderRadius: 3,
-    overflow: 'hidden',
-  },
-  progressBarFill: {
-    height: '100%',
-    backgroundColor: '#10b981',
-    borderRadius: 3,
+    color: colors.text,
   },
   unassignedCard: {
-    backgroundColor: '#fffbeb',
+    backgroundColor: colors.warningSurface,
     borderWidth: 1.5,
-    borderColor: '#fde68a',
+    borderColor: colors.panelBorder,
     borderRadius: 18,
     padding: 14,
     marginTop: Spacing.three,
@@ -661,25 +660,25 @@ const styles = StyleSheet.create({
     width: 38,
     height: 38,
     borderRadius: 12,
-    backgroundColor: 'rgba(217, 119, 6, 0.12)',
+    backgroundColor: colors.warningSurface,
     alignItems: 'center',
     justifyContent: 'center',
   },
   unassignedTitleText: {
     fontSize: 16,
     fontWeight: '900',
-    color: '#92400e',
+    color: colors.warning,
   },
   unassignedSubtitleText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#b45309',
+    color: colors.warning,
     marginTop: 1,
   },
   unassignedPill: {
-    backgroundColor: '#fef3c7',
+    backgroundColor: colors.warningSurface,
     borderWidth: 1,
-    borderColor: '#fde68a',
+    borderColor: colors.border,
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 8,
@@ -687,12 +686,12 @@ const styles = StyleSheet.create({
   unassignedPillText: {
     fontSize: 9.5,
     fontWeight: '800',
-    color: '#d97706',
+    color: colors.warning,
     letterSpacing: 0.5,
   },
   unassignedDescText: {
     fontSize: 11,
-    color: '#92400e',
+    color: colors.warning,
     lineHeight: 16,
   },
   sectionTitleRow: {
@@ -704,9 +703,9 @@ const styles = StyleSheet.create({
     width: 18,
     height: 18,
     borderRadius: 9,
-    backgroundColor: '#ecfdf5',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: '#a7f3d0',
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -714,12 +713,12 @@ const styles = StyleSheet.create({
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
   },
   liveSyncText: {
     fontSize: 9.5,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.emerald,
     letterSpacing: 0.5,
   },
   sectionTitle: {
@@ -733,11 +732,11 @@ const styles = StyleSheet.create({
   },
   thinDivider: {
     height: 1,
-    backgroundColor: '#a7f3d0', // thin white emerald green color highlight line
+    backgroundColor: colors.accentSurface, // thin white emerald green color highlight line
     marginTop: 6,
     width: '100%',
   },
-  sensorGrid: {
+  deviceGrid: {
     gap: Spacing.three,
   },
   infoSection: {
@@ -745,7 +744,7 @@ const styles = StyleSheet.create({
     padding: Spacing.four,
   },
   lightInfoSection: {
-    backgroundColor: '#f3f4f6',
+    backgroundColor: colors.backgroundSelected,
     borderWidth: 1,
     borderColor: Colors.light.border,
   },
@@ -762,7 +761,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     ...Platform.select({
       ios: {
-        shadowColor: '#10b981',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.08,
         shadowRadius: 6,
@@ -787,7 +786,7 @@ const styles = StyleSheet.create({
     height: 80,
     borderRadius: 40,
     borderWidth: 2.5,
-    borderColor: '#d1d5db', // Changed border line color into gray
+    borderColor: colors.panelBorder, // Changed border line color into gray
   },
   statusDotWrapper: {
     position: 'absolute',
@@ -803,16 +802,16 @@ const styles = StyleSheet.create({
     width: 14,
     height: 14,
     borderRadius: 7,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     borderWidth: 2,
-    borderColor: '#ffffff',
+    borderColor: colors.border,
   },
   statusDotPulse: {
     position: 'absolute',
     width: 20,
     height: 20,
     borderRadius: 10,
-    backgroundColor: 'rgba(16, 185, 129, 0.45)',
+    backgroundColor: colors.accentSurface,
   },
   userProfileCardDetails: {
     flex: 1,
@@ -822,7 +821,7 @@ const styles = StyleSheet.create({
   userProfileCardName: {
     fontSize: 16,
     fontWeight: '800',
-    color: '#0b291d',
+    color: colors.text,
   },
   roleBadge: {
     alignSelf: 'flex-start',
@@ -832,13 +831,13 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     marginTop: 4,
     borderWidth: 0.5,
-    borderColor: '#a7f3d0',
+    borderColor: colors.border,
     maxWidth: '100%',
   },
   roleBadgeText: {
     fontSize: 9.5,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.emerald,
     letterSpacing: 0.4,
     textTransform: 'uppercase',
     lineHeight: 13,
@@ -852,7 +851,7 @@ const styles = StyleSheet.create({
   },
   phoneLabel: {
     fontSize: 11,
-    color: '#9ca3af',
+    color: colors.textMuted,
     fontWeight: '700',
   },
   userProfileCardPhone: {
@@ -864,15 +863,16 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     borderTopWidth: 1,
-    borderTopColor: 'rgba(16, 185, 129, 0.12)',
+    borderTopColor: colors.border,
     paddingTop: 10,
     marginTop: 12,
   },
   cardBottomText: {
     fontSize: 10.5,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.emerald,
     letterSpacing: 0.3,
     lineHeight: 15,
   },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };

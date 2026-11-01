@@ -3,44 +3,44 @@ import { Platform } from 'react-native';
 
 export const Colors = {
   light: {
-    text: '#18392b', // Dark pine green text for default high-contrast on white bg
-    background: '#f9fafb', // White/light grey background for pages
-    backgroundElement: '#ffffff', // White elements
-    backgroundSelected: '#0b291d', // Deep Forest Green active select
-    textSecondary: '#6b7280', // Muted dark grey secondary text
-    border: '#10b981', // Thin emerald green border matching the image reference
-    
-    // Core EcoTrack brand tokens
-    emerald: '#10b981',
-    emeraldHover: '#059669',
-    deepForest: '#0b291d',
-    mutedPine: '#18392b',
-    
-    // Accent Colors
-    cyan: '#22d3ee',
-    amber: '#fbbf24',
-    rose: '#f87171',
+    text: '#0f172a', textSecondary: '#475569', textMuted: '#64748b',
+    background: '#f8fafc', backgroundElement: '#ffffff', backgroundSelected: '#f1f5f9',
+    panelBorder: '#10b981', border: '#e2e8f0', inputBorder: '#64748b',
+    emerald: '#047857', emeraldHover: '#065f46', deepForest: '#047857', mutedPine: '#0f172a',
+    primaryFill: '#047857', onPrimary: '#ffffff', accentSurface: '#ecfdf5',
+    cyan: '#1d4ed8', amber: '#92400e', rose: '#b91c1c',
+    success: '#166534', warning: '#92400e', error: '#b91c1c', info: '#1d4ed8',
+    successSurface: '#f0fdf4', warningSurface: '#fffbeb', errorSurface: '#fef2f2', infoSurface: '#eff6ff',
   },
   dark: {
-    text: '#f1f5f9', // Clean light slate text
-    background: '#0a0f1d', // Premium dark obsidian navy background
-    backgroundElement: '#151e32', // Elevated dark slate container
-    backgroundSelected: '#064e3b', // Deep emerald active select
-    textSecondary: '#94a3b8', // Muted slate secondary text
-    border: '#059669', // Emerald border
-    
-    // Core EcoTrack brand tokens
-    emerald: '#10b981',
-    emeraldHover: '#34d399',
-    deepForest: '#6ee7b7',
-    mutedPine: '#cbd5e1',
-    
-    // Accent Colors
-    cyan: '#38bdf8',
-    amber: '#fbbf24',
-    rose: '#fb7185',
+    text: '#f1f5f9', textSecondary: '#cbd5e1', textMuted: '#94a3b8',
+    background: '#0b1220', backgroundElement: '#121826', backgroundSelected: '#1e293b',
+    panelBorder: '#10b981', border: '#334155', inputBorder: '#64748b',
+    emerald: '#34d399', emeraldHover: '#6ee7b7', deepForest: '#34d399', mutedPine: '#f1f5f9',
+    primaryFill: '#047857', onPrimary: '#ffffff', accentSurface: '#123529',
+    cyan: '#93c5fd', amber: '#fbbf24', rose: '#fca5a5',
+    success: '#86efac', warning: '#fbbf24', error: '#fca5a5', info: '#93c5fd',
+    successSurface: '#142e22', warningSurface: '#33270f', errorSurface: '#361d23', infoSurface: '#192d49',
   },
 } as const;
+
+export type AppColors = typeof Colors.light | typeof Colors.dark;
+
+/** Presentation only: status names, transitions and permissions remain with their callers. */
+export function getStatusPalette(status: string, colors: AppColors) {
+  switch (status) {
+    case 'Completed': case 'Verified':
+      return { bg: colors.successSurface, text: colors.success, border: colors.success };
+    case 'In Progress': case 'Under Repair': case 'Assigned':
+      return { bg: colors.infoSurface, text: colors.info, border: colors.info };
+    case 'For Verification': case 'Awaiting Admin Verification':
+      return { bg: colors.warningSurface, text: colors.warning, border: colors.warning };
+    case 'Needs Repair':
+      return { bg: colors.errorSurface, text: colors.error, border: colors.error };
+    default:
+      return { bg: colors.backgroundSelected, text: colors.textSecondary, border: colors.border };
+  }
+}
 
 export type ThemeColor = keyof typeof Colors.light & keyof typeof Colors.dark;
 
@@ -68,7 +68,7 @@ export const Fonts = Platform.select({
 export const GlassStyles = {
   glassSurface: {
     backgroundColor: 'rgba(255, 255, 255, 0.85)',
-    borderColor: 'rgba(16, 185, 129, 0.15)',
+    borderColor: '#e2e8f0',
     borderWidth: 1,
     ...Platform.select({
       web: {
@@ -89,7 +89,7 @@ export const GlassStyles = {
   },
   glassElevated: {
     backgroundColor: 'rgba(255, 255, 255, 0.95)',
-    borderColor: 'rgba(16, 185, 129, 0.25)',
+    borderColor: '#e2e8f0',
     borderWidth: 1,
     ...Platform.select({
       web: {
@@ -110,7 +110,7 @@ export const GlassStyles = {
   },
   glassSoft: {
     backgroundColor: 'rgba(255, 255, 255, 0.65)',
-    borderColor: 'rgba(16, 185, 129, 0.1)',
+    borderColor: '#e2e8f0',
     borderWidth: 1,
     ...Platform.select({
       web: {

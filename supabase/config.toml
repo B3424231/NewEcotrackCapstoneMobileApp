@@ -1,0 +1,14 @@
+[functions.account-login]
+verify_jwt = false
+
+[functions.provision-staff]
+verify_jwt = false
+
+[functions.provision-admin]
+verify_jwt = false
+
+[functions.deliver-mobile-push]
+verify_jwt = false
+
+[functions.update-staff]
+verify_jwt = false

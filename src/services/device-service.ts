@@ -1,19 +1,37 @@
+import { Platform, PermissionsAndroid } from 'react-native';
+import type { NetInfoWifiState } from '@react-native-community/netinfo';
+import { fetchAccessibleRows, readWithTimeout, invalidateReferenceRows, metadataChanged, type ReadScope } from './query-utils';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase, DbNode, DbRoom, DbFloor, DbBuilding } from './supabase';
+import { CapabilityEngine } from './ac-controller-service';
+import { probeController, requestControllerJson } from './device-transport';
+import { CloudHardware, CloudHardwareRequestError, connectionStatus, normalizeIrCapture, type IrCapture, type ControllerInfo, type ControllerAssignment, type CloudDeviceState } from './cloud-hardware';
+import { provisioningPackets, validateWifi } from './ble-protocol';
+import registry from './ac-capability-registry';
+import { equipmentDisplayName, equipmentType } from './equipment-display';
+import { WebBluetoothManager } from './web-bluetooth';
+import { ensurePhoneBluetooth, openPhoneWifiControls } from './phone-connectivity';
+import { measuredRotation } from './sensor-readings';
 
 export interface Esp32Device {
   id: string;                 // Supabase Primary Key e.g. "node_1234567890abcdef"
   deviceId: string;           // Display identifier e.g. "ESP32-S3-001" or node ID
-  name: string;               // e.g. "AC Sensor Node 001"
+  name: string;               // e.g. "AC Controller Node 001"
   status: 'connected' | 'offline';
+  sleepingUntil?: string | null;
+  hardwareCapabilities?: Record<string, unknown>;
+  deviceMode?: 'monitoring' | 'controller' | 'both';
   temp?: number | null;
-  pressure?: number | null;
+  rotation_rpm?: number | null;
+  sensorConfig?: Record<string, any> | null;
+  rotation_quality?: 'ok' | 'missing' | 'fault';
   rssi?: number | null;
   battery?: number | null;
   wifiStatus: 'connected' | 'disconnected' | 'connecting';
   wifiSsid?: string;
   ipAddress?: string;
   lastSeen: string;
+  lastSeenAt?: string | null;
   dateAdded: string;
   macAddress?: string;
   firmwareVersion?: string;
@@ -22,6 +40,11 @@ export interface Esp32Device {
   room?: string;
   roomId?: string | null;
   airconType?: string;
+  airconId?: string;
+  airconName?: string;
+  protocolName?: string;
+  brand?: string;
+  associatedAc?: string;
   wakeTime?: string;
   sleepTime?: string;
   intervalVal?: number;
@@ -39,13 +62,18 @@ export interface AvailableRoomOption {
   floorName: string;
   buildingName: string;
   fullPath: string; // e.g. "Main Building • 2nd Floor • Lab 204"
+  airconBrand?: string;
+  airconType?: string;
+  airconName?: string;
+  nodeName?: string;
 }
 
 export interface BleDiscoveredDevice {
   id: string;
+  bleId?: string;             // Native BLE identifier; deviceId remains the logical node identity.
   deviceId: string;
   name: string;
-  pingMs: number;
+  pingMs: number | null;      // Null until response time has actually been measured.
   macAddress: string;
   isEcoTrackDevice: boolean;
 }
@@ -53,12 +81,27 @@ export interface BleDiscoveredDevice {
 export interface WifiNetwork {
   ssid: string;
   isSecure: boolean;
+  signalStrength?: number;
+  signalLevel?: 1 | 2 | 3 | 4;
+  frequency?: string;
+  isSaved?: boolean;
+  isConnectedPhone?: boolean;
 }
+
+export interface ConnectedPhoneWifi {
+  ssid: string | null;
+  isWifi: boolean;
+  details?: NetInfoWifiState['details'];
+  error?: 'unsupported' | 'location-disabled' | 'permission-denied' | 'precise-location-required' | 'unavailable';
+}
+
+let iosWifiSsidEnabled = false;
 
 export interface StoredDeviceMeta {
   wifiSsid?: string;
   ipAddress?: string;
   macAddress?: string;
+  brand?: string;
   addedByUserId?: string;
   addedByUserEmail?: string;
   addedByUserName?: string;
@@ -162,17 +205,71 @@ function formatDateAdded(dateStr?: string | null): string {
 }
 
 export const DeviceService = {
-  /**
-   * Fetch all registered AC sensor nodes directly from Supabase `nodes` table
-   * joined with `rooms`, `floors`, and `buildings`.
-   */
-  async getDevices(): Promise<Esp32Device[]> {
+  applyHardwareState(device: Esp32Device, row: CloudDeviceState): Esp32Device {
+    if (row.node_id !== device.id || Date.parse(row.last_seen || '') < Date.parse(device.lastSeenAt || '')) return device;
+    return DeviceService.refreshConnectionAge({...device, lastSeenAt: row.last_seen, sleepingUntil: row.sleeping_until,
+      hardwareCapabilities: row.capabilities, firmwareVersion: row.firmware_version || device.firmwareVersion,
+      rssi: row.rssi ?? device.rssi, ipAddress: row.ip_address || device.ipAddress, wifiSsid: row.wifi_ssid || device.wifiSsid});
+  },
+  refreshConnectionAge(device: Esp32Device): Esp32Device {
+    const online = Boolean(device.lastSeenAt) && connectionStatus({ node_id: device.id, device_id: device.deviceId,
+      last_seen: device.lastSeenAt!, sleeping_until: device.sleepingUntil }) === 'online';
+    return { ...device, status: online ? 'connected' : 'offline', wifiStatus: online ? 'connected' : 'disconnected',
+      lastSeen: device.lastSeenAt ? formatLastSeen(device.lastSeenAt) : device.lastSeen };
+  },
+
+  /** Detect a real decoded protocol without claiming a physical manufacturer. */
+  async sniffRemoteBrand(ipAddress: string, expectedDeviceId?: string): Promise<{
+    success: boolean; brand?: string; protocol?: string; rawType?: string; error?: string;
+  }> {
+    const address = ipAddress.trim();
+    if (!address || address === '0.0.0.0') {
+      return { success: false, error: 'Device local IP address is not available.' };
+    }
     try {
-      const [nodesRes, roomsRes, floorsRes, buildingsRes] = await Promise.all([
-        supabase.from('nodes').select('*').order('created', { ascending: false }),
-        supabase.from('rooms').select('*'),
-        supabase.from('floors').select('*'),
-        supabase.from('buildings').select('*'),
+      if (expectedDeviceId?.trim()) await probeController(address, [expectedDeviceId.trim()]);
+      const data = await requestControllerJson(address, '/sniff-protocol', 8000);
+      const rawType = typeof data.raw_type === 'string' ? data.raw_type.trim().toUpperCase() : '';
+      // Accept known AC decoder families, not the firmware's timeout or synthetic RAW defaults.
+      const decoders = [
+        { pattern: /^MIDEA(?:24)?$/, protocol: 'midea_ir' },
+        { pattern: /^GREE$/, protocol: 'gree' },
+        { pattern: /^DAIKIN(?:2|64|128|152|160|176|200|216|312)?$/, protocol: 'daikin' },
+        { pattern: /^CARRIER_AC(?:40|64|84|128)?$/, protocol: 'carrier' },
+        { pattern: /^PANASONIC_AC(?:32)?$/, protocol: 'panasonic' },
+        { pattern: /^SAMSUNG_AC$/, protocol: 'samsung' },
+        { pattern: /^(?:MITSUBISHI_AC|MITSUBISHI112|MITSUBISHI136|MITSUBISHI_HEAVY_88|MITSUBISHI_HEAVY_152)$/, protocol: 'mitsubishi' },
+      ];
+      const decoded = decoders.find(candidate => candidate.pattern.test(rawType));
+      if (data.success !== true || !decoded || data.protocol !== decoded.protocol ||
+          typeof data.hex !== 'string' || !/^(?:0x)?[a-f\d]+$/i.test(data.hex.trim())) {
+        return { success: false, error: 'No recognizable AC remote signal was captured.' };
+      }
+      return { success: true, protocol: decoded.protocol, rawType };
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && 'name' in error && error.name === 'AbortError') {
+        return { success: false, error: 'Listening timed out. No IR remote signal was detected.' };
+      }
+      const message = error && typeof error === 'object' && 'message' in error && typeof error.message === 'string'
+        ? error.message : 'Unable to communicate with the device local server.';
+      return { success: false, error: message };
+    }
+  },
+
+  /**
+   * Fetch all registered AC controller devices directly from Supabase `nodes` table
+   * joined with `rooms`, `floors`, and `buildings`.
+   * Metadata mutations may supply their confirmed row to reuse the same mapping.
+   */
+  async getDevices(scope?: ReadScope, committedNode?: DbNode): Promise<Esp32Device[]> {
+    try {
+      const [nodesRes, roomsRes, floorsRes, buildingsRes, airconsRes, hardware] = await Promise.all([
+        committedNode ? Promise.resolve({ data: [committedNode], error: null }) : fetchAccessibleRows(supabase, 'nodes', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'rooms', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'floors', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'buildings', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'aircons', '*', undefined, scope),
+        CloudHardware.list(scope),
       ]);
 
       if (nodesRes.error) {
@@ -225,42 +322,58 @@ export const DeviceService = {
         if (!addedByUserEmail && storedMeta?.addedByUserEmail) addedByUserEmail = storedMeta.addedByUserEmail;
         if (!addedByUserName && storedMeta?.addedByUserName) addedByUserName = storedMeta.addedByUserName;
 
-        const isOnline = (node.status || '').toLowerCase() === 'online' || (node.status || '').toLowerCase() === 'connected';
+        const cloud = hardware.find(state => state.node_id === node.id);
+        const isOnline = cloud ? connectionStatus(cloud) === 'online' : false;
 
-        // Derive pseudo-mac from node id if not stored
-        const pseudoMac = node.id
-          .replace(/[^a-fA-F0-9]/g, '')
-          .padEnd(12, 'a')
-          .substring(0, 12)
-          .match(/.{1,2}/g)
-          ?.join(':')
-          .toUpperCase() || '24:6F:28:B4:A1:0C';
+        const airconsList = (airconsRes && airconsRes.data) ? airconsRes.data : [];
+        const matchedAc = airconsList.find((a: any) => (node as any).monitor_aircon_id === a.id) || airconsList.find((a: any) => a.controller_node_id ? a.controller_node_id === node.id :
+          (a.node_id && (a.node_id === node.name || a.node_id === node.id)));
+
+        const resolvedBrand = (node.brand && node.brand.trim()) ||
+          (matchedAc?.brand && matchedAc.brand.trim()) ||
+          (node as any).aircon_brand ||
+          storedMeta?.brand ||
+          undefined;
+
+        const resolvedMac = node.mac_address || storedMeta?.macAddress || undefined;
+        const resolvedIp = node.ip_address || storedMeta?.ipAddress || undefined;
+        const resolvedSsid = node.wifi_ssid || storedMeta?.wifiSsid || undefined;
 
         return {
           id: node.id,
-          deviceId: node.id.startsWith('node_') ? `ESP32-${node.id.substring(5, 8).toUpperCase()}` : node.id,
-          name: node.name,
+          deviceId: cloud?.device_id || node.id,
+          name: equipmentDisplayName(node.name, [node.id]) || `Device ${idx + 1}`,
           status: isOnline ? 'connected' : 'offline',
           temp: node.temp,
-          pressure: node.pressure,
+          rotation_rpm: measuredRotation(node.rotation_rpm, node.rotation_quality),
+          sensorConfig: node.sensor_config,
+          rotation_quality: node.rotation_quality,
           rssi: node.rssi,
           battery: node.battery,
           wifiStatus: isOnline ? 'connected' : 'disconnected',
-          wifiSsid: storedMeta?.wifiSsid || undefined,
-          ipAddress: storedMeta?.ipAddress || (isOnline ? `192.168.1.${Math.abs((node.id.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0) % 150) + 100)}` : undefined),
-          lastSeen: formatLastSeen(node.updated || node.created),
+          wifiSsid: resolvedSsid,
+          ipAddress: resolvedIp,
+          lastSeen: cloud?.last_seen ? formatLastSeen(cloud.last_seen) : 'Unverified',
+          lastSeenAt: cloud?.last_seen || null,
+          sleepingUntil: cloud?.sleeping_until,
+          hardwareCapabilities: cloud?.capabilities,
+          deviceMode:(node as any).device_mode || 'controller',
           dateAdded: formatDateAdded(node.install_date || node.created),
-          macAddress: storedMeta?.macAddress || pseudoMac,
-          firmwareVersion: 'v2.4.2-eco',
+          macAddress: resolvedMac,
+          firmwareVersion: cloud?.firmware_version || (node as any).firmware_version || undefined,
           building: building?.name,
           floor: floor?.name,
           room: room?.name,
           roomId: node.room_id,
-          airconType: node.aircon_type || 'Split Type (Inverter)',
-          wakeTime: node.wake_time || '00:00',
-          sleepTime: node.sleep_time || '00:00',
-          intervalVal: node.interval_val ?? 15,
-          intervalUnit: node.interval_unit || 'Minutes',
+          airconType: equipmentType(matchedAc?.aircon_type || matchedAc?.model || node.aircon_type, matchedAc?.protocol_name || node.protocol_name),
+          airconId: matchedAc?.id,
+          airconName: equipmentDisplayName(matchedAc?.name, [matchedAc?.id, node.id], matchedAc?.protocol_name || node.protocol_name),
+          protocolName: matchedAc?.protocol_name || matchedAc?.protocol || node.protocol_name || undefined,
+          brand: resolvedBrand,
+          wakeTime: node.wake_time || undefined,
+          sleepTime: node.sleep_time || undefined,
+          intervalVal: node.interval_val ?? undefined,
+          intervalUnit: node.interval_unit || undefined,
           created: node.created,
           updated: node.updated,
           addedByUserId,
@@ -269,6 +382,7 @@ export const DeviceService = {
         };
       });
     } catch (e) {
+      scope?.recordError(e);
       console.error('Failed to get devices from Supabase:', e);
       return [];
     }
@@ -285,17 +399,32 @@ export const DeviceService = {
   /**
    * Fetch all active rooms formatted for picker selection in Add/Edit device wizard
    */
-  async fetchAvailableRooms(): Promise<AvailableRoomOption[]> {
+  async fetchAvailableRooms(scope?: ReadScope): Promise<AvailableRoomOption[]> {
     try {
-      const [roomsRes, floorsRes, buildingsRes] = await Promise.all([
-        supabase.from('rooms').select('*').order('name', { ascending: true }),
-        supabase.from('floors').select('*'),
-        supabase.from('buildings').select('*'),
+      const [roomsRes, floorsRes, buildingsRes, airconsRes, nodesRes, rawLocalAircons] = await Promise.all([
+        fetchAccessibleRows(supabase, 'rooms', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'floors', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'buildings', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'aircons', '*', undefined, scope),
+        fetchAccessibleRows(supabase, 'nodes', '*', undefined, scope),
+        AsyncStorage.getItem('@ecotrack_aircons_v1').catch(() => null),
       ]);
 
       const rooms: DbRoom[] = roomsRes.data || [];
       const floors: DbFloor[] = floorsRes.data || [];
       const buildings: DbBuilding[] = buildingsRes.data || [];
+      const aircons: any[] = airconsRes.data || [];
+      const nodes: any[] = nodesRes.data || [];
+
+      let localAircons: any[] = [];
+      if (rawLocalAircons) {
+        try {
+          localAircons = JSON.parse(rawLocalAircons);
+        } catch {}
+      }
+
+      // Merge remote aircons and local aircons
+      const allAircons = [...aircons, ...localAircons];
 
       const floorsMap = new Map<string, DbFloor>();
       floors.forEach((f) => floorsMap.set(f.id, f));
@@ -307,19 +436,75 @@ export const DeviceService = {
         const floor = r.floor_id ? floorsMap.get(r.floor_id) : undefined;
         const building = floor?.building_id ? buildingsMap.get(floor.building_id) : undefined;
 
-        const buildingName = building?.name || 'Main Campus';
-        const floorName = floor?.name || '1st Floor';
-        const roomName = r.name;
+        const buildingName = building?.name || '';
+        const floorName = floor?.name || '';
+        const roomName = (r.name || '').trim();
+        const rIdStr = String(r.id || '').trim().toLowerCase();
+
+        // 1. Match Node from Supabase nodes table
+        const matchedNode = nodes.find((n: any) => {
+          if (!n) return false;
+          if (n.room_id && String(n.room_id).trim().toLowerCase() === rIdStr) return true;
+          if (n.room && n.room.trim().toLowerCase() === roomName.toLowerCase()) return true;
+          if (n.room_name && n.room_name.trim().toLowerCase() === roomName.toLowerCase()) return true;
+          if (n.name && roomName && n.name.trim().toLowerCase().includes(roomName.toLowerCase())) return true;
+          if (n.name && roomName && roomName.toLowerCase().includes(n.name.trim().toLowerCase())) return true;
+          return false;
+        });
+
+        // 2. Match Aircon from Admin Desktop aircons table
+        const matchedAc = allAircons.find((a: any) => {
+          if (!a) return false;
+          const aRoomId = a.room_id ? String(a.room_id).trim().toLowerCase() : '';
+          if (aRoomId && aRoomId === rIdStr) return true;
+
+          // Match by node linking
+          if (matchedNode) {
+            const mNodeName = (matchedNode.name || '').trim().toLowerCase();
+            const mNodeId = (matchedNode.id || '').trim().toLowerCase();
+            const aNodeId = (a.node_id || '').trim().toLowerCase();
+            if (aNodeId && (aNodeId === mNodeName || aNodeId === mNodeId)) return true;
+          }
+
+          // Match by room text in name or location
+          const aName = (a.name || '').trim().toLowerCase();
+          const aLoc = (a.location || a.roomName || a.room_name || '').trim().toLowerCase();
+          const rLower = roomName.toLowerCase();
+          if (rLower && (aName.includes(rLower) || aLoc.includes(rLower))) return true;
+
+          return false;
+        });
+
+        // Derive aircon brand if already registered in aircons table or node
+        const airconBrand =
+          matchedAc?.brand?.trim() ||
+          (matchedNode as any)?.brand?.trim() ||
+          (matchedNode as any)?.aircon_brand?.trim() ||
+          undefined;
+
+        const airconType =
+          matchedAc?.aircon_type ||
+          matchedAc?.model ||
+          matchedNode?.aircon_type ||
+          undefined;
+
+        const airconName = matchedAc?.name || (matchedNode ? `${roomName} AC` : undefined);
+        const nodeName = matchedNode?.name || matchedNode?.id || undefined;
 
         return {
           id: r.id,
           name: roomName,
           floorName,
           buildingName,
-          fullPath: `${buildingName} • ${floorName} • ${roomName}`,
+          fullPath: [buildingName, floorName, roomName].filter(Boolean).join(' • ') || roomName,
+          airconBrand,
+          airconType,
+          airconName,
+          nodeName,
         };
       });
     } catch (e) {
+      scope?.recordError(e);
       console.error('Failed to fetch rooms for device assignment:', e);
       return [];
     }
@@ -330,80 +515,42 @@ export const DeviceService = {
    * If the custom room does not exist in Supabase, automatically create it.
    */
   async resolveRoomId(roomIdOrCustomName: string | null | undefined): Promise<string | null> {
-    if (!roomIdOrCustomName || roomIdOrCustomName.trim() === '' || roomIdOrCustomName === 'unassigned') {
-      return null;
-    }
-
-    const trimmed = roomIdOrCustomName.trim();
-    // If it's a known room id prefix and NOT starting with 'custom:'
-    if (!trimmed.startsWith('custom:')) {
-      const { data: existingRoom } = await supabase
-        .from('rooms')
-        .select('id')
-        .eq('id', trimmed)
-        .limit(1);
-      if (existingRoom && existingRoom.length > 0) {
-        return existingRoom[0].id;
-      }
-    }
-
-    // It's a custom room name!
-    const roomName = trimmed.replace(/^custom:/i, '').trim();
-    if (!roomName) return null;
-
-    // Check if room with this name already exists (case-insensitive)
-    const { data: matchedRooms } = await supabase
-      .from('rooms')
-      .select('id')
-      .ilike('name', roomName)
-      .limit(1);
-
-    if (matchedRooms && matchedRooms.length > 0) {
-      return matchedRooms[0].id;
-    }
-
-    // Otherwise create the room in Supabase
-    const now = new Date().toISOString();
-    const newRoomId = `rm_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`;
-    
-    // Pick default floor if available
-    const { data: defaultFloor } = await supabase.from('floors').select('id').limit(1).single();
-    const floorId = defaultFloor?.id || 'flr_2nd_it';
-
-    const { data: newRoom, error: insertErr } = await supabase
-      .from('rooms')
-      .insert({
-        id: newRoomId,
-        name: roomName,
-        node_limit: 10,
-        floor_id: floorId,
-        created: now,
-        updated: now,
-      })
-      .select('id')
-      .single();
-
-    if (insertErr || !newRoom) {
-      console.warn('Could not create custom room in Supabase:', insertErr);
-      return null;
-    }
-
-    return newRoom.id;
+    const value = roomIdOrCustomName?.trim();
+    if (!value || value === 'unassigned') return null;
+    // Keep custom names as tokens. The mutation RPC resolves/creates the room
+    // together with the node and AC; a failed save cannot leave an orphan room.
+    if (value.startsWith('custom:')) return value;
+    const { data, error } = await readWithTimeout<any>(signal =>
+      supabase.from('rooms').select('id').eq('id', value).limit(1).abortSignal(signal));
+    if (error || !data?.length) throw new Error('Selected room could not be resolved. Refresh and select an existing room.');
+    return data[0].id;
   },
 
   /**
-   * Save a newly provisioned AC sensor node directly into Supabase `nodes` table
+   * Save a newly provisioned AC controller device directly into Supabase `nodes` table
    */
+  async registerController(bleId: string, deviceId: string, setup: ControllerAssignment, credentials: { ssid: string; pass: string }, capture?: IrCapture): Promise<Esp32Device> {
+    const info = await BleDeviceService.readControllerInfo(bleId);
+    if (info.device_id !== deviceId) throw new Error('The Bluetooth device does not match this AC device. Reconnect the selected device.');
+    if (setup.room_id?.startsWith('custom:')) throw new Error('Choose an existing building, floor and room before registering.');
+    const saved = await CloudHardware.register(info, setup, credentials,
+      (payload, cloud) => BleDeviceService.provisionCloud(bleId, payload, cloud, deviceId), capture);
+    const mapped = (await this.getDevices(undefined, saved.node))[0];
+    if (!mapped) throw new Error('Registration succeeded, but the device list could not be refreshed.');
+    return mapped;
+  },
+
   async saveDevice(newDevice: {
     name: string;
     deviceId?: string;
     roomId?: string | null;
     airconType?: string;
+    brand?: string;
     wifiSsid?: string;
     ipAddress?: string;
     macAddress?: string;
     temp?: number;
-    pressure?: number;
+    rotation_rpm?: number;
     battery?: number;
     rssi?: number;
     addedByUserId?: string;
@@ -412,72 +559,32 @@ export const DeviceService = {
   }): Promise<Esp32Device> {
     const now = new Date().toISOString();
     const dateStr = now.split('T')[0];
-
-    // Generate compliant node_ uuid id if not given
-    const randomHex = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-    const nodeId = newDevice.deviceId && newDevice.deviceId.startsWith('node_')
-      ? newDevice.deviceId
-      : `node_${randomHex.substring(0, 15)}`;
-
-    // Resolve room_id to ensure foreign-key validity or create custom room
-    const resolvedRoomId = await this.resolveRoomId(newDevice.roomId);
-
-    // Check if the node already exists in Supabase (e.g. unassigned node being commissioned)
-    const { data: existingNode } = await supabase
-      .from('nodes')
-      .select('id')
-      .eq('id', nodeId)
-      .limit(1);
-
-    const isExisting = existingNode && existingNode.length > 0;
-
-    const payload: any = {
-      name: newDevice.name.trim(),
-      status: 'online',
-      temp: newDevice.temp ?? 23.5,
-      pressure: newDevice.pressure ?? 0.5,
-      rssi: newDevice.rssi ?? -60,
-      battery: newDevice.battery ?? 4.15,
-      room_id: resolvedRoomId,
-      aircon_type: (newDevice.airconType && newDevice.airconType.trim()) || 'Split Type (Inverter)',
-      updated: now,
-    };
-
-    if (newDevice.addedByUserId || newDevice.addedByUserEmail || newDevice.addedByUserName) {
-      payload.photo_url = JSON.stringify({
-        addedByUserId: newDevice.addedByUserId,
-        addedByUserEmail: newDevice.addedByUserEmail,
-        addedByUserName: newDevice.addedByUserName,
-      });
+    const name = newDevice.name.trim();
+    if (!name) throw new Error('Device name is required.');
+    const nodeId = newDevice.deviceId?.startsWith('node_') ? newDevice.deviceId :
+      `node_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    const effectiveBrand = newDevice.brand?.trim() || '';
+    const assetTag = newDevice.deviceId && !newDevice.deviceId.startsWith('node_') ? newDevice.deviceId : `AC-${nodeId}`;
+    const { data: result, error } = await supabase.rpc('ecotrack_device_mutation', {
+      p_operation: 'save_node', p_id: nodeId,
+      p_payload: {
+        name, room_id: newDevice.roomId || null, brand: effectiveBrand || null,
+        aircon_type: newDevice.airconType?.trim() || null,
+        mac_address: newDevice.macAddress || null, ip_address: newDevice.ipAddress || null,
+        wifi_ssid: newDevice.wifiSsid || null, asset_tag: assetTag,
+        protocol_name: CapabilityEngine.resolveProtocolName(effectiveBrand),
+      },
+    });
+    if (error || !result?.node?.id || !result?.aircon?.id) {
+      throw new Error(error?.message || 'AC Device setup is unavailable. Ask your administrator to update the server.');
     }
-
-    if (isExisting) {
-      const { error: updateErr } = await supabase.from('nodes').update(payload).eq('id', nodeId);
-      if (updateErr) {
-        console.error('Error updating existing node in Supabase:', updateErr);
-        throw new Error(updateErr.message || 'Failed to update node in Supabase');
-      }
-    } else {
-      payload.id = nodeId;
-      payload.wake_time = '06:00';
-      payload.sleep_time = '22:00';
-      payload.interval_val = 15;
-      payload.interval_unit = 'Minutes';
-      payload.install_date = dateStr;
-      payload.created = now;
-
-      const { error: insertErr } = await supabase.from('nodes').insert(payload);
-      if (insertErr) {
-        console.error('Error inserting node into Supabase:', insertErr);
-        throw new Error(insertErr.message || 'Failed to save node into Supabase');
-      }
-    }
-
+    const resolvedRoomId = result.node.room_id;
     // Persist real metadata
     await setStoredDeviceMeta(nodeId, {
       wifiSsid: newDevice.wifiSsid,
       ipAddress: newDevice.ipAddress,
       macAddress: newDevice.macAddress,
+      brand: effectiveBrand || undefined,
       addedByUserId: newDevice.addedByUserId,
       addedByUserEmail: newDevice.addedByUserEmail,
       addedByUserName: newDevice.addedByUserName,
@@ -501,22 +608,23 @@ export const DeviceService = {
         name: newDevice.name.trim(),
         deviceId: nodeId,
         room: 'Unassigned',
-        building: 'Main Campus',
-        floor: '1st Floor',
-        status: 'connected',
-        wifiStatus: 'connected',
+        building: undefined,
+        floor: undefined,
+        status: 'offline',
+        wifiStatus: 'disconnected',
         dateAdded: formatDateAdded(dateStr),
         roomId: resolvedRoomId,
-        ipAddress: newDevice.ipAddress || '192.168.1.100',
-        macAddress: newDevice.macAddress || '24:6F:28:B4:A1:0C',
-        wifiSsid: newDevice.wifiSsid || 'Facility Wi-Fi',
-        temp: newDevice.temp ?? 23.5,
-        pressure: newDevice.pressure ?? 0.5,
-        battery: newDevice.battery ?? 4.15,
-        rssi: newDevice.rssi ?? -60,
-        firmwareVersion: 'v2.1.0-prod',
-        lastSeen: 'Just now',
-        airconType: (newDevice.airconType && newDevice.airconType.trim()) || 'Split Type (Inverter)',
+        ipAddress: newDevice.ipAddress,
+        macAddress: newDevice.macAddress,
+        wifiSsid: newDevice.wifiSsid,
+        temp: newDevice.temp,
+        rotation_rpm: measuredRotation(newDevice.rotation_rpm),
+        battery: newDevice.battery,
+        rssi: newDevice.rssi,
+        firmwareVersion: undefined,
+        lastSeen: 'Unverified',
+        airconType: newDevice.airconType,
+        brand: effectiveBrand,
         addedByUserId: newDevice.addedByUserId,
         addedByUserEmail: newDevice.addedByUserEmail,
         addedByUserName: newDevice.addedByUserName,
@@ -528,169 +636,437 @@ export const DeviceService = {
   /**
    * Update existing device metadata, room assignment, or name in Supabase
    */
-  async updateDevice(id: string, updates: Partial<Esp32Device>): Promise<Esp32Device | null> {
+  async updateDevice(id: string, updates: Partial<Esp32Device>, previous?: Esp32Device,
+    options: { throwOnError?: boolean } = {}): Promise<Esp32Device | null> {
     try {
-      const now = new Date().toISOString();
-      const dbUpdates: any = {
-        updated: now,
-      };
-
+      const dbUpdates: Record<string, unknown> = {};
       if (updates.name !== undefined) dbUpdates.name = updates.name.trim();
-      if (updates.roomId !== undefined) dbUpdates.room_id = await this.resolveRoomId(updates.roomId);
-      if (updates.status !== undefined) {
-        dbUpdates.status = updates.status === 'connected' ? 'online' : 'offline';
-      }
+      if (updates.roomId !== undefined) dbUpdates.room_id = updates.roomId;
       if (updates.airconType !== undefined) dbUpdates.aircon_type = updates.airconType.trim();
-      if (updates.temp !== undefined) dbUpdates.temp = updates.temp;
-      if (updates.pressure !== undefined) dbUpdates.pressure = updates.pressure;
-      if (updates.rssi !== undefined) dbUpdates.rssi = updates.rssi;
-      if (updates.battery !== undefined) dbUpdates.battery = updates.battery;
+      if (updates.brand !== undefined) dbUpdates.brand = updates.brand.trim();
+      // A display name or manufacturer edit never selects a different IR encoder.
+      if (updates.protocolName !== undefined) dbUpdates.protocol_name = updates.protocolName;
+      if (updates.ipAddress !== undefined) dbUpdates.ip_address = updates.ipAddress;
+      if (updates.macAddress !== undefined) dbUpdates.mac_address = updates.macAddress;
+      if (updates.wifiSsid !== undefined) dbUpdates.wifi_ssid = updates.wifiSsid;
       if (updates.wakeTime !== undefined) dbUpdates.wake_time = updates.wakeTime;
       if (updates.sleepTime !== undefined) dbUpdates.sleep_time = updates.sleepTime;
       if (updates.intervalVal !== undefined) dbUpdates.interval_val = updates.intervalVal;
       if (updates.intervalUnit !== undefined) dbUpdates.interval_unit = updates.intervalUnit;
-
-      const { error } = await supabase.from('nodes').update(dbUpdates).eq('id', id);
+      // Observed status/telemetry belong to the hardware ingestion service.
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const request = supabase.rpc('ecotrack_device_mutation', {
+        p_operation: 'update_node', p_id: id, p_payload: dbUpdates,
+      });
+      let receipt;
+      try {
+        receipt = await Promise.race([
+          typeof request.abortSignal === 'function' ? request.abortSignal(controller.signal) : request,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              reject(new Error('Save confirmation timed out. The change may have saved. Refresh the device list before trying again.'));
+              controller.abort();
+            }, 15000);
+          }),
+        ]);
+      } finally { if (timer) clearTimeout(timer); }
+      const { data, error } = receipt;
       if (error) {
-        console.error('Error updating node in Supabase:', error);
-        return null;
+        if (error.code === '42501') throw new Error('You can edit AC devices only in your active assigned room. Sign in again if your assignment changed.');
+        if (error.code === '23503') throw new Error('The selected AC device or room could not be linked. Refresh the device list and try again.');
+        throw new Error(error.message || 'The AC device could not be saved. Check your connection and try again.');
       }
-
-      if (updates.wifiSsid || updates.ipAddress) {
-        await setStoredDeviceMeta(id, {
-          wifiSsid: updates.wifiSsid,
-          ipAddress: updates.ipAddress,
-        });
+      if (data?.node?.id !== id) throw new Error('The server did not confirm this AC device. Refresh the device list and try again.');
+      if (updates.name !== undefined && data.node.name !== updates.name.trim()) throw new Error('The server did not confirm the new AC device name. Refresh and try again.');
+      if (updates.roomId !== undefined && !updates.roomId?.startsWith('custom:') && (data.node.room_id || null) !== (updates.roomId || null))
+        throw new Error('The server did not confirm the selected room. Refresh and try again.');
+      if (updates.wifiSsid || updates.ipAddress || updates.brand) {
+        try { await setStoredDeviceMeta(id, { wifiSsid: updates.wifiSsid, ipAddress: updates.ipAddress, brand: updates.brand }); }
+        catch (error) { console.warn('Device saved, but its optional local cache could not be updated:', error); }
       }
-      if (updates.wifiSsid) {
-        await BleDeviceService.saveWifiSsid(updates.wifiSsid);
-      }
-
-      return await this.getDeviceById(id);
-    } catch (e) {
-      console.error('Exception updating node in Supabase:', e);
+      // Use the row confirmed by the atomic transaction: a second node read can
+      // fail after reassignment and must not turn a committed save into failure.
+      // Name-only saves need no further network reads to confirm the server receipt.
+      // This also prevents an unrelated telemetry/room read failure from undoing a rename.
+      const hydrated = previous ? undefined : (await this.getDevices(undefined, data.node))[0];
+      if (hydrated) return hydrated;
+      const node = data.node as DbNode;
+      const moved = previous && previous.roomId !== node.room_id;
+      return {
+        ...previous, id: node.id, deviceId: previous?.deviceId || node.id, name: node.name,
+        roomId: node.room_id, room: moved ? undefined : previous?.room,
+        floor: moved ? undefined : previous?.floor, building: moved ? undefined : previous?.building,
+        airconType: updates.airconType !== undefined ? node.aircon_type || undefined : previous?.airconType || node.aircon_type || undefined,
+        brand: node.brand || previous?.brand,
+        protocolName: updates.protocolName !== undefined ? node.protocol_name || undefined : previous?.protocolName || node.protocol_name || undefined,
+        status: previous?.status || 'offline', wifiStatus: previous?.wifiStatus || 'disconnected',
+        lastSeen: previous?.lastSeen || 'Unverified', dateAdded: previous?.dateAdded || formatDateAdded(node.install_date || node.created),
+        ipAddress: updates.ipAddress !== undefined ? node.ip_address || undefined : node.ip_address || previous?.ipAddress,
+        macAddress: updates.macAddress !== undefined ? node.mac_address || undefined : node.mac_address || previous?.macAddress,
+        wifiSsid: updates.wifiSsid !== undefined ? node.wifi_ssid || undefined : node.wifi_ssid || previous?.wifiSsid,
+        updated: node.updated, created: node.created,
+      };
+    } catch (error) {
+      console.warn('Unable to update device:', error);
+      if (options.throwOnError) throw error;
       return null;
     }
   },
 
-  /**
-   * Delete node from Supabase `nodes` table
-   */
+  /** Atomically detach linked AC records before deleting a registered node. */
   async removeDevice(id: string, userKey?: string): Promise<boolean> {
     try {
-      const { error } = await supabase.from('nodes').delete().eq('id', id);
-      if (error) {
-        console.error('Error deleting node from Supabase:', error);
-        return false;
-      }
-      if (userKey) {
-        await UserDeviceStorage.removeUserNode(userKey, id);
-      }
+      const { data, error } = await supabase.rpc('ecotrack_device_mutation', {
+        p_operation: 'delete_node', p_id: id, p_payload: {},
+      });
+      if (error || data?.deleted !== true) return false;
+      if (userKey) await UserDeviceStorage.removeUserNode(userKey, id);
+      try { await AsyncStorage.removeItem(`@ecotrack_node_meta_${id}`); } catch { /* optional cache */ }
       return true;
-    } catch (e) {
-      console.error('Exception removing device:', e);
-      return false;
-    }
+    } catch { return false; }
   },
 
   /**
    * Real-time Postgres subscription to changes in `nodes`, `rooms`, `floors`, `buildings`
    */
-  subscribeToDeviceChanges(onUpdate: () => void): () => void {
+  subscribeToDeviceChanges(onUpdate: (row?: CloudDeviceState) => void, onAge?: () => void): () => void {
     const channelId = `device_mgmt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const channel = supabase
       .channel(channelId)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'nodes' }, () => {
-        onUpdate();
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'nodes' }, payload => {
+        if (metadataChanged(supabase, 'nodes', payload)) onUpdate();
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, () => {
-        onUpdate();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, () => {
-        onUpdate();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, () => {
-        onUpdate();
-      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'aircons' }, () => onUpdate())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, () => { invalidateReferenceRows(supabase, 'rooms'); onUpdate(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, () => { invalidateReferenceRows(supabase, 'floors'); onUpdate(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, () => { invalidateReferenceRows(supabase, 'buildings'); onUpdate(); })
       .subscribe();
 
+    const unsubscribeHardware = CloudHardware.subscribe(row => onUpdate(row), onAge);
     return () => {
+      unsubscribeHardware();
       supabase.removeChannel(channel);
     };
   },
 };
 
+// EcoTrack Hardware GATT UUIDs (matching firmware/ecotrack_esp32_s3/ecotrack_esp32_s3.ino)
+export const ECOTRACK_BLE_SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+export const ECOTRACK_CHAR_DEVICE_INFO_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+export const ECOTRACK_CHAR_WIFI_CONFIG_UUID = '1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e';
+export const ECOTRACK_CHAR_IR_TRIGGER_UUID = 'd7c2b4e1-2294-4d89-980b-8d085df7c7e9';
+
+let bleManagerInstance: any = null;
+
+function getBleManager() {
+  if (Platform.OS === 'web') return WebBluetoothManager;
+  if (!bleManagerInstance) {
+    try {
+      const { BleManager } = require('react-native-ble-plx');
+      bleManagerInstance = new BleManager();
+    } catch {
+      bleManagerInstance = null;
+    }
+  }
+  return bleManagerInstance;
+}
+
+function toBase64(str: string): string {
+  if (typeof btoa === 'function') {
+    return btoa(str);
+  }
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  let output = '';
+  for (
+    let block = 0, charCode, i = 0, map = chars;
+    str.charAt(i | 0) || ((map = '='), i % 1);
+    output += map.charAt(63 & (block >> (8 - (i % 1) * 8)))
+  ) {
+    charCode = str.charCodeAt((i += 3 / 4));
+    if (charCode > 0xff) {
+      throw new Error("'toBase64' failed: The string contains characters outside of the Latin1 range.");
+    }
+    block = (block << 8) | charCode;
+  }
+  return output;
+}
+
+function fromBase64(input: string): string {
+  if (typeof atob === 'function') {
+    return atob(input);
+  }
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  let str = input.replace(/=+$/, '');
+  let output = '';
+  if (str.length % 4 === 1) {
+    throw new Error("'fromBase64' failed: The string to be decoded is not correctly encoded.");
+  }
+  for (
+    let bc = 0, bs = 0, buffer, i = 0;
+    (buffer = str.charAt(i++));
+    ~buffer && ((bs = bc % 4 ? bs * 64 + buffer : buffer), bc++ % 4)
+      ? (output += String.fromCharCode(255 & (bs >> ((-2 * bc) & 6))))
+      : 0
+  ) {
+    buffer = chars.indexOf(buffer);
+  }
+  return output;
+}
+
+async function requestBlePermissions(): Promise<boolean> {
+  if (Platform.OS !== 'android') return true;
+
+  try {
+    if (Platform.Version >= 31) {
+      const granted = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
+      ]);
+
+      const scanGranted = granted[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === PermissionsAndroid.RESULTS.GRANTED;
+      const connectGranted = granted[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED;
+      const locationGranted = granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+      return scanGranted && connectGranted && locationGranted;
+    } else {
+      const granted = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
+      ]);
+      return granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function preparePhoneBluetooth(promptToEnable = true) {
+  const manager = getBleManager();
+  if (!manager) throw new Error('Bluetooth could not initialize. Install an EcoTrack APK built with Bluetooth support.');
+  if (!await requestBlePermissions()) throw new Error('Bluetooth and precise location permissions are required to scan for devices.');
+  await ensurePhoneBluetooth(manager, promptToEnable);
+  return manager;
+}
+
 /**
- * Service Abstraction for ESP32 Bluetooth Low Energy (BLE) & Wi-Fi Provisioning
+ * Service for Device Bluetooth Low Energy (BLE) & Wi-Fi Provisioning
  */
 export const BleDeviceService = {
   /**
-   * Scan for nearby ESP32-S3 EcoTrack Nodes over BLE or unassigned nodes in Supabase
+   * Scan for actual nearby ESP32-S3 EcoTrack Nodes over physical BLE or unassigned nodes in Supabase
    */
-  async scanNearbyDevices(): Promise<BleDiscoveredDevice[]> {
-    await new Promise((resolve) => setTimeout(resolve, 600));
+  async readControllerInfo(bleId: string): Promise<ControllerInfo> {
+    const manager = getBleManager();
+    if (!manager) throw new Error('Bluetooth is available in the installed EcoTrack APK.');
+    const device = await manager.isDeviceConnected(bleId) ? (await manager.devices([bleId]))[0]
+      : await manager.connectToDevice(bleId, { autoConnect: false, timeout: 10000 });
+    if (!device) throw new Error('Reconnect the selected device.');
+    await device.discoverAllServicesAndCharacteristics();
+    const characteristic = await device.readCharacteristicForService(ECOTRACK_BLE_SERVICE_UUID, ECOTRACK_CHAR_DEVICE_INFO_UUID);
+    const binary = fromBase64(characteristic.value || '');
+    const info = JSON.parse(decodeURIComponent(Array.from(binary, char => '%' + char.charCodeAt(0).toString(16).padStart(2, '0')).join('')));
+    if (!info || typeof info !== 'object') throw new Error('Invalid Bluetooth device information.');
+    return info;
+  },
+  async provisionCloud(bleId: string, payload: Record<string, any>, cloud = false, expectedDeviceId?: string): Promise<ControllerInfo> {
+    const info = await this.readControllerInfo(bleId);
+    if (info.cloud_protocol !== 1 || !/^esp32s3-[a-f0-9]{12}$/.test(info.device_id))
+      throw new Error('Flash the current EcoTrack cloud AC device sketch before setup.');
+    if (expectedDeviceId && info.device_id !== expectedDeviceId || payload.device_id && payload.device_id !== info.device_id)
+      throw new Error('The selected Bluetooth device does not match this AC device.');
+    validateWifi(payload.ssid, payload.pass);
+    const manager = getBleManager();
+    const device = (await manager.devices([bleId]))[0];
+    if (Platform.OS === 'android') await device.requestMTU(512);
+    const request = provisioningPackets({ ...payload, device_id: info.device_id });
+    for (const packet of request.packets) await device.writeCharacteristicWithResponseForService(
+      ECOTRACK_BLE_SERVICE_UUID, ECOTRACK_CHAR_WIFI_CONFIG_UUID, toBase64(packet));
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 700));
+      const receipt = await this.readControllerInfo(bleId);
+      if (receipt.device_id !== info.device_id) throw new Error('Bluetooth AC device identity changed.');
+      if (receipt.request_id !== request.id) continue;
+      if (receipt.wifi_status === 'error' || cloud && receipt.cloud_status === 'error')
+        throw new Error(receipt.error || 'The device rejected its Wi-Fi or cloud connection.');
+      if (receipt.wifi_status === 'connected' && receipt.wifi_ssid === payload.ssid &&
+          receipt.ip_address && (!cloud || receipt.cloud_status === 'verified')) return receipt;
+    }
+    throw new Error(cloud ? 'No cloud acknowledgement arrived. Keep the device awake and check its internet connection.' : 'The device did not confirm Wi-Fi setup.');
+  },
+  async learnNearby(bleId: string, expectedDeviceId: string): Promise<{ brand: string; protocol: string; capture?: IrCapture }> {
+    const info = await this.readControllerInfo(bleId);
+    if (info.device_id !== expectedDeviceId) throw new Error('Reconnect the selected device.');
+    if (info.capabilities?.ble_ir_monitor !== true) throw new Error('This sketch does not support Bluetooth remote detection.');
+    const manager = getBleManager();
+    const device = (await manager.devices([bleId]))[0];
+    const read = async () => {
+      const characteristic = await device.readCharacteristicForService(ECOTRACK_BLE_SERVICE_UUID, 'b80301f3-639c-4eaf-bcc0-537759229321');
+      const binary = fromBase64(characteristic.value || '');
+      return JSON.parse(decodeURIComponent(Array.from(binary, char => '%' + char.charCodeAt(0).toString(16).padStart(2, '0')).join('')));
+    };
+    const first = await read(), deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const capture = await read();
+      const protocol = registry.protocol(capture.protocol || capture.raw_type);
+      if (Number(capture.sequence) > Number(first.sequence || 0) && capture.raw_count >= 3 && protocol !== 'UNKNOWN')
+        return { protocol, brand: '',
+          capture: capture.raw_data ? normalizeIrCapture({ ...capture, protocol }) : undefined };
+    }
+    throw new Error('No new recognized remote signal. Point the remote at the IR receiver and press a button while listening.');
+  },
+  async scanNearbyDevices(promptToEnable = true): Promise<BleDiscoveredDevice[]> {
+    const discoveredMap = new Map<string, BleDiscoveredDevice>();
 
+    // A failed physical scan must not be disguised by the database fallback.
+    if (Platform.OS === 'web') {
+      // The chooser must start directly from a tap, never after asynchronous modal setup.
+      if (!promptToEnable) return [];
+      const id = await WebBluetoothManager.requestDevice(ECOTRACK_BLE_SERVICE_UUID);
+      const [selected] = await WebBluetoothManager.devices([id]);
+      return [{ id, bleId: id, deviceId: id, name: selected.name || 'Selected EcoTrack AC Device',
+        pingMs: null, macAddress: '', isEcoTrackDevice: true }];
+    }
+    const manager = await preparePhoneBluetooth(promptToEnable);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          try { manager.stopDeviceScan(); } catch { /* ignore */ }
+          resolve();
+        }, 8000);
+
+        manager.startDeviceScan(
+          null,
+          { allowDuplicates: true },
+          (error: any, device: any) => {
+            if (error) {
+              clearTimeout(timeout);
+              try { manager.stopDeviceScan(); } catch { /* ignore */ }
+              const message = error.errorCode === 601
+                ? 'Location services are disabled. Turn Location on and scan again.'
+                : 'Bluetooth scan failed. Check Bluetooth and location permissions, then retry.';
+              reject(new Error(message));
+              return;
+            }
+
+            if (device) {
+              const devName = (device.name || device.localName || '').trim();
+              const devId = device.id || '';
+              const isEcoService =
+                Array.isArray(device.serviceUUIDs) &&
+                device.serviceUUIDs.some(
+                  (u: string) => u.toLowerCase() === ECOTRACK_BLE_SERVICE_UUID.toLowerCase()
+                );
+              const isEcoName =
+                devName.toLowerCase().includes('ecotrack') ||
+                devName.toLowerCase().includes('esp32') ||
+                devName.toLowerCase().startsWith('node');
+
+              if (isEcoService || isEcoName || devName.length > 0) {
+                const cleanId = devName ? devName.replace(/^EcoTrack-?/i, '') : devId;
+                discoveredMap.set(devId, {
+                  id: devId,
+                  bleId: devId,
+                  deviceId: cleanId,
+                  name: devName || `EcoTrack Node (${devId.slice(-5)})`,
+                  pingMs: null,
+                  macAddress: devId,
+                  isEcoTrackDevice: isEcoService || isEcoName,
+                });
+              }
+            }
+          }
+        );
+      });
+    } catch (error) {
+      try { manager.stopDeviceScan(); } catch { /* scan already stopped */ }
+      if (error instanceof Error) throw error;
+      throw new Error('Bluetooth scan failed. Restart Bluetooth and retry.');
+    }
+
+
+    // 2. Discover unassigned nodes from Supabase
     try {
       const { data: unassignedNodes } = await supabase
         .from('nodes')
         .select('*')
         .is('room_id', null);
 
-      const discovered: BleDiscoveredDevice[] = [];
-
       if (unassignedNodes && unassignedNodes.length > 0) {
         unassignedNodes.forEach((node) => {
-          const pseudoMac = node.id
-            .replace(/[^a-fA-F0-9]/g, '')
-            .padEnd(12, 'a')
-            .substring(0, 12)
-            .match(/.{1,2}/g)
-            ?.join(':')
-            .toUpperCase() || '24:6F:28:B4:A1:0C';
-
-          discovered.push({
-            id: node.id,
-            deviceId: node.id,
-            name: node.name || `Node ${node.id}`,
-            pingMs: 18,
-            macAddress: pseudoMac,
-            isEcoTrackDevice: true,
-          });
+          if (!discoveredMap.has(node.id)) {
+            discoveredMap.set(node.id, {
+              id: node.id,
+              bleId: node.mac_address || undefined,
+              deviceId: node.id,
+              name: node.name || `Node ${node.id}`,
+              pingMs: null,
+              macAddress: node.mac_address || '',
+              isEcoTrackDevice: true,
+            });
+          }
         });
       }
-
-      if (discovered.length === 0) {
-        discovered.push({
-          id: 'ble_esp32_s3_node',
-          deviceId: 'ESP32-S3-01',
-          name: 'EcoTrack-ESP32-S3',
-          pingMs: 24,
-          macAddress: '30:AE:A4:7F:2B:1A',
-          isEcoTrackDevice: true,
-        });
-      }
-
-      return discovered;
     } catch {
-      return [
-        {
-          id: 'ble_esp32_s3_node',
-          deviceId: 'ESP32-S3-01',
-          name: 'EcoTrack-ESP32-S3',
-          pingMs: 24,
-          macAddress: '30:AE:A4:7F:2B:1A',
-          isEcoTrackDevice: true,
-        },
-      ];
+      // ignore
+    }
+
+    return Array.from(discoveredMap.values());
+  },
+
+  /** Resolve legacy/manual node identities by discovery, never by shortening a name. */
+  async resolveBleIdentifier(device: { bleId?: string; macAddress?: string; id?: string; deviceId?: string; name?: string }): Promise<string> {
+    if (Platform.OS === 'web') return device.bleId && WebBluetoothManager.hasSelectedDevice(device.bleId)
+      ? device.bleId : WebBluetoothManager.requestDevice(ECOTRACK_BLE_SERVICE_UUID);
+    const nativeId = device.bleId || device.macAddress || device.id || '';
+    if (/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(nativeId) || /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(nativeId)) return nativeId;
+    const nearby = await this.scanNearbyDevices();
+    const match = nearby.find(candidate => candidate.bleId &&
+      [candidate.id, candidate.deviceId, candidate.name].some(value =>
+        [device.id, device.deviceId, device.name].includes(value)));
+    if (!match?.bleId) throw new Error('AC Device Bluetooth identifier is unavailable. Rescan near the powered device and select it.');
+    return match.bleId;
+  },
+
+  /** Select and verify the physical controller before accepting Wi-Fi credentials. */
+  async connectForWifiReconfigure(device: { bleId?: string; macAddress?: string; id?: string; deviceId?: string; name?: string }): Promise<string> {
+    if (Platform.OS !== 'web') await preparePhoneBluetooth();
+    const bleId = await this.resolveBleIdentifier(device);
+    try {
+      if (!await this.connectBle(bleId)) throw new Error('Bluetooth connection failed. Turn Bluetooth on and keep the device powered on and nearby.');
+      const info = await this.readControllerInfo(bleId);
+      const identity = info.device_id || (info as unknown as { node?: string }).node;
+      const expected = device.deviceId || device.id;
+      if (!expected || identity !== expected) throw new Error('The selected Bluetooth AC device does not match this AC device. Choose the correct EcoTrack AC device and retry.');
+      return bleId;
+    } catch (error) {
+      await this.disconnectBle(bleId);
+      throw error;
     }
   },
 
+  async disconnectBle(bleId: string): Promise<void> {
+    try { await getBleManager()?.cancelDeviceConnection(bleId); } catch { /* Already disconnected. */ }
+  },
+
   /**
-   * Connect to an ESP32 device over BLE GATT service
+   * Connect to an ESP32 device over physical BLE GATT service
    */
   async connectBle(deviceId: string): Promise<boolean> {
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    return true;
+    const manager = getBleManager();
+    if (!manager) return false;
+
+    try {
+      const device = await manager.isDeviceConnected(deviceId) ? (await manager.devices([deviceId]))[0]
+        : await manager.connectToDevice(deviceId, { autoConnect: false, timeout: 8000 });
+      await device.discoverAllServicesAndCharacteristics();
+      return true;
+    } catch {
+      return false;
+    }
   },
 
   /**
@@ -741,71 +1117,235 @@ export const BleDeviceService = {
     }
   },
 
-  /**
-   * Scan for available Wi-Fi networks in range of the ESP32 (returns saved facility networks, no mock data)
-   */
-  async scanWifiNetworks(): Promise<WifiNetwork[]> {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    return await this.getSavedWifiNetworks();
+  /** Read the connected phone network; browsers cannot expose Wi-Fi SSIDs. */
+  async getConnectedPhoneWifi(promptToEnable = false): Promise<ConnectedPhoneWifi> {
+    if (Platform.OS === 'web') {
+      return { ssid: null, isWifi: false, error: 'unsupported' };
+    }
+    try {
+      /* eslint-disable @typescript-eslint/no-require-imports -- Lazy native modules preserve manual entry in older builds. */
+      if (Platform.OS === 'ios' && require('expo-constants').default.appOwnership === 'expo') {
+        return { ssid: null, isWifi: false, error: 'unsupported' };
+      }
+      // Keep manual provisioning available on web and installations without these native modules.
+      const NetInfo: typeof import('@react-native-community/netinfo').default = require('@react-native-community/netinfo').default;
+      const Location: typeof import('expo-location') = require('expo-location');
+      /* eslint-enable @typescript-eslint/no-require-imports */
+      // Only a user-requested Auto Search opens phone controls. Returning from the
+      // panel is not proof of connection; refresh again before using any SSID.
+      if (promptToEnable && Platform.OS === 'android') {
+        const current = await NetInfo.refresh();
+        if (current.type !== 'wifi' || current.isConnected !== true) await openPhoneWifiControls();
+      }
+      let permissionError: ConnectedPhoneWifi['error'];
+      if (!await Location.hasServicesEnabledAsync()) {
+        permissionError = 'location-disabled';
+      } else {
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (!permission.granted) permissionError = 'permission-denied';
+        else if (permission.android?.accuracy === 'coarse' || permission.ios?.accuracy === 'reduced') {
+          permissionError = 'precise-location-required';
+        }
+      }
+      // Only enable Apple's SSID API with the entitlement and precise foreground permission.
+      // Repeated configure() calls reset NetInfo listeners, so configure only when this changes.
+      if (Platform.OS === 'ios' && iosWifiSsidEnabled !== !permissionError) {
+        iosWifiSsidEnabled = !permissionError;
+        NetInfo.configure({ shouldFetchWiFiSSID: iosWifiSsidEnabled });
+      }
+      if (permissionError) return { ssid: null, isWifi: false, error: permissionError };
+
+      // Refresh the actual connection type; fetch('wifi') can label cellular as Wi-Fi on Android.
+      const state = await NetInfo.refresh();
+      if (state.type !== 'wifi' || state.isConnected !== true) return { ssid: null, isWifi: false };
+      const ssid = state.details.ssid?.replace(/^"(.*)"$/, '$1').trim() || null;
+      return {
+        ssid: ssid && ssid.toLowerCase() !== '<unknown ssid>' ? ssid : null,
+        isWifi: true,
+        details: state.details,
+      };
+    } catch {
+      return { ssid: null, isWifi: false, error: 'unavailable' };
+    }
+  },
+
+  /** Connected phone Wi-Fi followed by known saved and registered facility SSIDs. */
+  async scanWifiNetworks(phoneWifi?: ConnectedPhoneWifi): Promise<WifiNetwork[]> {
+    const list: WifiNetwork[] = [];
+    const seen = new Set<string>();
+    const phone = phoneWifi ?? await this.getConnectedPhoneWifi();
+    if (phone.isWifi && phone.ssid) {
+      const mhz = phone.details?.frequency;
+      const frequency = mhz && mhz >= 2400 && mhz < 2500 ? '2.4 GHz'
+        : mhz && mhz >= 4900 && mhz < 5925 ? '5 GHz'
+        : mhz && mhz >= 5925 && mhz <= 7125 ? '6 GHz' : undefined;
+      seen.add(phone.ssid);
+      list.push({ ssid: phone.ssid, isConnectedPhone: true, isSaved: false, isSecure: true, frequency });
+    }
+
+    // 1. Saved facility networks from local storage
+    try {
+      const saved = await this.getSavedWifiNetworks();
+      for (const net of saved) {
+        if (net.ssid === phone.ssid && list[0]?.isConnectedPhone) list[0].isSaved = true;
+        if (net.ssid && !seen.has(net.ssid)) {
+          seen.add(net.ssid);
+          list.push({
+            ...net,
+            isSaved: true,
+            frequency: '2.4 GHz',
+            isSecure: true,
+          });
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    // 2. Discover SSIDs from registered facility nodes in Supabase
+    try {
+      const { data } = await supabase
+        .from('nodes')
+        .select('wifi_ssid')
+        .not('wifi_ssid', 'is', null)
+        .limit(20);
+
+      if (data && Array.isArray(data)) {
+        for (const item of data) {
+          const ssid = (item.wifi_ssid || '').trim();
+          if (ssid && !seen.has(ssid)) {
+            seen.add(ssid);
+            list.push({
+              ssid,
+              isSaved: false,
+              isSecure: true,
+              frequency: '2.4 GHz',
+            });
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    return list;
   },
 
   /**
-   * Send Wi-Fi credentials to ESP32 over BLE with multi-step verification
+   * Send Wi-Fi credentials to ESP32 over physical BLE GATT characteristic
    */
   async configureWifi(
     deviceId: string,
     ssid: string,
     password: string,
-    onProgress?: (step: number, message: string) => void
+    onProgress?: (step: number, message: string) => void,
+    expectedDeviceId?: string
   ): Promise<{ success: boolean; ipAddress: string; error?: string }> {
-    // Step 1: Sending Wi-Fi credentials via BLE GATT characteristic
-    onProgress?.(1, 'Sending Wi-Fi credentials over BLE...');
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    const manager = getBleManager();
+    if (!manager) {
+      return {
+        success: false,
+        ipAddress: '',
+        error: 'Bluetooth hardware transport is not available. Please verify Bluetooth is enabled.',
+      };
+    }
 
-    // Step 2: ESP32 attempting DHCP handshake with router
-    onProgress?.(2, 'Connecting ESP32 to Wi-Fi...');
-    await new Promise((resolve) => setTimeout(resolve, 750));
+    try {
+      if (!ssid.trim() || encodeURIComponent(ssid).replace(/%[0-9A-F]{2}/g, 'x').length > 32 ||
+          (password.length !== 0 && (password.length < 8 || password.length > 64 ||
+          (password.length === 64 && !/^[0-9a-f]+$/i.test(password))))) {
+        throw new Error('Enter a valid Wi-Fi SSID and WPA password.');
+      }
+      onProgress?.(0, 'Connecting to device over Bluetooth...');
+      const existing = await manager.isDeviceConnected(deviceId);
+      const device = existing ? (await manager.devices([deviceId]))[0]
+        : await manager.connectToDevice(deviceId, { autoConnect: false, timeout: 10000 });
+      await device.discoverAllServicesAndCharacteristics();
+      if (Platform.OS === 'android') await device.requestMTU(512);
+      onProgress?.(1, 'Device Bluetooth connection confirmed.');
 
-    // Step 3: Verifying connection and assigned IP
-    onProgress?.(3, 'Verifying connection & local IP...');
-    await new Promise((resolve) => setTimeout(resolve, 650));
+      const info = await this.readControllerInfo(deviceId);
+      if (expectedDeviceId && (info.device_id || (info as unknown as { node?: string }).node) !== expectedDeviceId)
+        throw new Error('The selected Bluetooth AC device does not match this AC device. Reconnect to the correct AC device before sending Wi-Fi settings.');
+      if (info.cloud_protocol === 1) {
+        const receipt = await this.provisionCloud(deviceId, { ssid, pass: password }, false, expectedDeviceId);
+        await this.saveWifiSsid(ssid);
+        onProgress?.(4, 'Device Wi-Fi connection confirmed.');
+        return { success: true, ipAddress: receipt.ip_address || '' };
+      }
+      const requestId = `wifi-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      const payload = JSON.stringify({ ssid, pass: password, request_id: requestId });
+      const base64Data = toBase64(encodeURIComponent(payload).replace(/%([0-9A-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))));
 
-    // Step 4: Connecting to EcoTrack / Supabase Realtime Telemetry
-    onProgress?.(4, 'Registering with EcoTrack Supabase...');
-    await new Promise((resolve) => setTimeout(resolve, 600));
+      await device.writeCharacteristicWithResponseForService(
+        ECOTRACK_BLE_SERVICE_UUID,
+        ECOTRACK_CHAR_WIFI_CONFIG_UUID,
+        base64Data
+      );
 
-    const generatedIp = `192.168.1.${Math.floor(Math.random() * 150 + 100)}`;
-    return {
-      success: true,
-      ipAddress: generatedIp,
-    };
+      onProgress?.(2, 'Credentials transmitted; awaiting Device Wi-Fi confirmation.');
+      let assignedIp = '';
+      const deadline = Date.now() + 45000;
+      while (Date.now() < deadline && !assignedIp) {
+        let parsed: any = null;
+        try {
+          const infoChar = await device.readCharacteristicForService(
+            ECOTRACK_BLE_SERVICE_UUID,
+            ECOTRACK_CHAR_DEVICE_INFO_UUID
+          );
+          if (infoChar?.value) {
+            const jsonStr = decodeURIComponent(Array.from(fromBase64(infoChar.value), char => `%${char.charCodeAt(0).toString(16).padStart(2, '0')}`).join(''));
+            parsed = JSON.parse(jsonStr);
+          }
+        } catch { /* The controller may still be updating its response. */ }
+        if (expectedDeviceId && parsed && (parsed.device_id || parsed.node) !== expectedDeviceId)
+          throw new Error('The selected Bluetooth AC device does not match this AC device. Reconnect to the correct AC device.');
+        if (parsed?.request_id === requestId && parsed?.wifi_ssid === ssid) {
+          if (parsed.wifi_status === 'error') throw new Error('The device could not connect to Wi-Fi. Check the password, 2.4 GHz network and signal.');
+          if (parsed.wifi_status === 'connected' && typeof parsed.ip === 'string' &&
+              /^(?:\d{1,3}\.){3}\d{1,3}$/.test(parsed.ip) && parsed.ip !== '0.0.0.0' &&
+              parsed.ip.split('.').every((part: string) => Number(part) <= 255)) assignedIp = parsed.ip;
+        }
+        if (!assignedIp) await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      if (!assignedIp) throw new Error('The device did not confirm this Wi-Fi connection. Check the AC device firmware and retry.');
+      onProgress?.(3, 'Device Wi-Fi connected. Internet/backend access has not been verified.');
+
+      await this.saveWifiSsid(ssid);
+      onProgress?.(4, 'Confirmed network profile saved.');
+
+      return {
+        success: true,
+        ipAddress: assignedIp,
+      };
+    } catch (err: any) {
+      const message = String(err?.message || '');
+      return {
+        success: false,
+        ipAddress: '',
+        error: /^(Enter a valid Wi-Fi|The device could not connect|The device did not confirm|The selected Bluetooth AC device)/.test(message)
+          ? message : 'Bluetooth communication failed during Wi-Fi setup. Reconnect to the device and retry.',
+      };
+    }
   },
 
   /**
    * Run live connection and diagnostics test on a device
    */
   async testDeviceConnection(deviceId: string): Promise<{
-    online: boolean;
-    pingMs: number;
-    wifiSignal: string;
+    online: boolean; pingMs: number | null; wifiSignal: string;
+    connectionState: 'online' | 'offline' | 'sleeping' | 'unknown'; error?: string;
   }> {
-    const startTime = Date.now();
     try {
-      const { data } = await supabase.from('nodes').select('id, status, updated').eq('id', deviceId).limit(1);
-      const pingMs = Math.max(15, Date.now() - startTime);
-      const isOnline = data && data.length > 0 ? (data[0].status === 'online' || data[0].status === 'connected') : true;
-
-      return {
-        online: isOnline,
-        pingMs,
-        wifiSignal: `Ping: ${pingMs}ms • Supabase Verified`,
-      };
-    } catch {
-      return {
-        online: true,
-        pingMs: 24,
-        wifiSignal: 'Ping: 24ms',
-      };
+      const result = await CloudHardware.request(deviceId, 'ping', {}, 20000);
+      return { online: true, pingMs: result.round_trip_ms, connectionState: 'online',
+        wifiSignal: typeof result.rssi === 'number' && Number.isFinite(result.rssi)
+          ? result.rssi + ' dBm · Cloud AC device reached' : 'Cloud AC device reached' };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'AC Device acknowledgement unavailable';
+      return { online: false, pingMs: null,
+        connectionState: error instanceof CloudHardwareRequestError ? error.connectionState : 'unknown',
+        wifiSignal: message, error: message };
     }
   },
 };

@@ -1,0 +1,49 @@
+-- RETIRED: legacy anonymous/public access is unsafe. See supabase/README.md.
+do $$ begin raise exception 'Retired insecure setup script. Use reviewed supabase/migrations on a disposable schema copy.'; end $$;
+-- Original contents retained below as comments for schema comparison only.
+-- LEGACY | -- ==============================================================================
+-- LEGACY | -- EcoTrack Universal Aircon IoT: RLS Policies for aircons table
+-- LEGACY | -- Grants SELECT, INSERT, UPDATE, DELETE permissions to public / anon role
+-- LEGACY | -- ==============================================================================
+-- LEGACY |
+-- LEGACY | -- 1. Ensure public.aircons table exists and has ROW LEVEL SECURITY enabled
+-- LEGACY | ALTER TABLE IF EXISTS public.aircons ENABLE ROW LEVEL SECURITY;
+-- LEGACY |
+-- LEGACY | -- 2. Drop any legacy restrictive policies
+-- LEGACY | DROP POLICY IF EXISTS "Allow public read access to aircons" ON public.aircons;
+-- LEGACY | DROP POLICY IF EXISTS "Allow public insert access to aircons" ON public.aircons;
+-- LEGACY | DROP POLICY IF EXISTS "Allow public update access to aircons" ON public.aircons;
+-- LEGACY | DROP POLICY IF EXISTS "Allow public delete access to aircons" ON public.aircons;
+-- LEGACY |
+-- LEGACY | -- 3. Create permissive policies for full Admin (Desktop) & Maintenance Staff (Mobile) CRUD
+-- LEGACY | CREATE POLICY "Allow public read access to aircons"
+-- LEGACY | ON public.aircons FOR SELECT
+-- LEGACY | USING (true);
+-- LEGACY |
+-- LEGACY | CREATE POLICY "Allow public insert access to aircons"
+-- LEGACY | ON public.aircons FOR INSERT
+-- LEGACY | WITH CHECK (true);
+-- LEGACY |
+-- LEGACY | CREATE POLICY "Allow public update access to aircons"
+-- LEGACY | ON public.aircons FOR UPDATE
+-- LEGACY | USING (true);
+-- LEGACY |
+-- LEGACY | CREATE POLICY "Allow public delete access to aircons"
+-- LEGACY | ON public.aircons FOR DELETE
+-- LEGACY | USING (true);
+-- LEGACY |
+-- LEGACY | -- 4. Enable Supabase Realtime for aircons table if publication exists
+-- LEGACY | DO $$
+-- LEGACY | BEGIN
+-- LEGACY |   IF EXISTS (
+-- LEGACY |     SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime'
+-- LEGACY |   ) AND NOT EXISTS (
+-- LEGACY |     SELECT 1 FROM pg_publication_tables
+-- LEGACY |     WHERE pubname = 'supabase_realtime'
+-- LEGACY |       AND schemaname = 'public'
+-- LEGACY |       AND tablename = 'aircons'
+-- LEGACY |   ) THEN
+-- LEGACY |     ALTER PUBLICATION supabase_realtime ADD TABLE public.aircons;
+-- LEGACY |   END IF;
+-- LEGACY | END $$;
+-- LEGACY |

@@ -36,5 +36,7 @@ const styles = StyleSheet.create({
   badgeImage: {
     width: 48,
     height: 48,
+    borderRadius: 12,
+    overflow: 'hidden',
   },
 });

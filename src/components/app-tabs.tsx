@@ -16,7 +16,7 @@ export default function AppTabs() {
       labelStyle={{ selected: { color: colors.text } }}>
       
       <NativeTabs.Trigger name="index">
-        <NativeTabs.Trigger.Label>Sensor Location</NativeTabs.Trigger.Label>
+        <NativeTabs.Trigger.Label>AC Devices</NativeTabs.Trigger.Label>
         <NativeTabs.Trigger.Icon src={placeholderIcon} renderingMode="template" />
       </NativeTabs.Trigger>
 
@@ -40,10 +40,6 @@ export default function AppTabs() {
         <NativeTabs.Trigger.Icon src={placeholderIcon} renderingMode="template" />
       </NativeTabs.Trigger>
 
-      <NativeTabs.Trigger name="explore">
-        <NativeTabs.Trigger.Label>Explore</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon src={placeholderIcon} renderingMode="template" />
-      </NativeTabs.Trigger>
 
     </NativeTabs>
   );

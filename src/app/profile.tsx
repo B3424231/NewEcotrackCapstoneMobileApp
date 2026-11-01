@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect } from 'react';
+import { Colors as UiColors, type AppColors, Colors, Spacing } from '@/constants/theme';
+import { useState } from 'react';
 import { StyleSheet, View, ScrollView, Pressable, Animated, Dimensions, useColorScheme, Platform, TextInput, Modal, Switch, Alert, ActivityIndicator } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -8,7 +9,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Colors, Spacing } from '@/constants/theme';
+
 import { useAuth } from '@/context/auth-context';
 import { useSettings } from '@/context/settings-context';
 import { FloatingBottomNavbar } from '@/components/floating-navbar';
@@ -28,13 +29,14 @@ const ICON_PENCIL_2D = ICON_EDIT;
 const ICON_SETTINGS_2D = ICON_SETTINGS;
 
 type AvatarType = 'default' | 'male' | 'female' | 'custom';
-import { updateStaffProfile, uploadImageToSupabase, changeUserPassword } from '@/services/supabase';
+import { updateStaffProfile, uploadImageToSupabase, changeUserPassword, requestUserEmailChange } from '@/services/supabase';
 
 type ProfileField = 'fullName' | 'phone' | 'email' | 'role';
 
 export default function ProfileScreen() {
   const { logout, userName, userRole, userPhone, userAssignment, userAvatar, userCustomPhotoUri, updateUserProfile, userId, userEmail, userType } = useAuth();
   const { settings, effectiveTheme, colors, updateSetting, saveAllSettings, resetDefaults, clearLocalCache, triggerHaptic } = useSettings();
+  const styles = themedStyles[effectiveTheme];
   const theme = effectiveTheme;
   const isDark = effectiveTheme === 'dark';
 
@@ -42,72 +44,42 @@ export default function ProfileScreen() {
 
   // Functional System Settings States
   const [settingsModalVisible, setSettingsModalVisible] = useState(false);
-  const [selectedTheme, setSelectedTheme] = useState<'light' | 'dark' | 'system'>(settings.theme);
-  const [tempUnit, setTempUnit] = useState<'C' | 'F'>(settings.tempUnit);
-  const [autoSyncEnabled, setAutoSyncEnabled] = useState(settings.autoSyncEnabled);
-  const [syncFrequency, setSyncFrequency] = useState<5 | 15 | 30>(settings.syncFrequency);
-  const [criticalAlertsEnabled, setCriticalAlertsEnabled] = useState(settings.criticalAlertsEnabled);
-  const [maintenanceRemindersEnabled, setMaintenanceRemindersEnabled] = useState(settings.maintenanceRemindersEnabled);
-  const [hapticFeedbackEnabled, setHapticFeedbackEnabled] = useState(settings.hapticFeedbackEnabled);
+  const { theme: selectedTheme, tempUnit, autoSyncEnabled, syncFrequency,
+    criticalAlertsEnabled, maintenanceRemindersEnabled, hapticFeedbackEnabled } = settings;
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState(false);
   const [cacheCleared, setCacheCleared] = useState(false);
 
-  // Keep modal state in sync with global settings whenever settings change or modal opens
-  useEffect(() => {
-    setSelectedTheme(settings.theme);
-    setTempUnit(settings.tempUnit);
-    setAutoSyncEnabled(settings.autoSyncEnabled);
-    setSyncFrequency(settings.syncFrequency);
-    setCriticalAlertsEnabled(settings.criticalAlertsEnabled);
-    setMaintenanceRemindersEnabled(settings.maintenanceRemindersEnabled);
-    setHapticFeedbackEnabled(settings.hapticFeedbackEnabled);
-  }, [settings, settingsModalVisible]);
-
   // Instant Settings Change Handlers
   const handleThemeChange = (newTheme: 'light' | 'dark' | 'system') => {
-    setSelectedTheme(newTheme);
     updateSetting('theme', newTheme);
   };
 
   const handleTempUnitChange = (newUnit: 'C' | 'F') => {
-    setTempUnit(newUnit);
     updateSetting('tempUnit', newUnit);
   };
 
   const handleSyncFrequencyChange = (newFreq: 5 | 15 | 30) => {
-    setSyncFrequency(newFreq);
     updateSetting('syncFrequency', newFreq);
   };
 
   const handleAutoSyncToggle = (val: boolean) => {
-    setAutoSyncEnabled(val);
     updateSetting('autoSyncEnabled', val);
   };
 
   const handleCriticalAlertsToggle = (val: boolean) => {
-    setCriticalAlertsEnabled(val);
     updateSetting('criticalAlertsEnabled', val);
   };
 
   const handleMaintenanceRemindersToggle = (val: boolean) => {
-    setMaintenanceRemindersEnabled(val);
     updateSetting('maintenanceRemindersEnabled', val);
   };
 
   const handleHapticFeedbackToggle = (val: boolean) => {
-    setHapticFeedbackEnabled(val);
     updateSetting('hapticFeedbackEnabled', val);
   };
 
   const handleResetDefaults = async () => {
     await resetDefaults();
-    setSelectedTheme('system');
-    setTempUnit('C');
-    setAutoSyncEnabled(true);
-    setSyncFrequency(15);
-    setCriticalAlertsEnabled(true);
-    setMaintenanceRemindersEnabled(true);
-    setHapticFeedbackEnabled(true);
   };
 
   const handleSaveSettings = async () => {
@@ -121,7 +93,10 @@ export default function ProfileScreen() {
         maintenanceRemindersEnabled,
         hapticFeedbackEnabled,
       };
-      await saveAllSettings(payload);
+      if (!await saveAllSettings(payload)) {
+        Alert.alert('Unable to save settings', 'Your preferences could not be saved. Please try again.');
+        return;
+      }
       setSettingsSaveSuccess(true);
       setTimeout(() => {
         setSettingsSaveSuccess(false);
@@ -129,6 +104,7 @@ export default function ProfileScreen() {
       }, 1000);
     } catch (e) {
       console.error('Failed to save settings:', e);
+      Alert.alert('Unable to save settings', 'Your preferences could not be saved. Please try again.');
     }
   };
 
@@ -151,27 +127,14 @@ export default function ProfileScreen() {
     );
   };
 
-  // Profile Saved States (Role and Duty Assignment are dictated by Desktop admin dashboard)
-  const [fullName, setFullName] = useState(userName || '');
-  const [phone, setPhone] = useState(userPhone || '');
-  const [email, setEmail] = useState(userEmail || '');
-  const [assignments, setAssignments] = useState<string[]>(
-    userAssignment ? (userAssignment.includes(', ') ? userAssignment.split(', ') : [userAssignment]) : ['Unassigned']
-  );
-  const [role, setRole] = useState(userRole || 'HVAC / Aircon Technician');
-  const [avatar, setAvatar] = useState<AvatarType>(userAvatar || 'default');
-  const [customPhotoUri, setCustomPhotoUri] = useState<string | null>(userCustomPhotoUri || null);
-
-  // Sync state with auth context
-  useEffect(() => {
-    if (userName) setFullName(userName);
-    if (userPhone) setPhone(userPhone);
-    if (userEmail) setEmail(userEmail);
-    if (userRole) setRole(userRole);
-    if (userAssignment) setAssignments(userAssignment.includes(', ') ? userAssignment.split(', ') : [userAssignment]);
-    if (userAvatar) setAvatar(userAvatar);
-    if (userCustomPhotoUri) setCustomPhotoUri(userCustomPhotoUri);
-  }, [userName, userPhone, userEmail, userRole, userAssignment, userAvatar, userCustomPhotoUri]);
+  // Saved fields follow the shared profile; only the edit form owns a draft.
+  const fullName = userName || '';
+  const phone = userPhone || '';
+  const email = userEmail || '';
+  const assignments = userAssignment ? userAssignment.split(', ') : ['Unassigned'];
+  const role = userRole || 'HVAC / Aircon Technician';
+  const avatar: AvatarType = userAvatar || 'default';
+  const customPhotoUri = userCustomPhotoUri || null;
 
   // Modal Editing States (Personal info only - Role and Duty Assignment are dictated by Desktop)
   const [editModalVisible, setEditModalVisible] = useState(false);
@@ -301,6 +264,7 @@ export default function ProfileScreen() {
   };
 
   const saveProfileChanges = async () => {
+    try {
     let finalPhotoUrl = tempCustomPhotoUri;
 
     // If custom photo is selected, ensure it is uploaded / prepared for Supabase
@@ -315,15 +279,19 @@ export default function ProfileScreen() {
       }
     }
 
-    setFullName(tempFullName);
-    setPhone(tempPhone);
-    setEmail(tempEmail);
-    setAvatar(tempAvatar);
-    setCustomPhotoUri(finalPhotoUrl);
+    const assignmentStr = assignments.length > 0 ? assignments.join(', ') : userAssignment || 'Unassigned';
+    if (!userId || !await updateStaffProfile(userId, tempFullName, tempPhone, tempEmail, role, tempAvatar, finalPhotoUrl, assignmentStr)) {
+      Alert.alert('Unable to save profile', 'Your changes could not be saved. Please try again.');
+      return;
+    }
 
-    const assignmentStr = assignments.length > 0
-      ? assignments.join(', ')
-      : userAssignment || 'Unassigned';
+    if (tempEmail.trim().toLowerCase() !== email.trim().toLowerCase()) {
+      const requested = await requestUserEmailChange(tempEmail);
+      Alert.alert(requested ? 'Confirm email change' : 'Email change not sent', requested
+        ? 'Confirm the change using the email messages sent to your account. Your current email stays active until confirmation.'
+        : 'Your profile was saved, but the email change could not be requested. Please try again.');
+    }
+    setTempEmail(email);
 
     updateUserProfile(
       tempFullName,
@@ -331,22 +299,9 @@ export default function ProfileScreen() {
       tempPhone,
       tempAvatar,
       finalPhotoUrl,
-      tempEmail,
+      email,
       assignmentStr
     );
-
-    if (userId) {
-      await updateStaffProfile(
-        userId,
-        tempFullName,
-        tempPhone,
-        tempEmail,
-        role,
-        tempAvatar,
-        finalPhotoUrl,
-        assignmentStr
-      );
-    }
 
     setEditModalVisible(false);
 
@@ -354,11 +309,14 @@ export default function ProfileScreen() {
     setTimeout(() => {
       setSaveSuccess(false);
     }, 2000);
+    } catch {
+      Alert.alert('Unable to save profile', 'Your changes could not be saved. Please try again.');
+    }
   };
 
   return (
     <LinearGradient 
-      colors={effectiveTheme === 'dark' ? ['#0f172a', '#0a0f1d'] : ['#d1fae5', '#ffffff']} 
+      colors={[UiColors[effectiveTheme].background, UiColors[effectiveTheme].background]} 
       style={[styles.container, { backgroundColor: colors.background }]} 
       start={{ x: 0, y: 0 }} 
       end={{ x: 0, y: 0.35 }}
@@ -396,11 +354,7 @@ export default function ProfileScreen() {
                 pressed && styles.buttonPressed
               ]}
             >
-              <Image
-                source={{ uri: ICON_SETTINGS_2D }}
-                style={styles.pencilIcon}
-                tintColor={colors.textSecondary}
-              />
+              <AppIcon name="gear" size={18} color={colors.textSecondary} />
             </Pressable>
 
             {/* Edit Icon Button (No container background, positioned top right of profile area) */}
@@ -411,16 +365,12 @@ export default function ProfileScreen() {
                 pressed && styles.buttonPressed
               ]}
             >
-              <Image
-                source={{ uri: ICON_PENCIL_2D }}
-                style={styles.pencilIcon}
-                tintColor={colors.textSecondary}
-              />
+              <AppIcon name="edit" size={18} color={colors.textSecondary} />
             </Pressable>
 
             {/* View-Only Profile Header */}
             <View style={styles.profileHeaderSection}>
-              <View style={[styles.avatarCircle, { borderColor: colors.emerald, borderWidth: 2, backgroundColor: effectiveTheme === 'dark' ? '#151e32' : 'rgba(16, 185, 129, 0.1)' }]}>
+              <View style={[styles.avatarCircle, { borderColor: colors.emerald, borderWidth: 2, backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].accentSurface }]}>
                 <Image
                   source={getAvatarSource(avatar, customPhotoUri)}
                   style={styles.profileAvatarImage}
@@ -445,35 +395,35 @@ export default function ProfileScreen() {
 
             {/* View-Only Details list */}
             <View style={styles.detailsList}>
-              <View style={[styles.detailRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+              <View style={[styles.detailRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                 <ThemedText style={[styles.detailLabel, { color: colors.textSecondary }]}>Registered Phone</ThemedText>
                 <ThemedText style={[styles.detailValue, { color: colors.text }]}>{phone || 'N/A'}</ThemedText>
               </View>
 
-              <View style={[styles.detailRow, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+              <View style={[styles.detailRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                 <ThemedText style={[styles.detailLabel, { color: colors.textSecondary }]}>Corporate Email</ThemedText>
                 <ThemedText style={[styles.detailValue, { color: colors.text }]}>{email || 'N/A'}</ThemedText>
               </View>
 
               {/* Duty Assignment (Spacious, well-spaced, never truncated) */}
-              <View style={[styles.dutyAssignmentBlock, { borderBottomColor: effectiveTheme === 'dark' ? '#1e293b' : '#f1f5f9' }]}>
+              <View style={[styles.dutyAssignmentBlock, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                 <View style={styles.dutyAssignmentHeaderRow}>
                   <ThemedText style={[styles.detailLabel, { color: colors.textSecondary }]}>Duty Assignment</ThemedText>
                   <ThemedText style={[styles.dictatedBadge, { 
-                    backgroundColor: effectiveTheme === 'dark' ? '#064e3b' : '#ecfdf5', 
-                    color: effectiveTheme === 'dark' ? '#34d399' : '#047857' 
+                    backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].primaryFill : UiColors[effectiveTheme].accentSurface, 
+                    color: effectiveTheme === 'dark' ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].text 
                   }]}>
                     Assigned by Admin
                   </ThemedText>
                 </View>
                 <View style={[styles.dutyAssignmentTextCard, { 
-                  backgroundColor: effectiveTheme === 'dark' ? '#151e32' : '#f8fafc',
-                  borderColor: effectiveTheme === 'dark' ? '#334155' : '#e2e8f0',
+                  backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].background,
+                  borderColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
                 }]}>
                   {assignments.length > 0 && assignments[0] !== 'Unassigned' ? (
                     assignments.map((assign, idx) => (
                       <View key={idx} style={{ flexDirection: 'row', alignItems: 'center', gap: 7, marginVertical: 3 }}>
-                        <LocationIcon size={14} color="#10b981" />
+                        <LocationIcon size={14} color={UiColors[effectiveTheme].emerald} />
                         <ThemedText style={[styles.dutyAssignmentValueText, { color: colors.text }]}>
                           {assign}
                         </ThemedText>
@@ -481,7 +431,7 @@ export default function ProfileScreen() {
                     ))
                   ) : (
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
-                      <LocationIcon size={14} color="#9ca3af" />
+                      <LocationIcon size={14} color={UiColors[effectiveTheme].textMuted} />
                       <ThemedText style={[styles.dutyAssignmentValueText, { color: colors.textSecondary }]}>
                         Unassigned
                       </ThemedText>
@@ -536,7 +486,7 @@ export default function ProfileScreen() {
                       style={[
                         styles.avatarOptionCircle,
                         isDark && styles.avatarOptionCircleDark,
-                        tempAvatar === opt && { borderColor: colors.emerald, borderWidth: 2, backgroundColor: 'rgba(16, 185, 129, 0.15)' }
+                        tempAvatar === opt && { borderColor: colors.emerald, borderWidth: 2, backgroundColor: UiColors[effectiveTheme].accentSurface }
                       ]}
                     >
                       <Image
@@ -559,7 +509,7 @@ export default function ProfileScreen() {
                     style={[
                       styles.avatarOptionCircle,
                       isDark && styles.avatarOptionCircleDark,
-                      tempAvatar === 'custom' && { borderColor: colors.emerald, borderWidth: 2, backgroundColor: 'rgba(16, 185, 129, 0.15)' }
+                      tempAvatar === 'custom' && { borderColor: colors.emerald, borderWidth: 2, backgroundColor: UiColors[effectiveTheme].accentSurface }
                     ]}
                   >
                     {tempCustomPhotoUri ? (
@@ -576,12 +526,12 @@ export default function ProfileScreen() {
                           }}
                           style={styles.avatarMiniChangeTag}
                         >
-                          <SymbolView name="camera.fill" tintColor="#ffffff" size={10} fallback={<ThemedText style={{ fontSize: 8, color: '#ffffff' }}>+</ThemedText>} />
+                          <SymbolView name="camera.fill" tintColor={UiColors[effectiveTheme].onPrimary} size={10} fallback={<ThemedText style={{ fontSize: 8, color: UiColors[effectiveTheme].onPrimary }}>+</ThemedText>} />
                         </Pressable>
                       </View>
                     ) : (
                       <View style={styles.avatarPickerTrigger}>
-                        <SymbolView name="plus" tintColor={isDark ? '#94a3b8' : '#4b5563'} size={18} fallback={<ThemedText style={{ fontSize: 16, color: isDark ? '#94a3b8' : '#4b5563' }}>+</ThemedText>} />
+                        <SymbolView name="plus" tintColor={isDark ? '#94a3b8' : '#4b5563'} size={18} fallback={<ThemedText style={{ fontSize: 16, color: isDark ? UiColors[effectiveTheme].textMuted : '#4b5563' }}>+</ThemedText>} />
                       </View>
                     )}
                   </Pressable>
@@ -675,7 +625,7 @@ export default function ProfileScreen() {
                 onPress={saveProfileChanges}
                 style={({ pressed }) => [
                   styles.saveButton,
-                  { backgroundColor: colors.emerald },
+                  { backgroundColor: colors.primaryFill },
                   pressed && styles.buttonPressed,
                 ]}
               >
@@ -717,15 +667,15 @@ export default function ProfileScreen() {
 
             <ScrollView contentContainerStyle={styles.modalScrollBody} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
               
-              <ThemedText style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#64748b', marginBottom: 4, lineHeight: 18 }}>
-                Update your account password below. Enter your current password followed by your new password.
+              <ThemedText style={{ fontSize: 13, color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary, marginBottom: 4, lineHeight: 18 }}>
+                Enter your current password, then choose a new one.
               </ThemedText>
 
               {/* Error Feedback */}
               {pwdError ? (
                 <View style={[styles.pwdFeedbackBox, styles.pwdErrorBox]}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                    <AppIcon name="alert-octagon" size={13} color="#ef4444" />
+                    <AppIcon name="alert-octagon" size={13} color={UiColors[effectiveTheme].error} />
                     <ThemedText style={styles.pwdErrorText}>{pwdError}</ThemedText>
                   </View>
                 </View>
@@ -757,19 +707,23 @@ export default function ProfileScreen() {
                     placeholderTextColor={isDark ? '#64748b' : '#9ca3af'}
                     secureTextEntry={!showOldPwd}
                     autoCapitalize="none"
+                    autoCorrect={false}
+                    accessibilityLabel="Old password"
                     onFocus={() => setPwdFocusedField('old')}
                     onBlur={() => setPwdFocusedField(null)}
                   />
                   <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={showOldPwd ? 'Hide old password' : 'Show old password'}
+                    accessibilityState={{ selected: showOldPwd }}
                     hitSlop={10}
                     onPress={() => setShowOldPwd((prev) => !prev)}
                     style={styles.eyeToggleBtn}
                   >
-                    <Image
-                      source={{ uri: showOldPwd ? ICON_EYE_OFF : ICON_EYE }}
-                      style={styles.eyeIcon}
-                      contentFit="contain"
-                      tintColor={isDark ? '#94a3b8' : '#6b7280'}
+                    <AppIcon
+                      name={showOldPwd ? 'eye-off' : 'eye'}
+                      size={20}
+                      color={isDark ? '#94a3b8' : '#6b7280'}
                     />
                   </Pressable>
                 </View>
@@ -794,19 +748,23 @@ export default function ProfileScreen() {
                     placeholderTextColor={isDark ? '#64748b' : '#9ca3af'}
                     secureTextEntry={!showNewPwd}
                     autoCapitalize="none"
+                    autoCorrect={false}
+                    accessibilityLabel="New password"
                     onFocus={() => setPwdFocusedField('new')}
                     onBlur={() => setPwdFocusedField(null)}
                   />
                   <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={showNewPwd ? 'Hide new password' : 'Show new password'}
+                    accessibilityState={{ selected: showNewPwd }}
                     hitSlop={10}
                     onPress={() => setShowNewPwd((prev) => !prev)}
                     style={styles.eyeToggleBtn}
                   >
-                    <Image
-                      source={{ uri: showNewPwd ? ICON_EYE_OFF : ICON_EYE }}
-                      style={styles.eyeIcon}
-                      contentFit="contain"
-                      tintColor={isDark ? '#94a3b8' : '#6b7280'}
+                    <AppIcon
+                      name={showNewPwd ? 'eye-off' : 'eye'}
+                      size={20}
+                      color={isDark ? '#94a3b8' : '#6b7280'}
                     />
                   </Pressable>
                 </View>
@@ -831,19 +789,23 @@ export default function ProfileScreen() {
                     placeholderTextColor={isDark ? '#64748b' : '#9ca3af'}
                     secureTextEntry={!showConfirmPwd}
                     autoCapitalize="none"
+                    autoCorrect={false}
+                    accessibilityLabel="Confirm password"
                     onFocus={() => setPwdFocusedField('confirm')}
                     onBlur={() => setPwdFocusedField(null)}
                   />
                   <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={showConfirmPwd ? 'Hide confirm password' : 'Show confirm password'}
+                    accessibilityState={{ selected: showConfirmPwd }}
                     hitSlop={10}
                     onPress={() => setShowConfirmPwd((prev) => !prev)}
                     style={styles.eyeToggleBtn}
                   >
-                    <Image
-                      source={{ uri: showConfirmPwd ? ICON_EYE_OFF : ICON_EYE }}
-                      style={styles.eyeIcon}
-                      contentFit="contain"
-                      tintColor={isDark ? '#94a3b8' : '#6b7280'}
+                    <AppIcon
+                      name={showConfirmPwd ? 'eye-off' : 'eye'}
+                      size={20}
+                      color={isDark ? '#94a3b8' : '#6b7280'}
                     />
                   </Pressable>
                 </View>
@@ -855,19 +817,19 @@ export default function ProfileScreen() {
                 disabled={pwdSubmitting || pwdSuccess}
                 style={({ pressed }) => [
                   styles.saveButton,
-                  { backgroundColor: colors.emerald, marginTop: Spacing.three },
+                  { backgroundColor: colors.primaryFill, marginTop: Spacing.three },
                   (pwdSubmitting || pwdSuccess) && { opacity: 0.7 },
                   pressed && styles.buttonPressed,
                 ]}
               >
                 {pwdSubmitting ? (
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                    <ActivityIndicator size="small" color="#ffffff" />
+                    <ActivityIndicator size="small" color={UiColors[effectiveTheme].onPrimary} />
                     <ThemedText style={styles.saveButtonText}>UPDATING PASSWORD...</ThemedText>
                   </View>
                 ) : pwdSuccess ? (
                   <View style={styles.successRow}>
-                    <SymbolView name="checkmark.circle.fill" tintColor="#ffffff" size={18} fallback={<ThemedText style={{ color: '#ffffff' }}>✓</ThemedText>} />
+                    <SymbolView name="checkmark.circle.fill" tintColor={UiColors[effectiveTheme].onPrimary} size={18} fallback={<ThemedText style={{ color: UiColors[effectiveTheme].onPrimary }}>✓</ThemedText>} />
                     <ThemedText style={styles.saveButtonText}>PASSWORD UPDATED</ThemedText>
                   </View>
                 ) : (
@@ -1017,8 +979,8 @@ export default function ProfileScreen() {
                 
                 <View style={[styles.toggleRow, isDark && styles.toggleRowDark]}>
                   <View style={{ flex: 1, paddingRight: 10 }}>
-                    <ThemedText style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}>Live Telemetry Auto-Sync</ThemedText>
-                    <ThemedText style={{ fontSize: 11, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>Real-time PostgreSQL background subscription</ThemedText>
+                    <ThemedText style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>Live Telemetry Auto-Sync</ThemedText>
+                    <ThemedText style={{ fontSize: 11, color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary, marginTop: 2 }}>Real-time PostgreSQL background subscription</ThemedText>
                   </View>
                   <Switch
                     value={autoSyncEnabled}
@@ -1070,8 +1032,8 @@ export default function ProfileScreen() {
                 
                 <View style={[styles.toggleRow, isDark && styles.toggleRowDark]}>
                   <View style={{ flex: 1, paddingRight: 10 }}>
-                    <ThemedText style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}>Critical Temp Thresholds</ThemedText>
-                    <ThemedText style={{ fontSize: 11, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>Alerts when vent temperatures exceed 28°C</ThemedText>
+                    <ThemedText style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>Critical Temp Thresholds</ThemedText>
+                    <ThemedText style={{ fontSize: 11, color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary, marginTop: 2 }}>Alerts when vent temperatures exceed 28°C</ThemedText>
                   </View>
                   <Switch
                     value={criticalAlertsEnabled}
@@ -1083,8 +1045,8 @@ export default function ProfileScreen() {
 
                 <View style={[styles.toggleRow, isDark && styles.toggleRowDark]}>
                   <View style={{ flex: 1, paddingRight: 10 }}>
-                    <ThemedText style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}>Maintenance Reminders</ThemedText>
-                    <ThemedText style={{ fontSize: 11, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>Push notices for filter cleaning & checklists</ThemedText>
+                    <ThemedText style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>Maintenance Reminders</ThemedText>
+                    <ThemedText style={{ fontSize: 11, color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary, marginTop: 2 }}>Push notices for filter cleaning & checklists</ThemedText>
                   </View>
                   <Switch
                     value={maintenanceRemindersEnabled}
@@ -1096,8 +1058,8 @@ export default function ProfileScreen() {
 
                 <View style={[styles.toggleRow, isDark && styles.toggleRowDark]}>
                   <View style={{ flex: 1, paddingRight: 10 }}>
-                    <ThemedText style={[styles.toggleLabel, { color: isDark ? '#f1f5f9' : '#1e293b' }]}>Haptic Feedback</ThemedText>
-                    <ThemedText style={{ fontSize: 11, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>Vibrate device during urgent threshold events</ThemedText>
+                    <ThemedText style={[styles.toggleLabel, { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text }]}>Haptic Feedback</ThemedText>
+                    <ThemedText style={{ fontSize: 11, color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary, marginTop: 2 }}>Vibrate device during urgent threshold events</ThemedText>
                   </View>
                   <Switch
                     value={hapticFeedbackEnabled}
@@ -1124,11 +1086,11 @@ export default function ProfileScreen() {
                 >
                   <View>
                     <ThemedText style={[styles.cacheBtnText, isDark && styles.cacheBtnTextDark]}>Clear Local Cache</ThemedText>
-                    <ThemedText style={{ fontSize: 11, color: isDark ? '#fca5a5' : '#991b1b', marginTop: 2 }}>
+                    <ThemedText style={{ fontSize: 11, color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error, marginTop: 2 }}>
                       {cacheCleared ? '✓ Local cache cleared successfully' : 'Clears offline telemetry buffers'}
                     </ThemedText>
                   </View>
-                  <AppIcon name="trash" size={18} color="#ef4444" />
+                  <AppIcon name="trash" size={18} color={UiColors[effectiveTheme].error} />
                 </Pressable>
               </View>
 
@@ -1142,8 +1104,8 @@ export default function ProfileScreen() {
                   <View style={styles.diagRow}>
                     <ThemedText style={[styles.diagLabel, isDark && styles.diagLabelDark]}>Server Connection</ThemedText>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                      <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#10b981' }} />
-                      <ThemedText style={[styles.diagValue, { color: isDark ? '#34d399' : '#059669' }]}>Cloud Live Sync</ThemedText>
+                      <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: UiColors[effectiveTheme].primaryFill }} />
+                      <ThemedText style={[styles.diagValue, { color: isDark ? UiColors[effectiveTheme].emerald : UiColors[effectiveTheme].emerald }]}>Cloud Live Sync</ThemedText>
                     </View>
                   </View>
                   <View style={styles.diagRow}>
@@ -1170,13 +1132,13 @@ export default function ProfileScreen() {
                 onPress={handleSaveSettings}
                 style={({ pressed }) => [
                   styles.saveButton,
-                  { backgroundColor: colors.emerald, marginTop: 14 },
+                  { backgroundColor: colors.primaryFill, marginTop: 14 },
                   pressed && styles.buttonPressed,
                 ]}
               >
                 {settingsSaveSuccess ? (
                   <View style={styles.successRow}>
-                    <SymbolView name="checkmark.circle.fill" tintColor="#ffffff" size={18} fallback={<ThemedText style={{ color: '#ffffff' }}>✓</ThemedText>} />
+                    <SymbolView name="checkmark.circle.fill" tintColor={UiColors[effectiveTheme].onPrimary} size={18} fallback={<ThemedText style={{ color: UiColors[effectiveTheme].onPrimary }}>✓</ThemedText>} />
                     <ThemedText style={styles.saveButtonText}>SAVED SUCCESSFULLY</ThemedText>
                   </View>
                 ) : (
@@ -1199,7 +1161,7 @@ export default function ProfileScreen() {
                   source={{ uri: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cGF0aCBkPSJNOTkgMjFINWEyIDIgMCAwIDEtMi0yVjVhMiAyIDAgMCAxIDItMmg0Ii8+PHBvbHlsaW5lIHBvaW50cz0iMTYgMTcgMjEgMTIgMTYgNyIvPjxsaW5lIHgxPSIyMSIgeTE9IjEyIiB4Mj0iOSIgeTI9IjEyIi8+PC9zdmc+' }}
                   style={styles.logoutBadgeIcon}
                   contentFit="contain"
-                  tintColor="#ef4444"
+                  tintColor={UiColors[effectiveTheme].error}
                 />
               </View>
               <ThemedText style={[styles.confirmTitle, isDark && styles.confirmTitleDark]}>
@@ -1246,7 +1208,7 @@ export default function ProfileScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (colors: AppColors) => StyleSheet.create({
   container: {
     flex: 1,
   },
@@ -1275,7 +1237,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '800',
     lineHeight: 18,
-    color: '#064e3b',
+    color: colors.text,
   },
   headerRight: {
     flexDirection: 'row',
@@ -1290,7 +1252,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.1,
         shadowRadius: 4,
@@ -1310,7 +1272,7 @@ const styles = StyleSheet.create({
     position: 'relative',
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.1,
         shadowRadius: 4,
@@ -1331,24 +1293,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1.5,
-    borderColor: '#ffffff',
+    borderColor: colors.border,
     zIndex: 10,
   },
   hamburgerBadgeText: {
     fontSize: 8.5,
     fontWeight: '800',
-    color: '#ffffff',
+    color: colors.onPrimary,
     lineHeight: 11,
   },
   lightTriggerButton: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderWidth: 1,
     borderColor: Colors.light.border,
   },
   headerHamburgerLine: {
     width: 18,
     height: 2,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     borderRadius: 1,
   },
   scrollContent: {
@@ -1386,12 +1348,12 @@ const styles = StyleSheet.create({
     width: 88,
     height: 88,
     borderRadius: 44,
-    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    backgroundColor: colors.accentSurface,
     alignItems: 'center',
     justifyContent: 'center',
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.08,
         shadowRadius: 6,
@@ -1406,14 +1368,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 4,
     marginTop: 6,
-    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    backgroundColor: colors.accentSurface,
     paddingHorizontal: 8,
     paddingVertical: 2,
     borderRadius: 8,
   },
   successIndicatorText: {
     fontSize: 11,
-    color: '#10b981',
+    color: colors.emerald,
     fontWeight: '700',
   },
   detailsList: {
@@ -1426,12 +1388,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 18,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(107, 114, 128, 0.15)',
+    borderColor: colors.border,
   },
   detailLabel: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#6b7280',
+    color: colors.textSecondary,
   },
   detailValue: {
     fontSize: 14,
@@ -1440,7 +1402,7 @@ const styles = StyleSheet.create({
   dutyAssignmentBlock: {
     paddingVertical: 18,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(107, 114, 128, 0.15)',
+    borderColor: colors.border,
     gap: 8,
   },
   dutyAssignmentHeaderRow: {
@@ -1451,17 +1413,17 @@ const styles = StyleSheet.create({
   dictatedBadge: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#059669',
-    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    color: colors.emerald,
+    backgroundColor: colors.accentSurface,
     paddingHorizontal: 8,
     paddingVertical: 2,
     borderRadius: 6,
     overflow: 'hidden',
   },
   dutyAssignmentTextCard: {
-    backgroundColor: 'rgba(16, 185, 129, 0.04)',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: 'rgba(16, 185, 129, 0.15)',
+    borderColor: colors.panelBorder,
     borderRadius: 12,
     paddingHorizontal: 14,
     paddingVertical: 12,
@@ -1480,14 +1442,14 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
   },
   modalContent: {
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
     height: '80%',
     padding: Spacing.four,
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: -4 },
         shadowOpacity: 0.1,
         shadowRadius: 10,
@@ -1502,18 +1464,18 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    borderBottomColor: colors.border,
     paddingBottom: 16,
     marginBottom: 16,
   },
   modalTitle: {
     fontSize: 18,
     fontWeight: '800',
-    color: '#111827',
+    color: colors.text,
   },
   closeModalText: {
     fontSize: 14,
-    color: '#ef4444',
+    color: colors.error,
     fontWeight: '700',
   },
   modalScrollBody: {
@@ -1551,22 +1513,22 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 2,
-    borderColor: '#e5e7eb',
-    backgroundColor: '#f9fafb',
+    borderColor: colors.border,
+    backgroundColor: colors.background,
     overflow: 'hidden',
   },
   avatarMiniChangeTag: {
     position: 'absolute',
     bottom: 0,
     right: 0,
-    backgroundColor: '#10b981',
+    backgroundColor: colors.primaryFill,
     width: 16,
     height: 16,
     borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: '#ffffff',
+    borderColor: colors.border,
   },
   avatarPickerTrigger: {
     width: '100%',
@@ -1598,12 +1560,12 @@ const styles = StyleSheet.create({
   inputField: {
     borderRadius: 14,
     borderWidth: 1.5,
-    backgroundColor: '#f9fafb',
+    backgroundColor: colors.background,
     paddingHorizontal: Spacing.three,
     paddingVertical: 12,
     fontSize: 14,
     fontWeight: '600',
-    color: '#1f2937',
+    color: colors.text,
     ...Platform.select({
       web: {
         outlineStyle: 'none',
@@ -1611,8 +1573,8 @@ const styles = StyleSheet.create({
     }),
   },
   inputFieldFocused: {
-    borderColor: '#10b981',
-    backgroundColor: '#ffffff',
+    borderColor: colors.emerald,
+    backgroundColor: colors.backgroundElement,
   },
   saveButton: {
     borderRadius: 14,
@@ -1622,7 +1584,7 @@ const styles = StyleSheet.create({
     marginTop: Spacing.three,
   },
   saveButtonText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 13,
     fontWeight: '800',
     letterSpacing: 0.5,
@@ -1650,7 +1612,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     ...Platform.select({
       ios: {
-        shadowColor: '#000000',
+        shadowColor: "#0f172a",
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.08,
         shadowRadius: 8,
@@ -1673,8 +1635,8 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
   profileLogoutBtn: {
-    backgroundColor: '#fee2e2',
-    borderColor: '#fca5a5',
+    backgroundColor: colors.errorSurface,
+    borderColor: colors.border,
     borderWidth: 1.5,
     borderRadius: 14,
     paddingVertical: 14,
@@ -1684,7 +1646,7 @@ const styles = StyleSheet.create({
     marginBottom: Spacing.two,
   },
   profileLogoutText: {
-    color: '#ef4444',
+    color: colors.error,
     fontSize: 13.5,
     fontWeight: '800',
     letterSpacing: 0.8,
@@ -1702,35 +1664,35 @@ const styles = StyleSheet.create({
     borderRadius: 24,
     padding: 24,
     alignItems: 'center',
-    backgroundColor: '#ffffff',
+    backgroundColor: colors.backgroundElement,
     borderWidth: 1.5,
-    borderColor: '#10b981',
-    shadowColor: '#000',
+    borderColor: colors.border,
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.25,
     shadowRadius: 16,
     elevation: 12,
   },
   confirmBoxDark: {
-    backgroundColor: '#151e32',
-    borderColor: 'rgba(239, 68, 68, 0.45)',
-    shadowColor: '#000000',
+    backgroundColor: colors.backgroundElement,
+    borderColor: colors.border,
+    shadowColor: "#0f172a",
     shadowOpacity: 0.7,
   },
   logoutIconBadge: {
     width: 48,
     height: 48,
     borderRadius: 16,
-    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.25)',
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 12,
   },
   logoutIconBadgeDark: {
-    backgroundColor: 'rgba(239, 68, 68, 0.18)',
-    borderColor: 'rgba(239, 68, 68, 0.4)',
+    backgroundColor: colors.errorSurface,
+    borderColor: colors.border,
   },
   logoutBadgeIcon: {
     width: 24,
@@ -1739,16 +1701,16 @@ const styles = StyleSheet.create({
   confirmTitle: {
     fontSize: 18,
     fontWeight: '900',
-    color: '#0f172a',
+    color: colors.text,
     marginBottom: 6,
     textAlign: 'center',
   },
   confirmTitleDark: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
   confirmDesc: {
     fontSize: 13.5,
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '500',
     lineHeight: 19,
     textAlign: 'center',
@@ -1756,7 +1718,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
   },
   confirmDescDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   confirmActions: {
     flexDirection: 'row',
@@ -1770,43 +1732,43 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#ef4444',
+    shadowColor: "#0f172a",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.25,
     shadowRadius: 8,
     elevation: 4,
   },
   confirmLogoutBtnText: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontSize: 13.5,
     fontWeight: '900',
     letterSpacing: 0.4,
   },
   confirmCancelBtn: {
     flex: 1,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.border,
     borderRadius: 12,
     paddingVertical: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
   confirmCancelBtnDark: {
-    backgroundColor: '#1e293b',
-    borderColor: '#334155',
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
   },
   confirmCancelBtnText: {
-    color: '#475569',
+    color: colors.textSecondary,
     fontSize: 13.5,
     fontWeight: '700',
   },
   confirmCancelBtnTextDark: {
-    color: '#e2e8f0',
+    color: colors.text,
   },
   settingsDivider: {
     height: 1.5,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: colors.backgroundSelected,
     marginVertical: Spacing.four,
   },
   toggleRow: {
@@ -1815,7 +1777,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingVertical: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#f1f5f9',
+    borderBottomColor: colors.border,
   },
   toggleLabel: {
     fontSize: 13.5,
@@ -1832,7 +1794,7 @@ const styles = StyleSheet.create({
   settingsSectionTitle: {
     fontSize: 11,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.text,
     letterSpacing: 0.8,
     textTransform: 'uppercase',
     marginBottom: 8,
@@ -1851,24 +1813,24 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
   },
   segmentedBtnActive: {
-    backgroundColor: '#059669',
-    borderColor: '#059669',
+    backgroundColor: colors.primaryFill,
+    borderColor: colors.emerald,
   },
   segmentedBtnInactive: {
-    backgroundColor: '#f8fafc',
-    borderColor: '#e2e8f0',
+    backgroundColor: colors.background,
+    borderColor: colors.border,
   },
   segmentedBtnText: {
     fontSize: 12.5,
     fontWeight: '800',
   },
   segmentedBtnTextActive: {
-    color: '#ffffff',
+    color: colors.onPrimary,
     fontWeight: '800',
     fontSize: 12.5,
   },
   segmentedBtnTextInactive: {
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '700',
     fontSize: 12.5,
   },
@@ -1878,22 +1840,22 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     padding: 12,
     borderRadius: 14,
-    backgroundColor: '#fef2f2',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: '#fecaca',
+    borderColor: colors.border,
     marginTop: 6,
   },
   cacheBtnText: {
     fontSize: 13.5,
     fontWeight: '700',
-    color: '#b91c1c',
+    color: colors.error,
   },
   diagnosticsBox: {
-    backgroundColor: '#f8fafc',
+    backgroundColor: colors.background,
     borderRadius: 14,
     padding: 12,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: colors.border,
     marginTop: 6,
   },
   diagRow: {
@@ -1904,12 +1866,12 @@ const styles = StyleSheet.create({
   },
   diagLabel: {
     fontSize: 12,
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '600',
   },
   diagValue: {
     fontSize: 12,
-    color: '#0f172a',
+    color: colors.text,
     fontWeight: '700',
   },
   resetBtn: {
@@ -1920,74 +1882,74 @@ const styles = StyleSheet.create({
   },
   resetBtnText: {
     fontSize: 12.5,
-    color: '#64748b',
+    color: colors.textSecondary,
     fontWeight: '700',
     textDecorationLine: 'underline',
   },
   modalContentDark: {
-    backgroundColor: '#151e32',
+    backgroundColor: colors.backgroundElement,
     borderTopWidth: 1.5,
-    borderTopColor: 'rgba(16, 185, 129, 0.45)',
-    shadowColor: '#000000',
+    borderTopColor: colors.border,
+    shadowColor: "#0f172a",
     shadowOpacity: 0.6,
   },
   modalHeaderDark: {
-    borderBottomColor: '#1e293b',
+    borderBottomColor: colors.border,
   },
   modalTitleDark: {
-    color: '#ffffff',
+    color: colors.onPrimary,
   },
   settingsSectionTitleDark: {
-    color: '#34d399',
+    color: colors.text,
   },
   inputLabelDark: {
-    color: '#cbd5e1',
+    color: colors.textMuted,
   },
   inputFieldDark: {
-    backgroundColor: '#0a0f1d',
-    borderColor: '#334155',
-    color: '#f1f5f9',
+    backgroundColor: colors.background,
+    borderColor: colors.inputBorder,
+    color: colors.text,
   },
   inputFieldFocusedDark: {
-    borderColor: '#10b981',
+    borderColor: colors.emerald,
     backgroundColor: '#0f172a',
   },
   avatarOptionCircleDark: {
-    borderColor: '#334155',
-    backgroundColor: '#0a0f1d',
+    borderColor: colors.border,
+    backgroundColor: colors.background,
   },
   segmentedBtnInactiveDark: {
-    backgroundColor: '#0a0f1d',
-    borderColor: '#334155',
+    backgroundColor: colors.background,
+    borderColor: colors.border,
   },
   segmentedBtnTextInactiveDark: {
-    color: '#cbd5e1',
+    color: colors.textMuted,
   },
   toggleRowDark: {
-    borderBottomColor: '#1e293b',
+    borderBottomColor: colors.border,
   },
   settingsDividerDark: {
-    backgroundColor: '#1e293b',
+    backgroundColor: colors.backgroundSelected,
   },
   diagnosticsBoxDark: {
-    backgroundColor: '#0a0f1d',
-    borderColor: '#334155',
+    backgroundColor: colors.background,
+    borderColor: colors.border,
   },
   diagLabelDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   diagValueDark: {
-    color: '#f1f5f9',
+    color: colors.text,
   },
   cacheBtnDark: {
-    backgroundColor: 'rgba(239, 68, 68, 0.12)',
-    borderColor: 'rgba(239, 68, 68, 0.35)',
+    backgroundColor: colors.errorSurface,
+    borderColor: colors.border,
   },
   cacheBtnTextDark: {
-    color: '#f87171',
+    color: colors.error,
   },
   resetBtnTextDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
   changePasswordTriggerBtn: {
     flexDirection: 'row',
@@ -1996,42 +1958,42 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
     borderRadius: 14,
     borderWidth: 1.5,
-    borderColor: 'rgba(16, 185, 129, 0.4)',
-    backgroundColor: 'rgba(16, 185, 129, 0.08)',
+    borderColor: colors.border,
+    backgroundColor: colors.accentSurface,
     marginTop: Spacing.three,
   },
   changePasswordTriggerBtnDark: {
-    borderColor: 'rgba(52, 211, 153, 0.35)',
-    backgroundColor: 'rgba(16, 185, 129, 0.12)',
+    borderColor: colors.border,
+    backgroundColor: colors.accentSurface,
   },
   changePasswordTriggerText: {
     fontSize: 13,
     fontWeight: '800',
-    color: '#059669',
+    color: colors.emerald,
     letterSpacing: 0.5,
   },
   changePasswordTriggerTextDark: {
-    color: '#34d399',
+    color: colors.emerald,
   },
   passwordInputWrapper: {
     flexDirection: 'row',
     alignItems: 'center',
     borderRadius: 14,
     borderWidth: 1.5,
-    borderColor: '#e5e7eb',
-    backgroundColor: '#f9fafb',
+    borderColor: colors.inputBorder,
+    backgroundColor: colors.background,
     paddingHorizontal: Spacing.three,
   },
   passwordInputWrapperDark: {
-    backgroundColor: '#0a0f1d',
-    borderColor: '#334155',
+    backgroundColor: colors.background,
+    borderColor: colors.inputBorder,
   },
   passwordTextInput: {
     flex: 1,
     paddingVertical: 12,
     fontSize: 14,
     fontWeight: '600',
-    color: '#1f2937',
+    color: colors.text,
     ...Platform.select({
       web: {
         outlineStyle: 'none',
@@ -2039,7 +2001,7 @@ const styles = StyleSheet.create({
     }),
   },
   passwordTextInputDark: {
-    color: '#f1f5f9',
+    color: colors.text,
   },
   eyeToggleBtn: {
     padding: 6,
@@ -2056,22 +2018,22 @@ const styles = StyleSheet.create({
     marginVertical: 4,
   },
   pwdErrorBox: {
-    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    backgroundColor: colors.errorSurface,
     borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.3)',
+    borderColor: colors.border,
   },
   pwdErrorText: {
-    color: '#ef4444',
+    color: colors.error,
     fontSize: 12.5,
     fontWeight: '600',
   },
   pwdSuccessBox: {
-    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    backgroundColor: colors.accentSurface,
     borderWidth: 1,
-    borderColor: 'rgba(16, 185, 129, 0.3)',
+    borderColor: colors.border,
   },
   pwdSuccessText: {
-    color: '#10b981',
+    color: colors.emerald,
     fontSize: 12.5,
     fontWeight: '700',
   },
@@ -2082,20 +2044,21 @@ const styles = StyleSheet.create({
     marginTop: 6,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
-    backgroundColor: '#f8fafc',
+    borderColor: colors.border,
+    backgroundColor: colors.background,
   },
   cancelPasswordBtnDark: {
-    borderColor: '#334155',
-    backgroundColor: '#0a0f1d',
+    borderColor: colors.border,
+    backgroundColor: colors.background,
   },
   cancelPasswordText: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#64748b',
+    color: colors.textSecondary,
     letterSpacing: 0.5,
   },
   cancelPasswordTextDark: {
-    color: '#94a3b8',
+    color: colors.textMuted,
   },
 });
+const themedStyles = { light: createStyles(UiColors.light), dark: createStyles(UiColors.dark) };
