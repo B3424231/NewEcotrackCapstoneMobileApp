@@ -2,6 +2,7 @@ import type { SensorData } from './supabase';
 import { connectionStatus, type CloudDeviceState } from './cloud-hardware';
 import { remoteObservation, selectSettings } from './receiver-state';
 import { measuredRotation } from './sensor-readings';
+import { readBatteryState } from './battery-state';
 
 const enabled = (value: unknown) => value === true || value === 'on' || value === 1;
 const stamp = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : -Infinity;
@@ -27,7 +28,9 @@ export function applyHomeControllerState(item: SensorData, row?: CloudDeviceStat
   if (row && row.node_id !== item.id) return item;
   const oldHeartbeat = row?.last_seen && stamp(row.last_seen) < stamp(item.lastSeen);
   if (oldHeartbeat && !row?.measurement_at && !row?.node_updated_at && !row?.control_snapshot) return item;
-  const hardware = row && !oldHeartbeat && stamp(row.last_seen) !== -Infinity ? row : null;
+  const hardware = row && !oldHeartbeat && stamp(row.last_seen) !== -Infinity && stamp(row.last_seen) <= now + 5000 ? row : null;
+  const incomingBattery = readBatteryState(row?.applied_config, row?.last_seen, now);
+  const batteryState = incomingBattery && stamp(incomingBattery.observedAt) >= stamp(item.batteryState?.observedAt) ? incomingBattery : item.batteryState;
   let snapshot = mergeHomeSettings(item.settingsSnapshot, row?.control_snapshot, now);
   if (hardware) snapshot = { ...snapshot, ...remoteObservation(hardware.latest_ir, hardware.last_seen, snapshot) };
   const settings = selectSettings(snapshot).state;
@@ -64,7 +67,9 @@ export function applyHomeControllerState(item: SensorData, row?: CloudDeviceStat
     } : {}),
     ...(has('sensor_config') && stamp(row?.node_updated_at) >= stamp(item.sensorConfigAt) ? { sensorConfig: row?.sensor_config, sensorConfigAt: row?.node_updated_at } : {}),
     rssi: row?.rssi ?? item.rssi,
-    battery: typeof row?.battery === 'number' && Number.isFinite(row.battery) && row.battery >= 0 && row.battery <= 100 ? Math.round(row.battery) + '%' : item.battery,
+    batteryState,
+    battery: batteryState ? batteryState.percent === null ? '—' : Math.round(batteryState.percent) + '%'
+      : typeof row?.battery === 'number' && Number.isFinite(row.battery) && row.battery >= 0 && row.battery <= 100 ? Math.round(row.battery) + '%' : item.battery,
   };
 }
 export function mergeHomeControllerFetch(fetched: SensorData[], current: SensorData[]): SensorData[] {
@@ -76,6 +81,7 @@ export function mergeHomeControllerFetch(fetched: SensorData[], current: SensorD
     if (stamp(latest.measurementAt) > stamp(item.measurementAt)) merged = { ...merged, measurementAt: latest.measurementAt, ventTemp: latest.ventTemp, value: latest.value, rotation_rpm: latest.rotation_rpm, rotation_quality: latest.rotation_quality };
     if (stamp(latest.powerFeedback?.observedAt) > stamp(item.powerFeedback?.observedAt)) merged = { ...merged, powerFeedback: latest.powerFeedback };
     if (stamp(latest.sensorConfigAt) > stamp(item.sensorConfigAt)) merged = { ...merged, sensorConfig: latest.sensorConfig, sensorConfigAt: latest.sensorConfigAt };
+    if (stamp(latest.batteryState?.observedAt) > stamp(item.batteryState?.observedAt)) merged = { ...merged, battery: latest.battery, batteryState: latest.batteryState };
     return applyHomeControllerState(merged);
   });
 }

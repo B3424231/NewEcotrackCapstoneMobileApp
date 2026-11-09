@@ -5,7 +5,7 @@ import { getStatusPalette, Colors as UiColors, type AppColors, Spacing } from '@
 import { createReadScope } from '@/services/query-utils';
 import { createRefreshCoordinator, type RefreshCoordinator } from '@/services/refresh-coordinator';
 import { DataListSkeleton } from '@/components/data-list-skeleton';
-import { isChecklistItemComplete, isRepairDone, isRepairAwaitingVerification } from '@/services/maintenance-status';
+import { isChecklistItemComplete, isRepairDone, isRepairAwaitingVerification, getMaintenancePhase } from '@/services/maintenance-status';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -1103,6 +1103,10 @@ export default function MaintenanceScreen() {
     : null;
   const linkedRepairReport = targetRepair;
   const repairItems = targetRepair?.items || [];
+  const repairDoneCount = repairItems.filter(isChecklistItemComplete).length;
+  const repairPercentage = repairItems.length ? Math.round(repairDoneCount / repairItems.length * 100) : 0;
+  const repairPhase = getMaintenancePhase(targetRepair);
+  const isRepairReady = repairPhase === 'Ready to submit';
   const isRepairVerified = targetRepair ? isRepairDone(targetRepair) : false;
   const isRepairSubmitted = targetRepair
     ? !isRepairVerified && (isRepairAwaitingVerification(targetRepair) || targetRepair.status === 'For Verification')
@@ -1621,8 +1625,11 @@ export default function MaintenanceScreen() {
                   <ThemedText style={[styles.detailsMainSubtitle, { color: colors.textSecondary }]}>{activeReport.title}</ThemedText>
                 </View>
 
+                <View style={[styles.workflowPhase,{backgroundColor:getMaintenancePhase(activeReport) === 'Ready to submit' ? colors.warningSurface : getStatusPalette(activeReport.status,colors).bg}]}>
+                  <ThemedText style={{color:getMaintenancePhase(activeReport) === 'Ready to submit' ? colors.warning : getStatusPalette(activeReport.status,colors).text,fontWeight:'700',fontSize:13}}>{getMaintenancePhase(activeReport)}</ThemedText>
+                </View>
                 {/* SCREEN 2: Aircon Information Card */}
-                <View style={[styles.airconInfoCard, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
+                <View style={styles.airconInfoCard}>
                   <View style={styles.cardSectionHeader}>
                     <ThemedText style={[styles.cardSectionTitle, { color: colors.text }]}>AIRCON & EQUIPMENT INFORMATION</ThemedText>
                   </View>
@@ -1637,7 +1644,7 @@ export default function MaintenanceScreen() {
                     </View>
                     <View style={[styles.infoRow, { borderBottomColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border }]}>
                       <ThemedText style={[styles.infoKey, { color: colors.textSecondary }]}>Aircon Type:</ThemedText>
-                      <ThemedText style={[styles.infoValue, { color: colors.emerald, fontWeight: '700' }]}>
+                      <ThemedText style={[styles.infoValue, { color: colors.text, fontWeight: '700' }]}>
                         {activeReport.airconType || '—'}
                       </ThemedText>
                     </View>
@@ -1715,7 +1722,7 @@ export default function MaintenanceScreen() {
                   )}
                 </View>
 
-                <View style={[styles.airconInfoCard, { backgroundColor: UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
+                <View style={styles.airconInfoCard}>
                   <View style={styles.cardSectionHeader}>
                     <ThemedText style={[styles.cardSectionTitle, { color: colors.text }]}>SCOPE / DESCRIPTION</ThemedText>
                   </View>
@@ -1727,10 +1734,11 @@ export default function MaintenanceScreen() {
                 {/* Maintenance Progress Section */}
                 <View style={[styles.progressCard, { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder }]}>
                   <View style={styles.progressCardHeader}>
-                    <ThemedText style={[styles.cardSectionTitle, { color: colors.text }]}>MAINTENANCE PROGRESS</ThemedText>
+                    <ThemedText style={[styles.cardSectionTitle, { color: colors.text }]}>Maintenance progress</ThemedText>
                     <ThemedText style={styles.progressPercentageText}>{progressPercentage}%</ThemedText>
                   </View>
 
+                  <ThemedText style={{color:getMaintenancePhase(activeReport) === 'Ready to submit' ? colors.warning : colors.textSecondary,fontSize:13,marginTop:8}}>{getMaintenancePhase(activeReport)}</ThemedText>
                   <ThemedText style={[styles.progressCountText, { color: colors.textSecondary }]}>
                     {completedItems} of {totalItems} completed
                   </ThemedText>
@@ -1768,7 +1776,7 @@ export default function MaintenanceScreen() {
                     {!isCurrentRepair && needsRepairItems > 0 && (
                       <View style={[styles.statusChipItem, { backgroundColor: effectiveTheme === 'dark' ? '#0f172a' : UiColors[effectiveTheme].background }]}>
                         <ThemedText style={[styles.statusChipNum, { color: UiColors[effectiveTheme].error }]}>{needsRepairItems}</ThemedText>
-                        <ThemedText style={[styles.statusChipLabel, { color: colors.textSecondary }]}>Needs Repair</ThemedText>
+                        <ThemedText style={[styles.statusChipLabel, { color: colors.textSecondary }]}>Repair work</ThemedText>
                       </View>
                     )}
                   </View>
@@ -1781,7 +1789,7 @@ export default function MaintenanceScreen() {
                     <ThemedText style={[styles.checklistSectionTitle, { color: colors.text }]}>MAINTENANCE CHECKLIST</ThemedText>
                   </View>
                   <ThemedText style={[styles.checklistHint, { color: colors.textSecondary }]}>
-                    Tap an item for notes, photos or repairs. Use its dropdown to change status.
+                    Tap a task for notes, photos or status. Open its linked order to continue a repair.
                   </ThemedText>
 
                   <View style={styles.checklistItemsList}>
@@ -1793,7 +1801,6 @@ export default function MaintenanceScreen() {
                       const isUnderRepair = !repairDone && !isAwaitingVerification && (item.status === 'Under Repair' || Boolean(item.linkedRepairId));
                       const isItemChecked = isChecklistItemComplete(item) && !isUnderRepair && (!linkedRepair || repairDone);
                       const isItemRepaired = isItemChecked && Boolean(item.isRepaired || item.repaired);
-                      const isNeedsRepair = item.status === 'Needs Repair' || isUnderRepair;
                       const statusStyle = getStatusColor(isAwaitingVerification ? 'For Verification' : isUnderRepair ? 'Under Repair' : item.status);
                       const photoCount = Array.isArray(item.photoUris) && item.photoUris.length > 0
                         ? item.photoUris.length
@@ -1801,192 +1808,32 @@ export default function MaintenanceScreen() {
                       const displayRemarks = item.remarks || item.problemDescription;
 
                       return (
-                        <View
-                          key={item.id}
-                          style={[
-                            styles.checklistItemCard,
-                            { backgroundColor: effectiveTheme === 'dark' ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement, borderColor: UiColors[effectiveTheme].panelBorder },
-                            isUnderRepair && !isItemRepaired && (isDark
-                              ? { backgroundColor: 'rgba(14, 165, 233, 0.08)', borderColor: UiColors[effectiveTheme].panelBorder }
-                              : { backgroundColor: UiColors[effectiveTheme].infoSurface, borderColor: UiColors[effectiveTheme].panelBorder }
-                            ),
-                            isNeedsRepair && !isUnderRepair && !isItemRepaired && (isDark
-                              ? { backgroundColor: UiColors[effectiveTheme].errorSurface, borderColor: UiColors[effectiveTheme].panelBorder }
-                              : styles.checklistItemCardDanger
-                            ),
-                            isItemRepaired && (isDark
-                              ? { backgroundColor: UiColors[effectiveTheme].accentSurface, borderColor: UiColors[effectiveTheme].panelBorder }
-                              : { backgroundColor: UiColors[effectiveTheme].accentSurface, borderColor: UiColors[effectiveTheme].panelBorder }
-                            ),
-                          ]}
-                        >
-                          <View style={{ flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
-                            {/* Left Area: Index Circle + Title + Inline Badges + Remarks */}
-                            <Pressable
-                              onPress={() => handleOpenItemEditor(item, activeReport.id)}
-                              style={{ flex: 1, flexDirection: 'row', gap: 10, alignItems: 'flex-start' }}
-                            >
-                              <Pressable
-                                onPress={() => handleToggleTaskCheck(item.id, activeReport.id)}
-                                style={[
-                                  styles.itemIndexCircle,
-                                  {
-                                    backgroundColor: isItemChecked ? UiColors[effectiveTheme].primaryFill : (effectiveTheme === 'dark' ? '#0f172a' : '#f1f5f9'),
-                                    borderWidth: isUnderRepair || isDark ? 1 : 0,
-                                    borderColor: isUnderRepair ? UiColors[effectiveTheme].border : isItemChecked ? UiColors[effectiveTheme].border : (isDark ? '#334155' : 'transparent'),
-                                  },
-                                ]}
-                              >
-                                {isItemChecked ? (
-                                  <ThemedText style={{ color: UiColors[effectiveTheme].onPrimary, fontWeight: '900', fontSize: 13 }}>✓</ThemedText>
-                                ) : (
-                                  <ThemedText style={[styles.itemIndexNumber, { color: colors.text }]}>{index + 1}</ThemedText>
-                                )}
-                              </Pressable>
-
-                              <View style={{ flex: 1 }}>
-                                {/* Title and Pills Row (Image 3) */}
-                                <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 4 }}>
-                                  <ThemedText
-                                    style={[
-                                      styles.itemTitle,
-                                      { color: colors.text },
-                                      isUnderRepair && !isItemRepaired && { color: isDark ? UiColors[effectiveTheme].text : '#0369a1' },
-                                      isNeedsRepair && !isUnderRepair && !isItemRepaired && { color: isDark ? UiColors[effectiveTheme].error : UiColors[effectiveTheme].error },
-                                      isItemRepaired && { color: isDark ? UiColors[effectiveTheme].text : UiColors[effectiveTheme].text, fontWeight: '800' },
-                                    ]}
-                                  >
-                                    {item.title}
-                                  </ThemedText>
-
-                                  {/* Status Pill matching Image 3 */}
-                                  <View
-                                    style={[
-                                      styles.inlineStatusPill,
-                                      {
-                                        backgroundColor: isItemRepaired
-                                          ? (isDark ? 'rgba(16, 185, 129, 0.16)' : '#ecfdf5')
-                                          : statusStyle.bg,
-                                        borderColor: isItemRepaired
-                                          ? (isDark ? 'rgba(16, 185, 129, 0.45)' : '#a7f3d0')
-                                          : statusStyle.border,
-                                      },
-                                    ]}
-                                  >
-                                    <View
-                                      style={[
-                                        styles.statusDot,
-                                        {
-                                          backgroundColor: isItemRepaired
-                                            ? (isDark ? '#34d399' : '#059669')
-                                            : statusStyle.text,
-                                        },
-                                      ]}
-                                    />
-                                    <ThemedText
-                                      style={[
-                                        styles.inlineStatusPillText,
-                                        {
-                                          color: isItemRepaired
-                                            ? (isDark ? '#34d399' : '#047857')
-                                            : statusStyle.text,
-                                        },
-                                      ]}
-                                    >
-                                      {isAwaitingVerification
-                                        ? `For Verification${item.linkedRepairId ? ` (${item.linkedRepairId})` : ''}`
-                                        : isUnderRepair
-                                        ? `Under Repair${item.linkedRepairId ? ` (${item.linkedRepairId})` : ''}`
-                                        : isItemRepaired
-                                          ? `Repaired${item.linkedRepairId ? ` (${item.linkedRepairId})` : ' ✓'}`
-                                          : item.status}
-                                    </ThemedText>
-                                  </View>
-
-                                  {/* Photos Pill (Image 3) */}
-                                  {photoCount > 0 && (
-                                    <View
-                                      style={[
-                                        styles.inlinePhotoPill,
-                                        {
-                                          backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface,
-                                          borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
-                                        },
-                                      ]}
-                                    >
-                                      <AppIcon name="camera" size={11} color={isDark ? '#38bdf8' : '#0284c7'} />
-                                      <ThemedText
-                                        style={[
-                                          styles.inlinePhotoPillText,
-                                          { color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info },
-                                        ]}
-                                      >
-                                        {photoCount} {photoCount === 1 ? 'Photo' : 'Photos'}
-                                      </ThemedText>
-                                    </View>
-                                  )}
-                                </View>
-
-                                {/* Worker Remarks / Defect Quote below Title (Image 3) */}
-                                {displayRemarks ? (
-                                  <ThemedText
-                                    style={{
-                                      fontSize: 12.5,
-                                      color: isDark ? UiColors[effectiveTheme].textMuted : UiColors[effectiveTheme].textSecondary,
-                                      fontStyle: 'italic',
-                                      marginTop: 2,
-                                    }}
-                                    numberOfLines={1}
-                                  >
-                                    &quot;{displayRemarks}&quot;
-                                  </ThemedText>
-                                ) : (
-                                  <ThemedText style={[styles.itemDescription, { color: colors.textSecondary }]} numberOfLines={1}>
-                                    {item.description || 'Tap to update status or attach proof'}
-                                  </ThemedText>
-                                )}
+                        <View key={item.id} style={styles.checklistItemCard}>
+                          <View style={styles.checklistItemMain}>
+                            <Pressable accessibilityRole="checkbox" accessibilityLabel={`Mark ${item.title} done`}
+                              accessibilityState={{checked:isItemChecked,disabled:Boolean(item.linkedRepairId) || activeReport.status === 'Completed' || activeReport.status === 'For Verification'}}
+                              disabled={Boolean(item.linkedRepairId) || activeReport.status === 'Completed' || activeReport.status === 'For Verification'}
+                              onPress={() => handleToggleTaskCheck(item.id, activeReport.id)}
+                              style={[styles.interactiveCheckBtn,{backgroundColor:isItemChecked ? colors.primaryFill : colors.backgroundSelected,borderColor:colors.border}]}>
+                              <ThemedText style={{color:isItemChecked ? colors.onPrimary : colors.text,fontWeight:'700'}}>{isItemChecked ? '✓' : index+1}</ThemedText>
+                            </Pressable>
+                            <Pressable accessibilityRole="button" accessibilityLabel={`View ${item.title}`} onPress={() => handleOpenItemEditor(item,activeReport.id)} style={styles.itemTextContainer}>
+                              <ThemedText style={styles.itemTitle}>{item.title}</ThemedText>
+                              <View style={[styles.inlineStatusPill,{backgroundColor:statusStyle.bg,borderColor:colors.border}]}>
+                                <ThemedText style={[styles.inlineStatusPillText,{color:statusStyle.text}]}>{isAwaitingVerification ? 'For verification' : isUnderRepair ? 'Under repair' : isItemRepaired ? 'Repaired' : isItemChecked ? 'Done' : item.status}</ThemedText>
                               </View>
                             </Pressable>
-
-                            {/* Right Area: Repair Task Link Button (Image 3) + Chevron */}
-                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, alignSelf: 'center' }}>
-                              {item.linkedRepairId ? (
-                                <Pressable
-                                  onPress={() => handleOpenRepairPage(item.linkedRepairId!)}
-                                  style={[
-                                    styles.repairTaskLinkBtn,
-                                    {
-                                      backgroundColor: isDark ? UiColors[effectiveTheme].infoSurface : UiColors[effectiveTheme].infoSurface,
-                                      borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border,
-                                    },
-                                  ]}
-                                  hitSlop={6}
-                                >
-                                  <ThemedText
-                                    style={[
-                                      styles.repairTaskLinkBtnText,
-                                      { color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info },
-                                    ]}
-                                  >
-                                    {item.linkedRepairId}
-                                  </ThemedText>
-                                  <ThemedText style={{ fontSize: 11, fontWeight: '900', color: isDark ? UiColors[effectiveTheme].info : UiColors[effectiveTheme].info }}>
-                                    ↗
-                                  </ThemedText>
-                                </Pressable>
-                              ) : null}
-
-                              <Pressable
-                                onPress={() => handleOpenItemEditor(item, activeReport.id)}
-                                hitSlop={8}
-                                style={{ padding: 4 }}
-                              >
-                                <ThemedText style={{ fontSize: 16, color: colors.textSecondary, fontWeight: '600' }}>
-                                  ›
-                                </ThemedText>
-                              </Pressable>
-                            </View>
                           </View>
+                          {item.linkedRepairId ? (
+                            <Pressable accessibilityRole="button" accessibilityLabel={`Open repair ${item.linkedRepairId}`} onPress={() => handleOpenRepairPage(item.linkedRepairId!)} style={styles.repairTaskLinkBtn}>
+                              <ThemedText style={styles.repairTaskLinkBtnText}>Open repair</ThemedText>
+                              <ThemedText style={[styles.repairTaskLinkBtnText,{color:colors.info,flexShrink:1}]}>{item.linkedRepairId} ↗</ThemedText>
+                            </Pressable>
+                          ) : null}
+                          {photoCount > 0 ? <Pressable accessibilityRole="button" accessibilityLabel={`View ${photoCount} photos for ${item.title}`} onPress={() => handleOpenItemEditor(item,activeReport.id)} style={styles.checklistPhotoAction}>
+                            <AppIcon name="camera" size={16} color={colors.textSecondary}/><ThemedText style={{color:colors.textSecondary,fontSize:13}}>{photoCount} {photoCount === 1 ? 'photo' : 'photos'}</ThemedText>
+                          </Pressable> : null}
+                          {displayRemarks ? <View style={styles.remarksSnippet}><ThemedText style={styles.remarksSnippetText}>{displayRemarks}</ThemedText></View> : null}
                         </View>
                       );
                     })}
@@ -2276,17 +2123,16 @@ export default function MaintenanceScreen() {
                   </ThemedText>
                 </View>
 
+                <View style={[styles.workflowPhase,{backgroundColor:isRepairVerified ? colors.successSurface : isRepairReady || isRepairSubmitted ? colors.warningSurface : colors.infoSurface}]}>
+                  <ThemedText style={{color:isRepairVerified ? colors.success : isRepairReady || isRepairSubmitted ? colors.warning : colors.info,fontWeight:'700',fontSize:13}}>{repairPhase}</ThemedText>
+                </View>
                 {/* Supervisor Scope & Instructions Box */}
                 <View
                   style={[
                     styles.pageInstructionCard,
                     {
-                      backgroundColor: isRepairVerified
-                        ? (isDark ? 'rgba(16, 185, 129, 0.12)' : '#ecfdf5')
-                        : isRepairSubmitted
-                        ? (isDark ? 'rgba(147, 51, 234, 0.12)' : '#faf5ff')
-                        : (isDark ? 'rgba(244, 63, 94, 0.12)' : '#fff1f2'),
-                      borderColor: UiColors[effectiveTheme].panelBorder,
+                      backgroundColor: colors.backgroundElement,
+                      borderColor: colors.border,
                     },
                   ]}
                 >
@@ -2294,11 +2140,7 @@ export default function MaintenanceScreen() {
                     style={[
                       styles.pageInstructionLabel,
                       {
-                        color: isRepairVerified
-                          ? (isDark ? '#34d399' : '#059669')
-                          : isRepairSubmitted
-                          ? (colors.warning)
-                          : (isDark ? '#fb7185' : '#e11d48'),
+                        color: colors.textSecondary
                       },
                     ]}
                   >
@@ -2312,11 +2154,7 @@ export default function MaintenanceScreen() {
                     style={[
                       styles.pageInstructionText,
                       {
-                        color: isRepairVerified
-                          ? (isDark ? '#d1fae5' : '#065f46')
-                          : isRepairSubmitted
-                          ? (isDark ? '#e9d5ff' : '#6b21a8')
-                          : (isDark ? '#fecdd3' : '#9f1239'),
+                        color: colors.textSecondary
                       },
                     ]}
                   >
@@ -2361,18 +2199,25 @@ export default function MaintenanceScreen() {
                         style={[
                           styles.pageMetaVal,
                           {
-                            color: isRepairVerified
-                              ? (isDark ? '#34d399' : '#059669')
-                              : isRepairSubmitted
-                              ? (colors.warning)
-                              : (isDark ? '#fb7185' : '#e11d48'),
-                            fontWeight: '900',
+                            color: colors.textSecondary
                           },
                         ]}
                       >
                         {isRepairVerified ? 'Repaired Already' : isRepairSubmitted ? 'For Verification' : (targetRepair.priority || activeReport.priority || 'Critical')}
                       </ThemedText>
                     </View>
+                  </View>
+                </View>
+
+                <View style={styles.progressCard}>
+                  <View style={styles.progressCardHeader}>
+                    <ThemedText style={styles.cardSectionTitle}>Repair progress</ThemedText>
+                    <ThemedText style={styles.progressPercentageText}>{repairPercentage}%</ThemedText>
+                  </View>
+                  <ThemedText style={styles.progressCountText}>{repairDoneCount} of {repairItems.length} done</ThemedText>
+                  <View style={styles.largeProgressBarTrack} accessibilityRole="progressbar" accessibilityLabel="Repair progress"
+                    accessibilityValue={{ min: 0, max: Math.max(repairItems.length, 1), now: repairDoneCount }}>
+                    <View style={[styles.largeProgressBarFill, { width: `${repairPercentage}%`, backgroundColor: colors.emerald }]} />
                   </View>
                 </View>
 
@@ -2419,7 +2264,7 @@ export default function MaintenanceScreen() {
                             styles.checklistItemCard,
                             {
                               backgroundColor: isDark ? UiColors[effectiveTheme].backgroundElement : UiColors[effectiveTheme].backgroundElement,
-                              borderColor: UiColors[effectiveTheme].panelBorder,
+                              borderColor: colors.border,
                             },
                           ]}
                         >
@@ -2444,7 +2289,7 @@ export default function MaintenanceScreen() {
                               <ThemedText
                                 style={[
                                   styles.itemTitle,
-                                  { color: isDone ? (isDark ? '#34d399' : '#059669') : colors.text, textDecorationLine: isDone ? 'line-through' : 'none' },
+                                  { color: colors.text },
                                 ]}
                               >
                                 {item.title || 'Maintenance Task'}
@@ -2535,7 +2380,7 @@ export default function MaintenanceScreen() {
                                   },
                                 ]}
                               >
-                                {isDone ? `Repaired${item.linkedRepairId ? ` (${item.linkedRepairId})` : ' ✓'}` : item.status}
+                                {isDone ? 'Done' : item.status}
                               </ThemedText>
                             </View>
                           </View>
@@ -2607,7 +2452,16 @@ export default function MaintenanceScreen() {
                         Repair complete. Awaiting administrator approval.
                       </ThemedText>
                     </View>
-                  ) : null}
+                  ) : (
+                    <>
+                      <ThemedText style={{color:colors.textSecondary,fontSize:13}}>{isRepairReady ? 'Checklist complete. Submit for administrator review.' : 'Complete every repair step before submitting.'}</ThemedText>
+                      <Pressable accessibilityRole="button" accessibilityLabel="Submit repair for verification" disabled={!isRepairReady || isSubmitting}
+                        onPress={() => { setPendingRepairToSubmit(targetRepair); setConfirmRepairModalVisible(true); }}
+                        style={[styles.submitButton,(!isRepairReady || isSubmitting) && {opacity:0.5}]}>
+                        <ThemedText style={{color:colors.onPrimary,fontWeight:'700',fontSize:15}}>Submit for verification</ThemedText>
+                      </Pressable>
+                    </>
+                  )}
                 </View>
               </ScrollView>
             </View>
@@ -3737,7 +3591,9 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     gap: 8,
   },
   reportIdPill: {
-    backgroundColor: colors.primaryFill,
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
+    borderWidth: 1,
     paddingHorizontal: 9,
     paddingVertical: 4,
     borderRadius: 7,
@@ -4209,7 +4065,9 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     fontFamily: 'Roboto',
   },
   reportPillLarge: {
-    backgroundColor: colors.primaryFill,
+    backgroundColor: colors.backgroundSelected,
+    borderColor: colors.border,
+    borderWidth: 1,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 8,
@@ -4219,7 +4077,7 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
   reportPillLargeText: {
     fontSize: 12,
     fontWeight: '900',
-    color: colors.emerald,
+    color: colors.text,
     letterSpacing: 0.5,
     fontFamily: 'Roboto',
   },
@@ -4245,10 +4103,10 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
   airconInfoCard: {
     marginHorizontal: Spacing.four,
     backgroundColor: colors.backgroundElement,
-    borderRadius: 20,
+    borderRadius: 12,
     padding: 16,
-    borderWidth: 1.2,
-    borderColor: colors.panelBorder,
+    borderWidth: 1,
+    borderColor: colors.border,
     marginBottom: 14,
   },
   cardSectionHeader: {
@@ -4320,10 +4178,10 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
   progressCard: {
     marginHorizontal: Spacing.four,
     backgroundColor: colors.backgroundElement,
-    borderRadius: 20,
+    borderRadius: 12,
     padding: 16,
-    borderWidth: 1.2,
-    borderColor: colors.panelBorder,
+    borderWidth: 1,
+    borderColor: colors.border,
     marginBottom: 14,
     ...Platform.select({
       ios: {
@@ -4357,7 +4215,7 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     fontFamily: 'Roboto',
   },
   largeProgressBarTrack: {
-    height: 12,
+    height: 6,
     backgroundColor: colors.backgroundSelected,
     borderRadius: 6,
     overflow: 'hidden',
@@ -4423,9 +4281,9 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
   },
   checklistItemCard: {
     backgroundColor: colors.backgroundElement,
-    borderRadius: 18,
-    borderWidth: 1.2,
-    borderColor: colors.panelBorder,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
     padding: 14,
     gap: 10,
     ...Platform.select({
@@ -4467,10 +4325,11 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     gap: 3,
   },
   itemTitle: {
-    fontSize: 14,
-    fontWeight: '800',
+    fontSize: 16,
+    fontWeight: '700',
     color: colors.text,
     fontFamily: 'Roboto',
+    lineHeight: 22,
   },
   itemTitleDanger: {
     color: colors.error,
@@ -4551,8 +4410,10 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     gap: 6,
     paddingHorizontal: 10,
     paddingVertical: 5,
-    borderRadius: 8,
+    borderRadius: 6,
     borderWidth: 1,
+    alignSelf: 'flex-start',
+    flexShrink: 1,
   },
   checklistStatusBadgeText: {
     fontSize: 11,
@@ -4573,7 +4434,7 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     backgroundColor: colors.primaryFill,
     width: '100%',
     paddingVertical: 15,
-    borderRadius: 16,
+    borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
     ...Platform.select({
@@ -5895,8 +5756,8 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
   // Dedicated Repair Page Styles
   pageInstructionCard: {
     marginHorizontal: Spacing.four,
-    borderRadius: 16,
-    borderWidth: 1.5,
+    borderRadius: 12,
+    borderWidth: 1,
     padding: 14,
     marginBottom: 12,
     gap: 8,
@@ -5941,9 +5802,11 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 7,
     paddingVertical: 2.5,
-    borderRadius: 8,
+    borderRadius: 6,
     borderWidth: 1,
     gap: 4,
+    alignSelf: 'flex-start',
+    flexShrink: 1,
   },
   inlineStatusPillText: {
     fontSize: 10.5,
@@ -5964,14 +5827,12 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
     fontWeight: '700',
     fontFamily: 'Roboto',
   },
+  checklistPhotoAction: { flexDirection:'row', alignItems:'center', gap:8, minHeight:44 },
+  workflowPhase: { alignSelf:'flex-start',marginHorizontal:16,marginBottom:12,paddingHorizontal:10,paddingVertical:6,borderRadius:6 },
   repairTaskLinkBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 8,
-    paddingVertical: 4.5,
-    borderRadius: 8,
-    borderWidth: 1,
-    gap: 3,
+    flexDirection:'row',alignItems:'center',justifyContent:'space-between',gap:12,
+    paddingHorizontal:12,paddingVertical:10,minHeight:44,borderRadius:8,borderWidth:1,borderColor:colors.border,
+
   },
   repairTaskLinkBtnText: {
     fontSize: 11,

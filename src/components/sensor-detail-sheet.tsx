@@ -6,44 +6,20 @@ import { router } from 'expo-router';
 import { ThemedText } from './themed-text';
 import { AppIcon } from './app-icon';
 import { useSettings } from '@/context/settings-context';
-import { airconStateReading, batteryReading, blowerFanReading, controllerConnection } from '@/services/controller-display';
+import { airconStateReading, batteryReading, fanSettingReading, controllerConnection } from '@/services/controller-display';
 import type { AcControllerData } from './sensor-card';
 import { displayDeviceId } from '@/services/sensor-readings';
-import { canSetAirflowReference, saveAirflowReference } from '@/services/airflow-pressure';
-import { supabase } from '@/services/supabase';
-import { useAuth } from '@/context/auth-context';
 
 export interface AcControllerDetailSheetProps {
   visible: boolean; controller?: AcControllerData | null; sensor?: AcControllerData | null;
   onClose: () => void; slideAnim: Animated.Value;
-  onReferenceSaved?: (id: string, config: Record<string, any>) => void;
 }
-export function AcControllerDetailSheet({ visible, controller, sensor, onClose, slideAnim, onReferenceSaved }: AcControllerDetailSheetProps) {
+export function AcControllerDetailSheet({ visible, controller, sensor, onClose, slideAnim }: AcControllerDetailSheetProps) {
   const { effectiveTheme, colors, formatTemperatureDisplay } = useSettings();
   const styles = themedStyles[effectiveTheme];
   const item = controller || sensor;
-  const { userType, userId } = useAuth();
-  const [savingReference, setSavingReference] = React.useState(false);
-  const [referenceNotice, setReferenceNotice] = React.useState('');
-  const operation = React.useRef(false), generation = React.useRef(0), active = React.useRef(false);
-  React.useEffect(() => {
-    generation.current++; active.current = true; operation.current = false;
-    return () => { active.current = false; };
-  }, [userId, item?.id]);
   if (!visible || !item) return null;
-  const blower = blowerFanReading(item);
-  const canSetReference = canSetAirflowReference(item.rotation_rpm, item.rotation_quality, item.measurementAt, item.reportIntervalSeconds);
-  const saveReference = async () => {
-    if (operation.current || userType !== 'admin' || !canSetReference) return;
-    const revision = generation.current, current = () => active.current && generation.current === revision;
-    operation.current = true; setSavingReference(true); setReferenceNotice('');
-    try {
-      const config = await saveAirflowReference(supabase, item.id, item.rotation_rpm!, item.rotation_quality, item.measurementAt!, item.reportIntervalSeconds, current);
-      if (current()) { onReferenceSaved?.(item.id, config); setReferenceNotice('Reference saved.'); }
-    } catch (error) { if (current()) setReferenceNotice(error instanceof Error ? error.message : 'Unable to save the reference.'); }
-    finally { if (current()) { operation.current = false; setSavingReference(false); } }
-  };
-  const isDark = effectiveTheme === 'dark', connection = controllerConnection(item), battery = batteryReading(item.battery);
+  const isDark = effectiveTheme === 'dark', connection = controllerConnection(item), battery = batteryReading(item.battery, item.batteryState, item.connectionState === 'online');
   const connectionTone = connection.label === 'Online' ? colors.success
     : connection.label === 'Sleeping' ? colors.warning : colors.textSecondary;
   const panel = { backgroundColor: isDark ? UiColors[effectiveTheme].backgroundSelected : UiColors[effectiveTheme].background, borderColor: isDark ? UiColors[effectiveTheme].border : UiColors[effectiveTheme].border };
@@ -53,14 +29,14 @@ export function AcControllerDetailSheet({ visible, controller, sensor, onClose, 
   const rows = [
     ['Device identifier', displayDeviceId(item.serialNumber)],
     ['Last seen', lastSeen],
-    ['Battery', battery.text],
+    ['Battery', [battery.text, battery.status].filter(Boolean).join(' · ')],
     ['Wi-Fi signal', typeof item.rssi === 'number' ? item.rssi + ' dBm' : '—'],
     ['Report interval', item.interval || '—'],
     ['Wake / sleep', item.dailySchedule || '—'],
   ];
   const values = item.deviceMode === 'monitoring' || item.deviceMode === 'both' ? [
       ['Temperature', targetTemperature],
-      ['Airflow Indicator (RPM)', blower.value],
+      ['Fan setting', fanSettingReading(item)],
     ] : [];
   return <View style={[StyleSheet.absoluteFill, { zIndex: 100 }]}>
     <Pressable accessibilityLabel="Close AC device details" style={styles.backdrop} onPress={onClose} />
@@ -82,17 +58,8 @@ export function AcControllerDetailSheet({ visible, controller, sensor, onClose, 
             {values.map(([label, value]) => <View key={label} style={[styles.metric, panel]}>
               <ThemedText style={[styles.label, { color: colors.textSecondary }]}>{label}</ThemedText>
               <ThemedText style={[styles.metricValue, { color: colors.text }]}>{value}</ThemedText>
-              {label === 'Airflow Indicator (RPM)' && <ThemedText style={[styles.label, { color: colors.textSecondary }]}>{blower.detail}</ThemedText>}
               {label === 'Temperature' && <ThemedText style={[styles.label, { color: colors.textSecondary }]}>AC target setpoint</ThemedText>}
             </View>)}
-          </View>}
-          {!!values.length && <View style={[styles.panel, panel]}>
-            <ThemedText style={[styles.label, { color: colors.textSecondary }]}>% of saved reference · based on wheel rotation</ThemedText>
-            <ThemedText style={[styles.rowLabel, { color: colors.textSecondary }]}>Keep the wheel in the same position. Run the aircon at your normal setting before saving 100%.</ThemedText>
-            {userType === 'admin' ? <Pressable accessibilityRole="button" accessibilityState={{ disabled: savingReference || !canSetReference }} disabled={savingReference || !canSetReference} onPress={saveReference} style={{ minHeight: 44, justifyContent: 'center', opacity: savingReference || !canSetReference ? 0.5 : 1 }}>
-              <ThemedText style={[styles.value, { color: colors.emerald }]}>{savingReference ? 'Saving…' : 'Use current reading as 100%'}</ThemedText>
-            </Pressable> : <ThemedText style={[styles.rowLabel, { color: colors.textSecondary }]}>An administrator can set the shared reference.</ThemedText>}
-            {!!referenceNotice && <ThemedText accessibilityRole="alert" style={[styles.rowLabel, { color: colors.textSecondary }]}>{referenceNotice}</ThemedText>}
           </View>}
           <View style={[styles.panel, panel]}>
             <ThemedText style={[styles.label, { color: colors.textSecondary }]}>Aircon state</ThemedText>

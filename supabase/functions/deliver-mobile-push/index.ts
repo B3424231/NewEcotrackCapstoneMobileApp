@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2.112.4';
+import { maintenanceStatusAlert } from '../_shared/maintenance-status-alert.ts';
 
 const expoUrl = 'https://exp.host/--/api/v2/push';
 const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
@@ -34,8 +35,11 @@ export async function deliverBatch(client: any, deliveries: any[], request: type
       (notification.is_broadcast || notification.staff_id === worker.id) && (urgent ? token.critical_enabled : token.maintenance_enabled);
     if (!valid) { await update(row, { status: 'failed', last_error: 'Recipient unavailable or notification preference disabled' }); continue; }
     if (row.status === 'receipt' && row.ticket_id) { receipts.push(row); continue; }
+    const statusAlert = urgent ? undefined
+      : maintenanceStatusAlert(notification.type, notification.related_report_id, notification.title, notification.message);
     pending.push({ row, payload: {
-      to: token.token, title: notification.title, body: notification.message, sound: 'default', priority: urgent ? 'high' : 'normal',
+      to: token.token, title: statusAlert?.title ?? notification.title, body: notification.message, sound: 'default', priority: urgent ? 'high' : 'normal',
+      ...(statusAlert ? { tag: statusAlert.identifier } : {}),
       channelId: urgent ? 'alerts' : 'messages',
       data: { notificationId: notification.id, relatedReportId: notification.related_report_id, channelId: urgent ? 'alerts' : 'messages' },
     } });
@@ -46,8 +50,12 @@ export async function deliverBatch(client: any, deliveries: any[], request: type
       method: 'POST', headers: { 'Content-Type': 'application/json', ...(accessToken ? { Authorization: 'Bearer ' + accessToken } : {}) },
       body: JSON.stringify(payload), signal: AbortSignal.timeout(10000),
     });
-    if (!response.ok) throw new Error('Expo service temporarily unavailable');
-    return response.json();
+    const result = await response.json();
+    // Provider messages/details can contain device tokens. Persist only the code.
+    const code = result.errors?.[0]?.code;
+    if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(code)) throw new Error(code);
+    if (!response.ok) throw new Error(`Expo HTTP ${response.status}`);
+    return result;
   };
   const reject = async (row: any, error: string) => {
     if (error === 'DeviceNotRegistered') {
@@ -60,24 +68,38 @@ export async function deliverBatch(client: any, deliveries: any[], request: type
   };
   if (pending.length) {
     let tickets;
+    const ticketErrors: string[] = [];
+    let requestError = 'Expo ticket was not accepted';
     try { tickets = (await post('/send', pending.map(item => item.payload))).data; }
-    catch { tickets = null; }
+    catch (error) { tickets = null; requestError = error instanceof Error ? error.message : requestError; }
+    // Registrations can survive an EAS project change. Expo rejects a whole
+    // mixed-project batch before accepting any messages, so retry those singly.
+    if (requestError === 'PUSH_TOO_MANY_EXPERIENCE_IDS') {
+      tickets = [];
+      for (let offset = 0; offset < pending.length; offset += 6) {
+        await Promise.all(pending.slice(offset, offset + 6).map(async (item, index) => {
+          try { tickets[offset + index] = (await post('/send', [item.payload])).data?.[0]; }
+          catch (error) { ticketErrors[offset + index] = error instanceof Error ? error.message : 'Expo request failed'; }
+        }));
+      }
+    }
     for (let index = 0; index < pending.length; index++) {
       const { row } = pending[index], ticket = Array.isArray(tickets) ? tickets[index] : null;
       if (ticket?.status === 'ok' && typeof ticket.id === 'string') {
         await update(row, { status: 'receipt', ticket_id: ticket.id, last_error: null, attempts: 0, next_attempt_at: new Date(now + 15 * 60000).toISOString() });
-      } else await reject(row, ticket?.details?.error || 'Expo ticket was not accepted');
+      } else await reject(row, ticket?.details?.error || ticketErrors[index] || requestError);
     }
   }
   if (receipts.length) {
     let results;
+    let requestError = 'Expo receipt is not available yet';
     try { results = (await post('/getReceipts', { ids: receipts.map(row => row.ticket_id) })).data; }
-    catch { results = null; }
+    catch (error) { results = null; requestError = error instanceof Error ? error.message : requestError; }
     for (const row of receipts) {
       const receipt = results?.[row.ticket_id];
       if (receipt?.status === 'ok') await update(row, { status: 'delivered', last_error: null });
       else if (receipt?.status === 'error') await reject(row, receipt.details?.error || 'Expo receipt failed');
-      else await retry(row, 'Expo receipt is not available yet');
+      else await retry(row, requestError);
     }
   }
   return deliveries.length;

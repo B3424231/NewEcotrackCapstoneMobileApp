@@ -12,7 +12,9 @@ export function rotationReading(value: unknown, quality?: unknown, config?: unkn
 
 /** Keep real protocol identities internal while making visible labels functional. */
 export function functionalDeviceText(value: unknown): string {
-  return String(value ?? '').replace(/\b(?:ESP32(?:[-_ ]?S3)?|Heltec|MCP9808|MPX5010DP|LM393(?:DR)?|SX1262|2N2222?A?)\b/gi, 'Device');
+  return String(value ?? '')
+    .replace(/\b(?:AC\s+)?sensor(s)?\b/gi, (_match, plural) => plural ? 'AC devices' : 'AC device')
+    .replace(/\b(?:ESP32(?:[-_ ]?S3)?|Heltec|MCP9808|MPX5010DP|LM393(?:DR)?|SX1262|2N2222?A?)\b/gi, 'Device');
 }
 
 export function displayDeviceId(value: unknown): string {

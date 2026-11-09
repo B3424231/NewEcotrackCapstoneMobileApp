@@ -178,18 +178,48 @@ test('desktop password form verifies current Auth password and fails closed',asy
  }
 });
 
-function pushHarness(rows,{fail=false,ticketError=null,cutoff='-infinity'}={}) {
+function pushHarness(rows,{fail=false,ticketError=null,requestError=null,httpStatus=200,mixed=false,cutoff='-infinity',notification={}}={}) {
  const updates=[],deletes=[],requests=[];
- const notifications=[{id:'n1',staff_id:'staff-one',is_broadcast:false,priority:'high',title:'Urgent',message:'Service AC',related_report_id:'MR-1'}];
+ const notifications=[{id:'n1',staff_id:'staff-one',is_broadcast:false,priority:'high',title:'Urgent',message:'Service AC',related_report_id:'MR-1',...notification}];
  const tokens=[{token:'ExpoPushToken[synthetic]',staff_id:'staff-one',auth_user_id:'auth-one',updated_at:new Date().toISOString(),critical_enabled:true,maintenance_enabled:true}];
+ if(mixed) tokens.push({...tokens[0],token:'ExpoPushToken[second]'});
  const staff=[{id:'staff-one',auth_user_id:'auth-one',status:'active',is_archived:false,force_logout:false,auth_valid_after:cutoff}];
  const client={from(table){let operation='select',payload; const q={select(){return q;},in(){return q;},update(data){operation='update';payload=data;return q;},delete(){operation='delete';return q;},eq(_,id){if(operation==='update')updates.push({id,...payload});if(operation==='delete')deletes.push(id);return q;},then(resolve,reject){return Promise.resolve({data:operation==='select'?({mobile_notifications:notifications,staff_push_tokens:tokens,staff}[table]):null,error:null}).then(resolve,reject);}};return q;}};
  const module={exports:{}};
  const source=fs.readFileSync('supabase/functions/deliver-mobile-push/index.ts','utf8');
- vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,{exports:module.exports,module,require:()=>({}),Deno:{env:{get(){return undefined;}},serve(){}},AbortSignal,Date,Response,fetch:async(url,options)=>{requests.push({url,body:JSON.parse(options.body)});if(fail)throw Error('Network');return {ok:true,json:async()=>url.endsWith('/send')?{data:ticketError?[{status:'error',details:{error:ticketError}}]:[{status:'ok',id:'ticket-one'}]}:{data:{'ticket-one':{status:'ok'}}}};}});
+ vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,{exports:module.exports,module,require:name=>name.endsWith('/maintenance-status-alert.ts')?require(path.resolve('supabase/functions/_shared/maintenance-status-alert.ts')):{},Deno:{env:{get(){return undefined;}},serve(){}},AbortSignal,Date,Response,fetch:async(url,options)=>{const body=JSON.parse(options.body);requests.push({url,body});if(fail)throw Error('Network');return {ok:httpStatus<400,status:httpStatus,json:async()=>mixed&&body.length>1?{errors:[{code:'PUSH_TOO_MANY_EXPERIENCE_IDS'}]}:requestError?{errors:[{code:requestError,message:'May contain private recipient tokens'}]}:url.endsWith('/send')?{data:ticketError?[{status:'error',details:{error:ticketError}}]:[{status:'ok',id:body[0].to==='ExpoPushToken[second]'?'ticket-two':'ticket-one'}]}:{data:{'ticket-one':{status:'ok'}}}};}});
  return {run:()=>module.exports.deliverBatch(client,rows),updates,deletes,requests};
 }
 const delivery={id:'d1',notification_id:'n1',token:'ExpoPushToken[synthetic]',status:'pending',attempts:1};
+
+test('old and current Expo project tokens cannot block each other in a shared push batch',async()=>{
+ const h=pushHarness([delivery,{...delivery,id:'d2',token:'ExpoPushToken[second]'}],{mixed:true});
+ await h.run();
+ assert.equal(h.updates.length,2);
+ assert.deepEqual(h.updates.map(row=>[row.id,row.status,row.ticket_id]),[['d1','receipt','ticket-one'],['d2','receipt','ticket-two']]);
+ assert.equal(h.requests.length,3);
+});
+
+test('push request errors retain the provider code without leaking token-bearing messages',async()=>{
+ for(const httpStatus of [200,400,401]){
+  const h=pushHarness([delivery],{httpStatus,requestError:'UNAUTHORIZED'});await h.run();
+  assert.equal(h.updates[0].last_error,'UNAUTHORIZED');
+  assert.equal(h.updates[0].status,'pending');
+ }
+});
+test('remote routine status updates use the same Android tray key as local delivery', async () => {
+ const notification={priority:'medium',type:'status_update',title:'Maintenance Status Updated',message:'Report MR-1 at Room 1. Status: In Progress.'};
+ const h=pushHarness([delivery],{notification});
+ await h.run();
+ const payload=h.requests[0].body[0];
+ assert.equal(payload.tag,'maintenance-status:MR-1:in progress');
+ assert.equal(payload.title,'In Progress · MR-1');
+ assert.equal(payload.channelId,'messages');
+ const urgent=pushHarness([delivery],{notification:{...notification,priority:'critical'}});
+ await urgent.run();
+ assert.equal(urgent.requests[0].body[0].tag,undefined);
+});
+
 test('remote push sends recipient-specific payload and waits for Expo delivery receipts',async()=>{
  const h=pushHarness([delivery]);await h.run();assert.equal(h.requests[0].body[0].data.notificationId,'n1');assert.equal(h.requests[0].body[0].channelId,'alerts');assert.equal(h.updates[0].status,'receipt');
  const receipt=pushHarness([{...delivery,status:'receipt',ticket_id:'ticket-one'}]);await receipt.run();assert.ok(receipt.requests[0].url.endsWith('/getReceipts'));assert.equal(receipt.updates[0].status,'delivered');

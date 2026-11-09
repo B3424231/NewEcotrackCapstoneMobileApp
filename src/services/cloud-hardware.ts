@@ -9,6 +9,7 @@ export interface CloudDeviceState {
   sleeping_until?: string | null;
   firmware_version?: string;
   capabilities?: Record<string, unknown>;
+  applied_config?: Record<string, unknown> | null;
   latest_ir?: Record<string, any> | null;
   ip_address?: string;
   wifi_ssid?: string;

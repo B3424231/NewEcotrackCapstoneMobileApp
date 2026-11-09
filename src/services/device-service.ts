@@ -12,6 +12,7 @@ import { equipmentDisplayName, equipmentType } from './equipment-display';
 import { WebBluetoothManager } from './web-bluetooth';
 import { ensurePhoneBluetooth, openPhoneWifiControls } from './phone-connectivity';
 import { measuredRotation } from './sensor-readings';
+import { readBatteryState, type BatteryObservation } from './battery-state';
 
 export interface Esp32Device {
   id: string;                 // Supabase Primary Key e.g. "node_1234567890abcdef"
@@ -27,6 +28,7 @@ export interface Esp32Device {
   rotation_quality?: 'ok' | 'missing' | 'fault';
   rssi?: number | null;
   battery?: number | null;
+  batteryState?: BatteryObservation;
   wifiStatus: 'connected' | 'disconnected' | 'connecting';
   wifiSsid?: string;
   ipAddress?: string;
@@ -204,10 +206,19 @@ function formatDateAdded(dateStr?: string | null): string {
   }
 }
 
+function hardwareTimestamp(value?: string | null): number {
+  const seen = Date.parse(value || '');
+  return Number.isFinite(seen) && seen <= Date.now() + 5000 ? seen : -Infinity;
+}
+
 export const DeviceService = {
   applyHardwareState(device: Esp32Device, row: CloudDeviceState): Esp32Device {
-    if (row.node_id !== device.id || Date.parse(row.last_seen || '') < Date.parse(device.lastSeenAt || '')) return device;
+    const seen = hardwareTimestamp(row.last_seen);
+    if (row.node_id !== device.id || seen === -Infinity || seen < hardwareTimestamp(device.lastSeenAt)) return device;
+    const incomingBattery = readBatteryState(row.applied_config, row.last_seen);
+    const batteryState = incomingBattery && (!device.batteryState || Date.parse(incomingBattery.observedAt) >= Date.parse(device.batteryState.observedAt)) ? incomingBattery : device.batteryState;
     return DeviceService.refreshConnectionAge({...device, lastSeenAt: row.last_seen, sleepingUntil: row.sleeping_until,
+      batteryState, battery: batteryState ? batteryState.percent : device.battery,
       hardwareCapabilities: row.capabilities, firmwareVersion: row.firmware_version || device.firmwareVersion,
       rssi: row.rssi ?? device.rssi, ipAddress: row.ip_address || device.ipAddress, wifiSsid: row.wifi_ssid || device.wifiSsid});
   },
@@ -216,6 +227,19 @@ export const DeviceService = {
       last_seen: device.lastSeenAt!, sleeping_until: device.sleepingUntil }) === 'online';
     return { ...device, status: online ? 'connected' : 'offline', wifiStatus: online ? 'connected' : 'disconnected',
       lastSeen: device.lastSeenAt ? formatLastSeen(device.lastSeenAt) : device.lastSeen };
+  },
+  mergeDeviceFetch(fetched: Esp32Device, current?: Esp32Device): Esp32Device {
+    if (!current || current.id !== fetched.id || current.roomId !== fetched.roomId) return fetched;
+    const stamp = (value?: string | null) => Date.parse(value || '') || -Infinity;
+    const metadata = stamp(current.updated) > stamp(fetched.updated) ? current : fetched;
+    const heartbeat = hardwareTimestamp(current.lastSeenAt) > hardwareTimestamp(fetched.lastSeenAt) ? current : fetched;
+    const validHeartbeat = hardwareTimestamp(heartbeat.lastSeenAt) !== -Infinity;
+    const battery = hardwareTimestamp(current.batteryState?.observedAt) > hardwareTimestamp(fetched.batteryState?.observedAt) ? current : fetched;
+    return DeviceService.refreshConnectionAge({ ...metadata, lastSeenAt: validHeartbeat ? heartbeat.lastSeenAt : null, sleepingUntil: validHeartbeat ? heartbeat.sleepingUntil : undefined,
+      lastSeen: validHeartbeat ? heartbeat.lastSeen : 'Unverified', hardwareCapabilities: heartbeat.hardwareCapabilities,
+      firmwareVersion: heartbeat.firmwareVersion, rssi: heartbeat.rssi,
+      ipAddress: heartbeat.ipAddress, wifiSsid: heartbeat.wifiSsid,
+      ...(battery.batteryState ? { batteryState: battery.batteryState, battery: battery.battery } : {}) });
   },
 
   /** Detect a real decoded protocol without claiming a physical manufacturer. */
@@ -323,6 +347,8 @@ export const DeviceService = {
         if (!addedByUserName && storedMeta?.addedByUserName) addedByUserName = storedMeta.addedByUserName;
 
         const cloud = hardware.find(state => state.node_id === node.id);
+        const heartbeat = hardwareTimestamp(cloud?.last_seen) !== -Infinity ? cloud : undefined;
+        const batteryState = readBatteryState(cloud?.applied_config, cloud?.last_seen);
         const isOnline = cloud ? connectionStatus(cloud) === 'online' : false;
 
         const airconsList = (airconsRes && airconsRes.data) ? airconsRes.data : [];
@@ -349,13 +375,14 @@ export const DeviceService = {
           sensorConfig: node.sensor_config,
           rotation_quality: node.rotation_quality,
           rssi: node.rssi,
-          battery: node.battery,
+          battery: batteryState ? batteryState.percent : node.battery,
+          batteryState,
           wifiStatus: isOnline ? 'connected' : 'disconnected',
           wifiSsid: resolvedSsid,
           ipAddress: resolvedIp,
-          lastSeen: cloud?.last_seen ? formatLastSeen(cloud.last_seen) : 'Unverified',
-          lastSeenAt: cloud?.last_seen || null,
-          sleepingUntil: cloud?.sleeping_until,
+          lastSeen: heartbeat?.last_seen ? formatLastSeen(heartbeat.last_seen) : 'Unverified',
+          lastSeenAt: heartbeat?.last_seen || null,
+          sleepingUntil: heartbeat?.sleeping_until,
           hardwareCapabilities: cloud?.capabilities,
           deviceMode:(node as any).device_mode || 'controller',
           dateAdded: formatDateAdded(node.install_date || node.created),

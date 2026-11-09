@@ -36,6 +36,13 @@ export function isChecklistItemComplete(item: Item): boolean {
   return item.status === 'Completed' && (!item.linkedRepairId || item.repaired === true);
 }
 
+export function getMaintenancePhase(report?: Pick<Report, 'status' | 'items'> | null): string {
+  if (isRepairDone(report || undefined)) return 'Completed';
+  if (isRepairAwaitingVerification(report || undefined)) return 'For Verification';
+  if (report?.items.length && report.items.every(isChecklistItemComplete)) return 'Ready to submit';
+  return report?.status || 'Pending';
+}
+
 /** Reconcile before worker filtering, including repairs assigned to another worker. */
 export function synchronizeMaintenanceRepairs<T extends Report>(reports: T[]): T[] {
   const byId = new Map(reports.map(report => [key(report.id), report]));

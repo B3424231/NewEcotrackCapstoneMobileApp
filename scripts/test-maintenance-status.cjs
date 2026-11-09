@@ -9,6 +9,9 @@ vm.runInNewContext(ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText, { exports: exportsObject });
 const { synchronizeMaintenanceRepairs: sync, isChecklistItemComplete: complete } = exportsObject;
+assert.equal(exportsObject.getMaintenancePhase({status:'In Progress',items:[{id:'1',title:'Check',status:'Completed'}]}),'Ready to submit');
+assert.equal(exportsObject.getMaintenancePhase({status:'For Verification',items:[]}),'For Verification');
+assert.notEqual(exportsObject.getMaintenancePhase({status:'In Progress',items:[]}),'Ready to submit');
 const task = (id, repair) => ({ id: String(id), title: `Step ${id}`, status: 'Completed', repaired: true, isRepaired: true, linkedRepairId: repair });
 const parent = () => ({ id: 'MR-2026-001', status: 'Completed', isVerified: true, items: [task(1, 'REP-4324'), task(2, 'REP-8996'), task(3, 'REP-3464'), task(4), task(5), task(6)] });
 const repair = (id, status) => ({ id, status, parentReportId: 'MR-2026-001', items: [] });

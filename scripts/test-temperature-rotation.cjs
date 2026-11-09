@@ -79,6 +79,15 @@ test('visible board labels are functional while actual identifiers are not mutat
   assert.equal(equipmentDisplayName('Lab monitor'), 'Lab monitor');
 });
 
+test('saved sensor device names and messages display AC device wording without changing identifiers', () => {
+  const { equipmentDisplayName } = load('src/services/equipment-display.ts');
+  assert.equal(equipmentDisplayName('AC Sensor 04A7AC'), 'AC device 04A7AC');
+  assert.equal(equipmentDisplayName('Sensor Room 1'), 'AC device Room 1');
+  assert.equal(readings.functionalDeviceText('No sensor readings. AC Sensors need attention.'), 'No AC device readings. AC devices need attention.');
+  assert.equal(readings.displayDeviceId('sensor-db-id'), 'sensor-db-id');
+  assert.equal(equipmentDisplayName('Aircon Matrix'), 'Aircon Matrix');
+});
+
 test('mobile registration accepts Monitoring and Both, preserving assignment, and rejects other device types', async () => {
   const source = ts.createSourceFile('devices.tsx', fs.readFileSync('src/app/devices.tsx', 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let declaration;

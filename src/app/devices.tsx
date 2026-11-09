@@ -6,7 +6,7 @@ import { createReadScope, type ReadScope } from '@/services/query-utils';
 import { createRefreshCoordinator, type RefreshCoordinator } from '@/services/refresh-coordinator';
 import { DataListSkeleton } from '@/components/data-list-skeleton';
 import { displayDeviceId, functionalDeviceText } from '@/services/sensor-readings';
-import { airflowRpmText } from '@/services/airflow-pressure';
+import { batteryStatus } from '@/services/battery-state';
 
 import {
   StyleSheet,
@@ -111,7 +111,7 @@ function formatConnectionLatency(result: { online: boolean; pingMs: number | nul
 }
 
 export default function DevicesScreen() {
-  const { effectiveTheme, colors, triggerHaptic, formatTemperatureDisplay } = useSettings();
+  const { effectiveTheme, colors, settings, triggerHaptic, formatTemperatureDisplay } = useSettings();
   const styles = themedStyles[effectiveTheme];
   const { userId, userEmail, userName, userType } = useAuth();
   const isDark = effectiveTheme === 'dark';
@@ -124,6 +124,8 @@ export default function DevicesScreen() {
       userId ? `devices:${fetchUser}` : undefined, () => ({ devices: [], availableRooms: [] }));
   const { availableRooms } = data;
   const devices = data.devices.map(device => DeviceService.refreshConnectionAge(device));
+  const visibleDevices = useRef(devices);
+  useEffect(() => { visibleDevices.current = devices; }, [devices]);
   const setDevices = useCallback((value: SetStateAction<Esp32Device[]>) => setData(previous => ({ ...previous,
     devices: typeof value === 'function' ? value(previous.devices) : value,
   })), [setData]);
@@ -321,13 +323,13 @@ export default function DevicesScreen() {
       if (!isCurrent() || !isSessionCurrent()) return;
       commit(current => ({ devices: userDevices.map(fresh => {
         const confirmed = current.devices.find(device => device.id === fresh.id);
-        return confirmed && Date.parse(confirmed.updated || '') > Date.parse(fresh.updated || '') ? confirmed : fresh;
+        return DeviceService.mergeDeviceFetch(fresh, confirmed);
       }), availableRooms: rooms }));
       setSelectedDevice(current => {
         if (!current) return null;
         const fresh = userDevices.find(device => device.id === current.id);
         if (!fresh) return null;
-        return Date.parse(current.updated || '') > Date.parse(fresh.updated || '') ? current : fresh;
+        return DeviceService.mergeDeviceFetch(fresh, current);
       });
     } catch (e) {
       console.error('Failed to load devices:', e);
@@ -340,6 +342,7 @@ export default function DevicesScreen() {
 
   useEffect(() => {
     const refresh = createRefreshCoordinator(refreshDeviceData, 150, AppState);
+    let disposed = false, readingHardware = false;
     refreshRef.current = refresh;
     void refresh.refresh();
     const ageDevices = () => {
@@ -352,12 +355,34 @@ export default function DevicesScreen() {
       setDevices(current => current.map(device => DeviceService.applyHardwareState(device, row)));
       setSelectedDevice(current => current ? DeviceService.applyHardwareState(current, row) : null);
     }, ageDevices);
+    // Recover missed realtime events using only the visible device identities.
+    const intervalId = setInterval(() => {
+      if (disposed || readingHardware || !refresh.isActive() || !isSessionCurrent()) return;
+      const visible = visibleDevices.current;
+      if (!visible.length) return;
+      const newest = Math.max(...visible.map(device => Date.parse(device.lastSeenAt || '')).filter(seen => Number.isFinite(seen) && seen <= Date.now() + 5000));
+      const since = Number.isFinite(newest) ? new Date(newest - 60000).toISOString() : undefined;
+      readingHardware = true;
+      void CloudHardware.listUpdates(visible.map(device => device.id), since).then(rows => {
+        if (disposed || !refresh.isActive() || !isSessionCurrent()) return;
+        setDevices(current => current.map(device => {
+          const row = rows.find(state => state.node_id === device.id);
+          return row ? DeviceService.applyHardwareState(device, row) : DeviceService.refreshConnectionAge(device);
+        }));
+        setSelectedDevice(current => {
+          const row = current && rows.find(state => state.node_id === current.id);
+          return current && row ? DeviceService.applyHardwareState(current, row) : current;
+        });
+      }).catch(() => { /* Keep the last values and their original observation times. */ }).finally(() => { readingHardware = false; });
+    }, settings.syncFrequency * 1000);
     return () => {
+      disposed = true;
+      clearInterval(intervalId);
       refresh.dispose();
       if (refreshRef.current === refresh) refreshRef.current = null;
       unsubscribe();
     };
-  }, [refreshDeviceData]);
+  }, [refreshDeviceData, isSessionCurrent, setDevices, settings.syncFrequency]);
 
   // Filter and Search Logic
   const filteredDevices = devices.filter((device) => {
@@ -2734,15 +2759,12 @@ export default function DevicesScreen() {
                       <ThemedText style={styles.infoKey}>Temperature</ThemedText>
                       <ThemedText style={[styles.infoVal, isDark && styles.textWhite]}>{typeof selectedDevice?.temp === 'number' && Number.isFinite(selectedDevice.temp) ? formatTemperatureDisplay(selectedDevice.temp) : 'Unavailable'}</ThemedText>
                     </View>
-                    <View style={styles.infoRow}>
-                      <ThemedText style={styles.infoKey}>Airflow Indicator (RPM)</ThemedText>
-                      <ThemedText style={[styles.infoVal, isDark && styles.textWhite]}>{airflowRpmText(selectedDevice?.rotation_rpm, selectedDevice?.rotation_quality)}</ThemedText>
-                    </View>
                   </>}
                   <View style={styles.infoRow}>
                     <ThemedText style={styles.infoKey}>Battery Level</ThemedText>
                     <ThemedText style={[styles.infoVal, isDark && styles.textWhite]}>
                       {formatBatteryPercent(selectedDevice?.battery)}
+                      {batteryStatus(selectedDevice?.batteryState, selectedDevice?.status === 'connected') ? ` · ${batteryStatus(selectedDevice?.batteryState, selectedDevice?.status === 'connected')}` : ''}
                     </ThemedText>
                   </View>
                   <View style={styles.infoRow}>

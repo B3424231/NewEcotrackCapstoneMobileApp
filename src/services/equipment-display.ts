@@ -1,3 +1,5 @@
+import { functionalDeviceText } from './sensor-readings';
+
 type EquipmentRow = Record<string, any>;
 
 export interface EquipmentDisplayContext {
@@ -30,7 +32,7 @@ export function equipmentDisplayName(value: unknown, identifiers: unknown[] = []
   if (!name || identifiers.some(id => same(name, id)) || same(name, protocol) ||
     /\b(?:esp32(?:[-_ ]?s3)?|heltec|mcp9808|mpx5010dp|lm393(?:dr)?|sx1262)\b/i.test(name) || /^node[_-]/i.test(name) ||
     /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(name)) return undefined;
-  return name;
+  return functionalDeviceText(name);
 }
 
 export function equipmentType(value: unknown, protocol?: unknown): string | undefined {

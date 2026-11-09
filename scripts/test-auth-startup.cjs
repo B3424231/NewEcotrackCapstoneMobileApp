@@ -127,7 +127,7 @@ test('navigation shows only splash until verification completes, then selects th
   assert(find(navigation({ isRestoringSession: false, isAuthenticated: true, isArchived: true }), 'Login'));
 });
 
-test('splash cannot hide or start its fallback timer before both layout and authentication are ready', async () => {
+test('native splash hands off to the loading overlay after layout while protected content still waits for authentication', async () => {
   const h = hooks(), timers = new Map(); let hideCalls = 0;
   const keyframe = class { duration() { return this; } withCallback() { return this; } };
   const module = { exports: {} };
@@ -143,7 +143,7 @@ test('splash cannot hide or start its fallback timer before both layout and auth
   let output = h.render(component, { ready: false }); h.flush();
   output.props.onLayout(); await settle();
   output = h.render(component, { ready: false }); h.flush(); await settle();
-  assert.equal(hideCalls, 0); assert.equal(timers.size, 0); assert(output);
+  assert.equal(hideCalls, 1, 'native splash must reveal the loading bar while session verification is pending'); assert.equal(timers.size, 0); assert(output);
   h.render(component, { ready: true }); h.flush(); await settle();
   assert.equal(hideCalls, 1); assert.equal(timers.size, 1);
   timers.get(1).fn(); assert.equal(h.render(component, { ready: true }), null);

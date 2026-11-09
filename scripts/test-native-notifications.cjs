@@ -1,6 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('typescript');
 
@@ -8,7 +9,8 @@ const ts = require('typescript');
 // visit, Supabase connection, permission prompt or device notification is needed.
 function mount({ os = 'android', expoGo = false, channelError = false, pushRegistration } = {}) {
   const calls = [], effects = [];
-  let incoming, responseListener;
+  const timers = new Map();
+  let incoming, responseListener, bannerListener;
   const native = {
     AndroidImportance: { HIGH: 4 },
     setNotificationHandler: handler => calls.push(['handler', handler]),
@@ -19,6 +21,7 @@ function mount({ os = 'android', expoGo = false, channelError = false, pushRegis
     getPermissionsAsync: async () => { calls.push(['permissions']); return { status: 'undetermined' }; },
     requestPermissionsAsync: async () => { calls.push(['request']); return { status: 'granted' }; },
     scheduleNotificationAsync: async request => { calls.push(['schedule', request]); },
+    dismissAllNotificationsAsync: async () => { calls.push(['clear-tray']); },
     addNotificationResponseReceivedListener: listener => {
       responseListener = listener; return { remove: () => calls.push(['remove-native']) };
     },
@@ -29,15 +32,15 @@ function mount({ os = 'android', expoGo = false, channelError = false, pushRegis
     useEffect: effect => effects.push(effect),
   };
   const emitter = {
-    trigger: (...args) => calls.push(['banner', ...args]),
-    addListener: () => () => calls.push(['remove-banner']),
+    trigger: (...args) => { calls.push(['banner', ...args]); bannerListener?.(...args); },
+    addListener: listener => { bannerListener = listener; return () => calls.push(['remove-banner']); },
   };
   const mocks = {
     react,
     'react-native': {
       Platform: { OS: os, select: values => values[os] ?? values.default },
       Dimensions: { get: () => ({ width: 400, height: 800 }) },
-      Animated: { Value: class { setValue() {} } },
+      Animated: { Value: class { setValue() {} }, spring: () => ({ start() {} }), timing: () => ({ start: done => done?.() }) },
       PanResponder: { create: () => ({}) },
       LogBox: { ignoreLogs() {} },
       StyleSheet: { create: styles => styles, absoluteFillObject: {} },
@@ -47,7 +50,7 @@ function mount({ os = 'android', expoGo = false, channelError = false, pushRegis
     'expo-splash-screen': { preventAutoHideAsync() {} },
     'expo-router': { router: { push: path => calls.push(['route', path]) } },
     '@/context/auth-context': { useAuth: () => ({ userName: 'Worker', userId: 'synthetic', userType: 'staff', isAuthenticated: !!pushRegistration }) },
-    '@/context/settings-context': { useSettings: () => ({ settings: {}, triggerHaptic() {} }) },
+    '@/context/settings-context': { useSettings: () => ({ settings: { criticalAlertsEnabled: true, maintenanceRemindersEnabled: true }, triggerHaptic() {} }) },
     '@/utils/notification-emitter': { NotificationEmitter: emitter },
     '@/services/mobile-notifications': {
       registerMobilePushToken: () => pushRegistration(),
@@ -66,17 +69,32 @@ function mount({ os = 'android', expoGo = false, channelError = false, pushRegis
     jsx: ts.JsxEmit.React, esModuleInterop: true,
   } }).outputText;
   vm.runInNewContext(compiled, {
-    require: name => mocks[name] || {}, module, exports: module.exports,
-    window: {}, console: { warn() {}, error() {} }, setTimeout, clearTimeout,
+    require: name => name.endsWith('/maintenance-status-alert')
+      ? require(path.resolve('supabase/functions/_shared/maintenance-status-alert.ts'))
+      : mocks[name] || {}, module, exports: module.exports,
+    window: {}, console: { warn() {}, error() {} },
+    setTimeout: (callback, delay) => { const id = Symbol(); timers.set(id, { callback, delay }); return id; },
+    clearTimeout: id => timers.delete(id),
   });
   module.exports.GlobalNotificationBanner();
   const cleanups = effects.map(effect => effect());
   return {
     calls, emit: item => incoming(item), tap: request => responseListener(request),
     settle: () => new Promise(resolve => setImmediate(resolve)),
+    expireBanner: () => { for (const [id, timer] of timers) if (timer.delay === 6000) { timers.delete(id); timer.callback(); } },
     cleanup: () => cleanups.forEach(cleanup => cleanup?.()),
   };
 }
+
+test('closing the six-second in-app banner preserves Android tray notifications', async () => {
+  const h = mount(); await h.settle();
+  h.emit({ id: 'new-maintenance', title: 'Assigned maintenance', message: 'Inspect AC' });
+  await h.settle();
+  assert.ok(h.calls.some(call => call[0] === 'schedule'));
+  h.expireBanner();
+  assert.equal(h.calls.some(call => call[0] === 'clear-tray'), false);
+  h.cleanup();
+});
 
 test('a notification during push registration keeps the banner without duplicating remote system delivery',async()=>{
   let resolveRegistration;
@@ -85,6 +103,29 @@ test('a notification during push registration keeps the banner without duplicati
   assert.ok(h.calls.some(call=>call[0]==='banner'));assert.equal(h.calls.some(call=>call[0]==='schedule'),false);
   resolveRegistration(true);await h.settle();
   assert.equal(h.calls.some(call=>call[0]==='schedule'),false);h.cleanup();
+});
+
+test('Android tray replaces repeat status alerts for the same report and phase', async () => {
+  const h = mount();
+  const status = (id, relatedReportId, phase) => ({
+    id, relatedReportId, type: 'status_update', title: 'Maintenance Status Updated',
+    message: `Report ${relatedReportId} at Room 1. Status: ${phase}.`,
+  });
+  h.emit(status('one', 'MR-1', 'In Progress'));
+  h.emit(status('two', 'MR-1', 'In Progress'));
+  h.emit(status('three', 'MR-1', 'Completed'));
+  h.emit(status('four', 'REP-1', 'In Progress'));
+  h.emit({ ...status('urgent', 'MR-1', 'In Progress'), priority: 'high' });
+  await h.settle();
+  const [first, repeat, completed, other, urgent] = h.calls.filter(call => call[0] === 'schedule').slice(-5).map(call => call[1]);
+  assert.equal(first.content.title, 'In Progress · MR-1');
+  assert.equal(first.identifier, 'maintenance-status:MR-1:in progress');
+  assert.equal(repeat.identifier, first.identifier);
+  assert.notEqual(completed.identifier, first.identifier);
+  assert.notEqual(other.identifier, first.identifier);
+  assert.equal(urgent.identifier, undefined);
+  assert.equal(urgent.trigger.channelId, 'alerts');
+  h.cleanup();
 });
 
 test('native startup configures channels and permissions before the first local notification', async () => {

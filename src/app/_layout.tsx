@@ -67,6 +67,7 @@ import { AuthProvider, useAuth } from '@/context/auth-context';
 import { SettingsProvider, useSettings } from '@/context/settings-context';
 import { NotificationEmitter } from '@/utils/notification-emitter';
 import { subscribeToIncomingNotifications, registerMobilePushToken } from '@/services/mobile-notifications';
+import { maintenanceStatusAlert } from '../../supabase/functions/_shared/maintenance-status-alert';
 
 export { useAuth } from '@/context/auth-context';
 export { useSettings } from '@/context/settings-context';
@@ -184,6 +185,8 @@ export default function RootLayout() {
 function GlobalNotificationBanner() {
   const { userName, userId, isAuthenticated, userType } = useAuth();
   const { settings, triggerHaptic } = useSettings();
+  const notificationPreferences = useRef({ settings, triggerHaptic });
+  notificationPreferences.current = { settings, triggerHaptic };
   const [visible, setVisible] = useState(false);
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
@@ -207,25 +210,11 @@ function GlobalNotificationBanner() {
     return () => { disposed = true; remotePushReady.current = false; remotePushRegistration.current = null; seenNotifications.current.clear(); };
   }, [isAuthenticated, userId, userType, settings.criticalAlertsEnabled, settings.maintenanceRemindersEnabled]);
 
-  // Clear delivered/system notifications from the device tray
-  const handleDismissAllSystemNotifications = () => {
-    if (!isExpoGo && Platform.OS !== 'web') {
-      try {
-        const Notifications = require('expo-notifications');
-        if (Notifications && typeof Notifications.dismissAllNotificationsAsync === 'function') {
-          Notifications.dismissAllNotificationsAsync();
-        }
-      } catch (e) {
-        // safe fallback
-      }
-    }
-  };
-
   const dismissNotification = (direction: 'left' | 'right' | 'up' = 'up') => {
     if (dismissTimerRef.current) {
       clearTimeout(dismissTimerRef.current);
     }
-    handleDismissAllSystemNotifications();
+    // Closing the foreground banner must leave delivered tray alerts available.
 
     if (direction === 'left') {
       Animated.timing(panX, {
@@ -334,20 +323,24 @@ function GlobalNotificationBanner() {
           const Notifications = require('expo-notifications');
           if (Notifications && typeof Notifications.scheduleNotificationAsync === 'function') {
             const channelId = isUrgent ? 'alerts' : 'messages';
+            const statusAlert = isUrgent ? undefined
+              : maintenanceStatusAlert(item.type, item.relatedReportId, item.title, item.message);
             notificationSetup.then(async () => {
               await remotePushRegistration.current;
-              return disposed || remotePushReady.current ? undefined : Notifications.scheduleNotificationAsync({
-              content: {
-                title: item.title || 'New Maintenance Notification',
-                body: item.message || '',
-                sound: true,
-                data: {
-                  relatedReportId: item.relatedReportId,
-                  type: item.type,
-                  channelId,
+              if (disposed || remotePushReady.current) return;
+              return Notifications.scheduleNotificationAsync({
+                ...(Platform.OS === 'android' && statusAlert ? { identifier: statusAlert.identifier } : {}),
+                content: {
+                  title: statusAlert?.title || item.title || 'New Maintenance Notification',
+                  body: item.message || '',
+                  sound: true,
+                  data: {
+                    relatedReportId: item.relatedReportId,
+                    type: item.type,
+                    channelId,
+                  },
                 },
-              },
-              trigger: Platform.OS === 'android' ? { channelId } : null,
+                trigger: Platform.OS === 'android' ? { channelId } : null,
               });
             }).catch(() => {});
           }
@@ -357,10 +350,10 @@ function GlobalNotificationBanner() {
 
     const removeListener = NotificationEmitter.addListener((newTitle, newBody, newIsAlert) => {
       // Respect user's System Settings notification preferences
-      if (newIsAlert && !settings.criticalAlertsEnabled) {
+      if (newIsAlert && !notificationPreferences.current.settings.criticalAlertsEnabled) {
         return;
       }
-      if (!newIsAlert && !settings.maintenanceRemindersEnabled) {
+      if (!newIsAlert && !notificationPreferences.current.settings.maintenanceRemindersEnabled) {
         return;
       }
 
@@ -369,7 +362,7 @@ function GlobalNotificationBanner() {
       setIsAlert(newIsAlert);
       setVisible(true);
 
-      triggerHaptic();
+      notificationPreferences.current.triggerHaptic();
 
       // Reset animate positions
       slideAnim.setValue(-150);

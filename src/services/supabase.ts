@@ -8,6 +8,7 @@ import { isChecklistItemComplete, isRepairDone, isRepairAwaitingVerification } f
 import { remoteObservation, selectSettings } from './receiver-state';
 import { CloudHardware, connectionStatus, type CloudDeviceState } from './cloud-hardware';
 import { applyHomeControllerState, mergeHomeSettings } from './home-controller-state';
+import type { BatteryObservation } from './battery-state';
 import { functionalDeviceText, measuredRotation } from './sensor-readings';
 import { resolveEquipmentDisplay, refreshEquipmentText, equipmentDisplayName, equipmentType, type EquipmentDisplayContext, type EquipmentDisplaySeed } from './equipment-display';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -34,6 +35,7 @@ export interface SensorData {
   rotation_quality?: 'ok' | 'missing' | 'fault';
   deviceMode?: 'monitoring' | 'controller' | 'both';
   battery?: string;
+  batteryState?: BatteryObservation;
   building?: string;
   floor?: string;
   room?: string;
@@ -88,6 +90,9 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
 
 // Native AsyncStorage works without a browser window; SSR must not fabricate one.
 const isClient = Platform.OS !== 'web' || typeof window !== 'undefined';
+// Match the SDK default explicitly so local logout never needs the Auth lock
+// or a successful network request to locate the persisted session.
+const authStorageKey = `sb-${new URL(SUPABASE_URL).hostname.split('.')[0]}-auth-token`;
 const ssrSafeAuthStorage = {
   getItem: (key: string) => isClient ? AsyncStorage.getItem(key) : Promise.resolve(null),
   setItem: (key: string, value: string) => isClient ? AsyncStorage.setItem(key, value) : Promise.resolve(),
@@ -97,6 +102,7 @@ const ssrSafeAuthStorage = {
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
     storage: ssrSafeAuthStorage,
+    storageKey: authStorageKey,
     autoRefreshToken: isClient,
     persistSession: isClient,
     detectSessionInUrl: false,
@@ -672,7 +678,7 @@ export async function fetchLiveSensors(roomId?: string | null, scope?: ReadScope
       // Determine status from temperature and status field
       let status: 'optimal' | 'warning' | 'critical' = 'optimal';
       let statusLabel = 'Optimal';
-      let details = 'Sensor measurements are within acceptable thresholds.';
+      let details = 'AC device measurements are within acceptable thresholds.';
 
       const tempVal = typeof rawTemp === 'number' && Number.isFinite(rawTemp) ? rawTemp : null;
       const hardware = hardwareRes.find(state => state.node_id === node.id);
@@ -680,7 +686,7 @@ export async function fetchLiveSensors(roomId?: string | null, scope?: ReadScope
       if (nodeStatus === 'offline') {
         status = 'critical';
         statusLabel = 'Offline';
-        details = 'Sensor node is currently offline and unreachable.';
+        details = 'AC device is currently offline and unreachable.';
       } else if (tempVal === null) {
         statusLabel = 'Reading unavailable';
         details = 'No temperature reading has been reported by this device.';
@@ -956,7 +962,7 @@ export async function fetchLiveNotifications(): Promise<AppNotificationItem[]> {
         building: building?.name,
         floor: floor?.name,
         room: room?.name,
-        sensorName: room ? `${room.name} Sensor` : undefined,
+        sensorName: room ? `${room.name} AC device` : undefined,
       };
     });
   } catch (error) {
@@ -1013,9 +1019,15 @@ export async function createNotification(content: string, roomId?: string): Prom
 
 // All authentication is verified by Supabase Auth plus a server-owned profile.
 const accountAuth = createAuthService(supabase, AsyncStorage);
-export const authenticateUser = accountAuth.authenticateUser;
-export const registerStaffMember = accountAuth.registerStaffMember;
-export const verifyUserForPasswordReset = accountAuth.verifyUserForPasswordReset;
+let localSignOut: Promise<void> | null = null;
+async function afterLocalSignOut<T extends { success: boolean; error?: string }>(operation: () => Promise<T>): Promise<T> {
+  try { if (localSignOut) await readWithTimeout(() => localSignOut!, 3000); }
+  catch { return { success: false, error: 'Local sign-out is still finishing. Please try again.' } as T; }
+  return operation();
+}
+export const authenticateUser = (...args: Parameters<typeof accountAuth.authenticateUser>) => afterLocalSignOut(() => accountAuth.authenticateUser(...args));
+export const registerStaffMember = (...args: Parameters<typeof accountAuth.registerStaffMember>) => afterLocalSignOut(() => accountAuth.registerStaffMember(...args));
+export const verifyUserForPasswordReset = (...args: Parameters<typeof accountAuth.verifyUserForPasswordReset>) => afterLocalSignOut(() => accountAuth.verifyUserForPasswordReset(...args));
 export const requestPasswordRecovery = accountAuth.requestPasswordRecovery;
 export const resetUserPassword = accountAuth.resetUserPassword;
 export const changeUserPassword = accountAuth.changeUserPassword;
@@ -1211,15 +1223,40 @@ export async function getSavedSession(options: { throwOnUnavailable?: boolean } 
 
 // Clear user session and set user status to Offline in Supabase
 export async function clearSession(_userId?: string): Promise<void> {
-  try {
-    const token = await AsyncStorage.getItem('ecotrack_expo_push_token');
-    if (token) await supabase.rpc('ecotrack_unregister_push_token', { p_token: token });
-    await AsyncStorage.removeItem('ecotrack_expo_push_token');
-  } catch {}
-  await AsyncStorage.removeItem('ecotrack_session_user');
-  try { const keys=await AsyncStorage.getAllKeys(); await AsyncStorage.multiRemove(keys.filter(key=>/^ecotrack_(staff|admin)_pwd_/.test(key))); } catch {}
-  try { await supabase.rpc('ecotrack_set_presence', { p_online: false }); } catch {}
-  await supabase.auth.signOut({ scope: 'local' });
+  if (localSignOut) { await readWithTimeout(() => localSignOut!, 3000).catch(() => {}); return; }
+  // Capture old credentials before clearing storage. Optional push storage must
+  // not delay removing the authenticated session.
+  const pushToken = readWithTimeout(() => AsyncStorage.getItem('ecotrack_expo_push_token'), 1000).catch(() => null);
+  const run = (async () => {
+    const raw = await readWithTimeout(() => AsyncStorage.getItem(authStorageKey), 1000).catch(() => null);
+    let accessToken: string | undefined;
+    try { accessToken = raw ? JSON.parse(raw).access_token : undefined; } catch {}
+    const keys = await readWithTimeout(() => AsyncStorage.getAllKeys(), 500).catch(() => [] as string[]);
+    await AsyncStorage.multiRemove([...new Set([authStorageKey, `${authStorageKey}-user`, `${authStorageKey}-code-verifier`,
+      'ecotrack_session_user', 'ecotrack_expo_push_token', ...keys.filter(key => key.startsWith(`${authStorageKey}-flow-`) || /^ecotrack_(staff|admin)_pwd_/.test(key))])]);
+    // No session remains for signOut to revoke over the network. Let the SDK
+    // clear its PKCE state and emit SIGNED_OUT through the normal lifecycle.
+    await supabase.auth.signOut({ scope: 'local' });
+    // Use only the captured JWT: delayed cleanup can never act as a new login.
+    if (accessToken) void (async () => {
+      const request = (path: string, body?: object) => readWithTimeout(signal => fetch(`${SUPABASE_URL}${path}`, {
+        method: 'POST', signal,
+        headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      }), 3000).catch(() => {});
+      const token = await pushToken;
+      await Promise.all([
+        ...(token ? [request('/rest/v1/rpc/ecotrack_unregister_push_token', { p_token: token })] : []),
+        request('/rest/v1/rpc/ecotrack_set_presence', { p_online: false }),
+      ]);
+      await request('/auth/v1/logout?scope=local');
+    })();
+  })();
+  localSignOut = run;
+  void run.finally(() => { if (localSignOut === run) localSignOut = null; }).catch(() => {});
+  // An SDK initialization/lock failure cannot keep the provider's logout open.
+  // New sign-ins wait only for this local phase, never optional remote cleanup.
+  await readWithTimeout(() => run, 3000).catch(() => {});
 }
 
 // Explicitly update staff member online/offline status in Supabase

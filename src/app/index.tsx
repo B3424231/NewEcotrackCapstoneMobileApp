@@ -61,8 +61,6 @@ export default function HomeScreen() {
   const styles = themedStyles[effectiveTheme];
   const theme = effectiveTheme;
 
-  const [pulseAnim] = useState(() => new Animated.Value(1));
-
   // Supabase live AC controllers and room assignment state
   const fetchUser = userId || userEmail || userPhone || userName;
   const { data, loading, error: fetchError, setData, commit, startLoading, fail, isCurrent: isSessionCurrent } =
@@ -136,7 +134,7 @@ export default function HomeScreen() {
           return applyHomeControllerState(next);
         }));
       }).catch(() => { /* Retain the last values and their original ages. */ }).finally(() => { readingHardware = false; });
-    }, 2000);
+    }, settings.syncFrequency * 1000);
     return () => {
       disposed = true;
       refresh.dispose();
@@ -145,31 +143,12 @@ export default function HomeScreen() {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (intervalId) clearInterval(intervalId);
     };
-  }, [fetchControllers, settings.autoSyncEnabled, setControllers, isSessionCurrent]);
+  }, [fetchControllers, settings.autoSyncEnabled, settings.syncFrequency, setControllers, isSessionCurrent]);
 
   const onRefresh = () => {
     setRefreshing(true);
     void refreshRef.current?.refresh();
   };
-
-  useEffect(() => {
-    const animation = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, {
-          toValue: 1.4,
-          duration: 1200,
-          useNativeDriver: true,
-        }),
-        Animated.timing(pulseAnim, {
-          toValue: 1,
-          duration: 1200,
-          useNativeDriver: true,
-        }),
-      ])
-    );
-    animation.start();
-    return () => animation.stop();
-  }, [pulseAnim]);
 
   const getAvatarSource = (avatar: string, uri: string | null) => {
     if (avatar === 'custom' && uri) {
@@ -270,8 +249,7 @@ export default function HomeScreen() {
                     style={styles.userProfileCardAvatar}
                     contentFit="cover"
                   />
-                  <View style={styles.statusDotWrapper}>
-                    <Animated.View style={[styles.statusDotPulse, { transform: [{ scale: pulseAnim }] }]} />
+                  <View style={styles.statusDotWrapper} accessible accessibilityLabel="Online">
                     <View style={styles.statusDot} />
                   </View>
                 </View>
@@ -449,7 +427,6 @@ export default function HomeScreen() {
         controller={selectedController}
         onClose={closeDetails}
         slideAnim={slideAnim}
-        onReferenceSaved={(id, config) => { if (isSessionCurrent()) setControllers(current => current.map(item => item.id === id ? { ...item, sensorConfig: config, sensorConfigAt: config.airflow_reference.saved_at } : item)); }}
       />
 
       {!detailsVisible && <FloatingBottomNavbar currentPage="home" />}
@@ -790,28 +767,23 @@ const createStyles = (colors: AppColors) => StyleSheet.create({
   },
   statusDotWrapper: {
     position: 'absolute',
-    top: 2,
+    bottom: 2,
     right: 2,
-    width: 20,
-    height: 20,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 3,
+    borderColor: colors.backgroundElement,
+    backgroundColor: colors.emerald,
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 10,
   },
   statusDot: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: colors.primaryFill,
-    borderWidth: 2,
-    borderColor: colors.border,
-  },
-  statusDotPulse: {
-    position: 'absolute',
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: colors.accentSurface,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: colors.emerald,
   },
   userProfileCardDetails: {
     flex: 1,

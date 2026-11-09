@@ -143,7 +143,7 @@ test('maintenance description is a readable sibling card between equipment and p
   visit(ast);
   const equipment = cards.find(node => node.getText(ast).includes('AIRCON & EQUIPMENT INFORMATION'));
   const description = cards.find(node => node.getText(ast).includes('SCOPE / DESCRIPTION'));
-  const progress = cards.find(node => node.getText(ast).includes('MAINTENANCE PROGRESS'));
+  const progress = cards.find(node => /maintenance progress/i.test(node.getText(ast)));
   assert.ok(equipment && description && progress);
   assert.equal(equipment.parent, description.parent); assert.equal(description.parent, progress.parent);
   assert.ok(equipment.end < description.pos && description.end < progress.pos);
@@ -151,4 +151,41 @@ test('maintenance description is a readable sibling card between equipment and p
   assert.ok(!description.getText(ast).includes('numberOfLines'));
   assert.ok(!description.getText(ast).includes('<ScrollView'));
   assert.ok(equipment.getText(ast).includes('Assigned Worker:'));
+});
+
+test('maintenance report ID text has accessible contrast in both themes', () => {
+  const source = fs.readFileSync('src/app/Maintenance.tsx', 'utf8');
+  const ast = ts.createSourceFile('Maintenance.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const declaration = ast.statements.find(node => ts.isVariableStatement(node) &&
+    node.declarationList.declarations.some(item => item.name.getText(ast) === 'createStyles'));
+  assert.ok(declaration);
+
+  const compile = source => ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const theme = {};
+  const platform = { select: values => values.android ?? values.default };
+  vm.runInNewContext(compile(fs.readFileSync('src/constants/theme.ts', 'utf8')), {
+    exports: theme,
+    require: name => name === 'react-native' ? { Platform: platform } : {},
+  });
+  const context = vm.createContext({
+    StyleSheet: { create: styles => styles }, Platform: platform, Spacing: theme.Spacing,
+    SCREEN_WIDTH: 320, SCREEN_HEIGHT: 800,
+  });
+  const createStyles = vm.runInContext(compile(declaration.getText(ast) + '\ncreateStyles;'), context);
+  const luminance = hex => hex.slice(1).match(/../g)
+    .map(pair => parseInt(pair, 16) / 255)
+    .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
+    .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0);
+
+  for (const colors of Object.values(theme.Colors)) {
+    const styles = createStyles(colors);
+    for (const [badge, label] of [['reportIdPill', 'reportIdText'], ['reportPillLarge', 'reportPillLargeText']]) {
+      assert.equal(styles[badge].backgroundColor, colors.backgroundSelected);
+      const pair = [luminance(styles[badge].backgroundColor), luminance(styles[label].color)];
+      assert.ok((Math.max(...pair) + 0.05) / (Math.min(...pair) + 0.05) >= 4.5, badge);
+    }
+    assert.equal(styles.airconInfoCard.borderColor, colors.border);
+  }
 });

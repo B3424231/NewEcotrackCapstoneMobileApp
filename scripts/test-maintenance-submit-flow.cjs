@@ -60,3 +60,20 @@ test('100% progress retains the final Submit button until the report is actually
   const text=n=>Array.isArray(n)?n.map(text).join(' '):n&&typeof n==='object'?text(n.props.children):n==null?'':String(n);
   assert.match(text(tree),/Submit for Verification/);assert.doesNotMatch(text(tree),/Submitted for Verification/);
 });
+
+test('a finished linked repair exposes its explicit submission confirmation',()=>{
+  const node=find(n=>ts.isJsxElement(n)&&n.openingElement.attributes.getText(source).includes('styles.submitSection')&&n.getText(source).includes('isRepairVerified'));
+  const React={createElement:(type,props,...children)=>({type,props:{...props,children}}),Fragment:'Fragment'};
+  const completed={id:'REP-ready',status:'In Progress',items:[{id:'1',title:'Check',status:'Completed'}]};
+  const state={pending:null,confirm:false};
+  const tree=evaluate('exports.tree=('+node.getText(source)+');',{React,View:'View',ThemedText:'Text',Pressable:'Button',AppIcon:'Icon',
+    styles:new Proxy({},{get:()=>({})}),isRepairVerified:false,isRepairSubmitted:false,isRepairReady:true,repairPhase:'Ready to submit',targetRepair:completed,isSubmitting:false,
+    isDark:true,effectiveTheme:'dark',UiColors:{dark:{onPrimary:'#fff'}},colors:{primaryFill:'#047857'},
+    setPendingRepairToSubmit:r=>{state.pending=r;},setConfirmRepairModalVisible:v=>{state.confirm=v;},
+  }).tree;
+  const walk=n=>Array.isArray(n)?n.flatMap(walk):n&&typeof n==='object'?[n,...walk(n.props.children)]:[];
+  const text=n=>Array.isArray(n)?n.map(text).join(' '):n&&typeof n==='object'?text(n.props.children):n==null?'':String(n);
+  assert.match(text(tree),/Submit for verification/i);
+  const button=walk(tree).find(n=>n.type==='Button');assert(button);button.props.onPress();
+  assert.equal(state.pending,completed);assert.equal(state.confirm,true);
+});

@@ -3,7 +3,8 @@
 // Board: Heltec Wireless Stick Lite(V3), ESP32 core 3.3.12.
 // Receiver OUT=IR_RX_PIN. Transmitter module S/IN=IR_TX_PIN; common GND.
 // Power the transmitter at its rated supply; its signal input must accept 3.3V.
-// Battery sensing and charge LEDs are excluded; leave GPIO2, GPIO6 and GPIO7 unused.
+// Battery/USB charging are MOCKED; no ADC or charger-status input is connected.
+// Blue LED=GPIO6 (>20%), red LED=GPIO7 (<=20%); GPIO2 stays unused.
 // Measured temperature is excluded; GPIO47 and GPIO48 are not used by this sketch.
 // IR transmission does not prove measured AC power.
 // Bluetooth: encrypted Just Works pairing and bonding, with no six-digit PIN.
@@ -195,6 +196,64 @@ void updateRotationMeasurement() {
   measuredRotationRpm = (double(pulses) * 60000000.0) / (ROTATION_PULSES_PER_REVOLUTION * double(elapsed));
 }
 
+// BEGIN MOCK BATTERY SOURCE
+// Code-only demonstration settings; not real USB detection or a fuel gauge.
+// Replace this source when actual battery/charger sensing hardware is available.
+// Two parallel 2600 mAh cells form a 1S2P 5200 mAh pack, not a 7.4 V pack.
+constexpr uint8_t BATTERY_BLUE_LED_PIN = 6;
+constexpr uint8_t BATTERY_RED_LED_PIN = 7;
+constexpr uint16_t BATTERY_CAPACITY_MAH = 5200;
+constexpr int MOCK_BATTERY_INITIAL_PERCENT = 80;  // Set 0/20/21/100 for boundary checks.
+constexpr bool MOCK_BATTERY_USB_PRESENT = true;  // Set false to demonstrate discharging.
+constexpr uint32_t MOCK_BATTERY_STEP_MS = 10000UL;  // One percentage point per awake step.
+static_assert(MOCK_BATTERY_INITIAL_PERCENT >= 0 && MOCK_BATTERY_INITIAL_PERCENT <= 100, "Mock battery percent must be 0..100.");
+static_assert(MOCK_BATTERY_STEP_MS > 0, "Mock battery progression must have a nonzero interval.");
+// Retain the demonstration level across scheduled deep sleep; no NVS writes per step.
+RTC_DATA_ATTR int mockBatteryPercent = MOCK_BATTERY_INITIAL_PERCENT;
+static uint32_t mockBatteryLastStepMs = 0;
+
+float batteryVoltage() {
+  // Mock 1S voltage only. Historical telemetry's battery field is always volts.
+  return 3.0f + 1.2f * mockBatteryPercent / 100.0f;
+}
+void updateBatteryLeds() {
+  digitalWrite(BATTERY_BLUE_LED_PIN, mockBatteryPercent > 20 ? HIGH : LOW);
+  digitalWrite(BATTERY_RED_LED_PIN, mockBatteryPercent <= 20 ? HIGH : LOW);
+}
+void beginBatteryStatus() {
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)BATTERY_BLUE_LED_PIN);
+  gpio_hold_dis((gpio_num_t)BATTERY_RED_LED_PIN);
+  mockBatteryPercent = constrain(mockBatteryPercent, 0, 100);
+  pinMode(BATTERY_BLUE_LED_PIN, OUTPUT); pinMode(BATTERY_RED_LED_PIN, OUTPUT);
+  mockBatteryLastStepMs = millis();
+  updateBatteryLeds();
+}
+void updateBatteryStatus() {
+  const uint32_t elapsed = uint32_t(millis() - mockBatteryLastStepMs);
+  const uint32_t steps = elapsed / MOCK_BATTERY_STEP_MS;
+  if (!steps) return;
+  mockBatteryLastStepMs = uint32_t(mockBatteryLastStepMs + steps * MOCK_BATTERY_STEP_MS);
+  if (MOCK_BATTERY_USB_PRESENT) mockBatteryPercent += min(steps, uint32_t(100 - mockBatteryPercent));
+  else mockBatteryPercent -= min(steps, uint32_t(mockBatteryPercent));
+  updateBatteryLeds();
+}
+void writeBatteryStatus(JsonObject config) {
+  config["battery_voltage"] = batteryVoltage();
+  config["battery_percent_estimate"] = mockBatteryPercent;
+  config["battery_charging"] = MOCK_BATTERY_USB_PRESENT && mockBatteryPercent < 100;
+  config["battery_charge_state"] = MOCK_BATTERY_USB_PRESENT ? (mockBatteryPercent >= 100 ? "full" : "charging") : "discharging";
+  config["battery_source"] = "mock";
+  config["battery_capacity_mah"] = BATTERY_CAPACITY_MAH;
+}
+void holdBatteryLeds() {
+  updateBatteryLeds();
+  gpio_hold_en((gpio_num_t)BATTERY_BLUE_LED_PIN);
+  gpio_hold_en((gpio_num_t)BATTERY_RED_LED_PIN);
+  gpio_deep_sleep_hold_en();
+}
+// END MOCK BATTERY SOURCE
+
 constexpr uint16_t IR_RX_PIN = 4;  // Receiver OUT.
 constexpr uint16_t IR_TX_PIN = 5;  // Transmitter module S/IN.
 constexpr bool IR_TX_ENABLED = true;  // Set false while no transmitter is wired.
@@ -207,7 +266,7 @@ constexpr uint32_t RECHECK_SLEEP_SECONDS = 900;
 constexpr char SERVICE_UUID[] = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 constexpr char INFO_UUID[] = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
 constexpr char WIFI_UUID[] = "1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e";
-constexpr char VERSION[] = "cloud-ir-device-2.2-no-temperature";
+constexpr char VERSION[] = "cloud-ir-device-2.3-battery";
 constexpr char CAPTURE_UUID[] = "b80301f3-639c-4eaf-bcc0-537759229321";
 
 constexpr uint16_t IR_CAPTURE_BUFFER = 1024;
@@ -909,7 +968,7 @@ void captureTelemetryReading() {
   reading["node_id"] = registryId; reading["boot_id"] = deviceId + "-" + String(bootCount);
   reading["sequence"] = reportSequence; reading["observed_at"] = isoUtc(time(nullptr));
   reading["interval_seconds"] = intervalMs / 1000;
-  reading["battery"] = nullptr;  // Battery sensing is excluded; unknown is not zero.
+  reading["battery"] = batteryVoltage();  // Explicit MOCK 1S voltage; never percent.
   if (WiFi.status() == WL_CONNECTED) reading["rssi"] = WiFi.RSSI(); else reading["rssi"] = nullptr;
   reading["outlet_temperature_c"] = nullptr;  // Temperature sensing is excluded; preserve the nullable transport field.
   if (isfinite(measuredRotationRpm)) reading["rotation_rpm"] = measuredRotationRpm; else reading["rotation_rpm"] = nullptr;
@@ -950,8 +1009,7 @@ bool exchange(const String &sleepingUntil = "") {
   status["applied_config"]["measurement_clock_ready"] = clockReady();
   status["applied_config"]["last_measurement_at"] = lastMeasurementAt;
   status["applied_config"]["missed_measurements"] = missedMeasurements;
-  status["applied_config"]["battery_voltage"] = nullptr;
-  status["applied_config"]["battery_percent_estimate"] = nullptr;
+  writeBatteryStatus(status["applied_config"].as<JsonObject>());
   if (sleepingUntil.length()) status["sleeping_until"] = sleepingUntil;
   JsonDocument capture, ack;
   if (captureDirty && immediateObservationSupport < 0 && !deserializeJson(capture, latestCapture)) status["latest_ir"].set(capture.as<JsonVariantConst>());
@@ -1051,11 +1109,13 @@ void scheduledSleep() {
     digitalWrite(IR_TX_PIN,IR_TX_INVERTED ? HIGH : LOW);
     gpio_hold_en((gpio_num_t)IR_TX_PIN); gpio_deep_sleep_hold_en();
   }
+  holdBatteryLeds();  // Board is still powered during scheduled sleep.
   closeCloudTransport(); BLEDevice::deinit(true); WiFi.disconnect(true);
   esp_sleep_enable_timer_wakeup((uint64_t)duration * 1000000ULL); esp_deep_sleep_start();
 }
 void setup() {
   beginMeasurementInputs();
+  beginBatteryStatus();
   Serial.begin(115200); prefs.begin("ecotrack-cloud", false);
   if (IR_TX_ENABLED) {
     gpio_deep_sleep_hold_dis(); gpio_hold_dis((gpio_num_t)IR_TX_PIN);
@@ -1092,6 +1152,7 @@ void setup() {
 }
 void loop() {
   updateRotationMeasurement();
+  updateBatteryStatus();
   processProvisioning(); manageWifi(); collectIR();
   captureTelemetryReading();
   if (advertiseAgain) { advertiseAgain = false; BLEDevice::startAdvertising(); }

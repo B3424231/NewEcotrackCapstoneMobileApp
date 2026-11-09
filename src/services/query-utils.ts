@@ -22,6 +22,11 @@ export function metadataChanged(client: object, table: string, payload: { eventT
   const row = payload.new, id = row?.id || payload.old?.id;
   if (!id || payload.eventType === 'DELETE' || !row || Object.keys(row).length < 2) return true;
   const key = table + ':' + id, next = fingerprint(row);
+  // FULL replica identity can prove an observation-only update even before a
+  // screen has needed an equipment lookup. An ID-only old row cannot.
+  if (payload.eventType === 'UPDATE' && payload.old &&
+      Object.keys(row).every(field => observationFields.has(field) || field in payload.old) &&
+      fingerprint(payload.old) === next) return false;
   const eventKey = payload.commit_timestamp ? key + ':' + payload.commit_timestamp + ':' + next : null;
   let events = metadataEvents.get(client);
   if (!events) { events = new Map(); metadataEvents.set(client, events); }

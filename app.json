@@ -55,7 +55,8 @@
       [
         "expo-notifications",
         {
-          "color": "#0b291d"
+          "icon": "./assets/images/ecotrack-notification-icon.png",
+          "color": "#047857"
         }
       ],
       [

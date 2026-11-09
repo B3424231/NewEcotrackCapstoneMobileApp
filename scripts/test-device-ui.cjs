@@ -7,10 +7,15 @@ const themeModule = { exports: {} };
 const themeSource = fs.readFileSync('src/constants/theme.ts', 'utf8');
 vm.runInNewContext(ts.transpileModule(themeSource.slice(themeSource.indexOf('export const Colors'), themeSource.indexOf('export type ThemeColor')), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports: themeModule.exports });
 const UiColors = themeModule.exports.Colors;
-const measurementDisplay = { exports: {} };
-vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/sensor-readings.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports: measurementDisplay.exports });
 const airflowDisplay = { exports: {} };
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/airflow-pressure.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports: airflowDisplay.exports });
+const measurementDisplay = { exports: {} };
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/sensor-readings.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports: measurementDisplay.exports, require: name => {
+  assert.equal(name, './airflow-pressure');
+  return airflowDisplay.exports;
+} });
+const batteryDisplay = { exports: {} };
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/battery-state.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports: batteryDisplay.exports });
 const sourceText = fs.readFileSync('src/app/devices.tsx', 'utf8');
 const source = ts.createSourceFile('devices.tsx', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 function find(predicate) {
@@ -25,7 +30,7 @@ function declaration(name) {
 function evaluate(code, context = {}) {
   const module = { exports: {} };
   vm.runInNewContext(ts.transpileModule(code, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React } }).outputText,
-    { module, exports: module.exports, Date, UiColors, effectiveTheme: context.isDark ? 'dark' : 'light', console: { error() {} }, ...measurementDisplay.exports, ...airflowDisplay.exports, deviceMode: 'controller', AcDeviceTypePicker: 'TypePicker', ...context });
+    { module, exports: module.exports, Date, UiColors, effectiveTheme: context.isDark ? 'dark' : 'light', console: { error() {} }, ...measurementDisplay.exports, ...batteryDisplay.exports, deviceMode: 'controller', AcDeviceTypePicker: 'TypePicker', ...context });
   return module.exports;
 }
 const formatters = evaluate(declaration('formatBatteryPercent') + declaration('formatConnectionLatency') + 'exports.battery = formatBatteryPercent; exports.latency = formatConnectionLatency;');
@@ -57,16 +62,16 @@ test('latency is available only from a successful measured probe and has an expl
   assert.match(text(tree), /Connection Latency.*24 ms/); assert.doesNotMatch(text(tree), /66 ms/);
 });
 
-test('Monitoring and Both device details display temperature and reference percentages with explicit missing states', () => {
+test('Monitoring and Both device details display temperature and omit measured rotation', () => {
   for (const deviceMode of ['monitoring', 'both']) {
     const device = { ...oldDevice, deviceMode, temp: 24.5, rotation_rpm: 600, rotation_quality: 'ok', sensorConfig: { airflow_reference: { rpm: 1200 } } };
     const content = text(renderSection('infoList', 'Battery Level', { selectedDevice: device, formatTemperatureDisplay: value => `${value} °C` }));
     assert.match(content, /Temperature.*24.5 °C/);
-    assert.match(content, /Airflow pressure.*50%/);
+    assert.doesNotMatch(content, /Airflow|RPM/);
     assert.doesNotMatch(content, /ESP32|MPX5010|Rotation speed/i);
     const missing = text(renderSection('infoList', 'Battery Level', { selectedDevice: { ...device, temp: null, rotation_rpm: null }, formatTemperatureDisplay: value => `${value} °C` }));
     assert.match(missing, /Temperature.*Unavailable/);
-    assert.match(missing, /Airflow pressure.*Unavailable/);
+    assert.doesNotMatch(missing, /Airflow|RPM/);
   }
 });
 

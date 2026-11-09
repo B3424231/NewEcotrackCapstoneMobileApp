@@ -268,7 +268,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const handleLogout = async () => {
     clearSessionPageSnapshots();
     const currentId = userId;
-    await clearSession(currentId);
+    const cleanup = clearSession(currentId);
     setUserId('');
     setUserEmail('');
     setUserName('');
@@ -282,12 +282,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setArchiveNotes(null);
     setArchivedAt(null);
     setIsAuthenticated(false);
+    await cleanup;
   };
 
   const acknowledgeArchived = async () => {
     clearSessionPageSnapshots();
     const currentId = userId;
-    await clearSession(currentId);
+    const cleanup = clearSession(currentId);
     setUserId('');
     setUserEmail('');
     setUserName('');
@@ -301,6 +302,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setArchiveNotes(null);
     setArchivedAt(null);
     setIsAuthenticated(false);
+    await cleanup;
   };
 
   const acknowledgeRemoteLogout = () => {

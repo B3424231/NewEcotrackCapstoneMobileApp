@@ -2,6 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase, LiveMaintenanceReport, resolveNotificationEquipment } from './supabase';
 import { NotificationEmitter } from '@/utils/notification-emitter';
 import { functionalDeviceText } from './sensor-readings';
+import { metadataChanged } from './query-utils';
 
 export async function registerMobilePushToken(preferences: { critical: boolean; maintenance: boolean }): Promise<boolean> {
   try {
@@ -78,6 +79,16 @@ export interface MobileNotificationStateChange {
 const stateListeners = new Set<(change?: MobileNotificationStateChange) => void>();
 let stateRevision = 0;
 let stateUpdatePending = false;
+let stateAccount: string | null | undefined;
+let stateEpoch = 0;
+supabase.auth.onAuthStateChange?.((_event, session) => {
+  const account = session?.user.id || null;
+  if (account === stateAccount) return;
+  stateAccount = account;
+  stateEpoch++;
+  stateRevision++;
+  stateUpdatePending = false;
+});
 
 export function getMobileNotificationStateRevision(): number { return stateRevision; }
 export function isMobileNotificationStateUpdating(): boolean { return stateUpdatePending; }
@@ -105,12 +116,13 @@ async function commitNotificationState(
 ): Promise<boolean> {
   // Prevent overlapping read/unread operations from committing in an ambiguous order.
   if (stateUpdatePending) return false;
+  const epoch = stateEpoch;
   stateUpdatePending = true;
   stateRevision++;
   notifyStateListeners();
   try {
     const ok = await operation();
-    if (ok) {
+    if (ok && epoch === stateEpoch) {
       stateRevision++;
       notifyStateListeners(change);
     }
@@ -119,6 +131,9 @@ async function commitNotificationState(
     console.warn('Unable to update notification state:', error);
     return false;
   } finally {
+    // An old recipient's response must not mutate a later account's feed or
+    // release that account's independently pending operation.
+    if (epoch !== stateEpoch) return false;
     stateUpdatePending = false;
     stateRevision++;
     // Refresh from the per-recipient RPC after the commit, including uncertain failures.
@@ -318,11 +333,11 @@ export function subscribeToMobileNotifications(onUpdate: (change?: MobileNotific
     .channel(channelId)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'mobile_notifications' }, () => onUpdate())
     .on('postgres_changes', { event: '*', schema: 'public', table: 'mobile_notification_state' }, () => onUpdate())
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'nodes' }, () => onUpdate())
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'aircons' }, () => onUpdate())
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, () => onUpdate())
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, () => onUpdate())
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, () => onUpdate())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'nodes' }, payload => { if (metadataChanged(supabase, 'nodes', payload)) onUpdate(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'aircons' }, payload => { if (metadataChanged(supabase, 'aircons', payload)) onUpdate(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, payload => { if (metadataChanged(supabase, 'rooms', payload)) onUpdate(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'floors' }, payload => { if (metadataChanged(supabase, 'floors', payload)) onUpdate(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'buildings' }, payload => { if (metadataChanged(supabase, 'buildings', payload)) onUpdate(); })
     .subscribe();
   return () => { stateListeners.delete(onUpdate); supabase.removeChannel(channel); };
 }

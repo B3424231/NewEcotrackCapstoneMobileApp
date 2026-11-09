@@ -3,6 +3,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const ts = require('typescript');
+const queryUtils = { exports: {} };
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/query-utils.ts', 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, { module: queryUtils, exports: queryUtils.exports, AbortController, setTimeout, clearTimeout });
 const measurementDisplay = { exports: {} };
 const airflowDisplay = { exports: {} };
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/airflow-pressure.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports: airflowDisplay.exports });
@@ -33,6 +37,7 @@ function notifications(respond = () => ({ data: 1, error: null })) {
   vm.runInNewContext(js,{
     module,exports:module.exports,Date,console:{ warn(){},error(){} },
     require: name => {
+      if (name === './query-utils') return queryUtils.exports;
       if (name === './sensor-readings') return measurementDisplay.exports;
       if (name === './supabase') return { supabase:client, resolveNotificationEquipment: async items => items };
       if (name === '@react-native-async-storage/async-storage') return {

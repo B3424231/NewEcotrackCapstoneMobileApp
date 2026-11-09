@@ -5,7 +5,7 @@ import { ThemedText } from './themed-text';
 import { AppIcon } from './app-icon';
 import { LocationIcon } from './location-icon';
 import { useSettings } from '@/context/settings-context';
-import { airconStateReading, batteryReading, blowerFanReading, controllerConnection } from '@/services/controller-display';
+import { airconStateReading, batteryReading, fanSettingReading, controllerConnection } from '@/services/controller-display';
 import type { SensorData } from '@/services/supabase';
 
 export type AcControllerData = SensorData;
@@ -24,7 +24,8 @@ export function AcControllerCard({ controller, sensor, onPress, onViewChecklist 
   const temperature = React.useMemo(() => typeof setpoint === 'number' && Number.isFinite(setpoint)
     ? formatTemperatureDisplay(setpoint) : null, [setpoint, formatTemperatureDisplay]);
   if (!item) return null;
-  const connection = controllerConnection(item), battery = batteryReading(item.battery), blower = blowerFanReading(item);
+  const connection = controllerConnection(item), battery = batteryReading(item.battery, item.batteryState, item.connectionState === 'online'), fan = fanSettingReading(item);
+  const batteryText = [battery.text, battery.status].filter(Boolean).join(' · ');
   const location = [item.building, item.floor, item.room].filter(Boolean).join(' • ') || item.location || 'Unassigned';
   const hasTask = Boolean(item.activeReportId && item.maintenanceStatus !== 'No Maintenance Yet');
   const openChecklist = () => onViewChecklist ? onViewChecklist(item) : router.push({
@@ -44,9 +45,9 @@ export function AcControllerCard({ controller, sensor, onPress, onViewChecklist 
             <View style={[styles.dot, { backgroundColor: connectionTone }]} />
             <ThemedText style={[styles.connectionText, { color: connectionTone }]}>{connection.label}</ThemedText>
           </View>
-          <View style={styles.battery} accessible accessibilityLabel={battery.text === '—' ? 'Battery unavailable' : `Battery ${battery.text}`}>
-            <AppIcon name="battery" size={13} color={batteryTone} />
-            <ThemedText style={[styles.reading, { color: batteryTone }]}>{battery.text}</ThemedText>
+          <View style={styles.battery} accessible accessibilityLabel={battery.text === '—' ? 'Battery unavailable' : `Battery ${batteryText}`}>
+            <AppIcon name={battery.status === 'Charging' ? 'bolt' : 'battery'} size={13} color={batteryTone} />
+            <ThemedText style={[styles.reading, { color: batteryTone }]}>{batteryText}</ThemedText>
           </View>
         </View>
       </View>
@@ -65,9 +66,8 @@ export function AcControllerCard({ controller, sensor, onPress, onViewChecklist 
           <ThemedText style={[styles.reading, { color: colors.textSecondary }]}>AC target setpoint</ThemedText>
         </View>
         <View style={[styles.metric, panel]}>
-          <ThemedText style={[styles.label, { color: colors.textSecondary }]}>Airflow Indicator (RPM)</ThemedText>
-          <ThemedText style={[styles.value, { color: colors.text }]}>{`Blower Fan Speed: ${blower.value === '—' ? 'Unavailable' : blower.value}`}</ThemedText>
-          <ThemedText style={[styles.reading, { color: colors.textSecondary }]}>{blower.detail}</ThemedText>
+          <ThemedText style={[styles.label, { color: colors.textSecondary }]}>Fan setting</ThemedText>
+          <ThemedText style={[styles.value, { color: colors.text }]}>{fan}</ThemedText>
         </View>
       </View>}
     </Pressable>
@@ -99,7 +99,7 @@ const styles = StyleSheet.create({
   value: { fontSize: 13, lineHeight: 20, fontWeight: '700', flexShrink: 1 },
   state: { padding: 11, borderRadius: 12, borderWidth: 1, gap: 4 },
   reading: { fontSize: 11, lineHeight: 17, flexShrink: 1 },
-  battery: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  battery: { flexDirection: 'row', alignItems: 'center', gap: 5, flexShrink: 1, maxWidth: '100%' },
   checklist: { flexDirection: 'row', alignItems: 'center', gap: 10, borderTopWidth: 1, padding: 14 },
   checklistTitle: { fontSize: 13, lineHeight: 19, fontWeight: '700' },
 });
